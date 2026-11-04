@@ -6,7 +6,7 @@
   - launch_app / close_app / press_key / uninstall_app
   - swipe_direction / install_apk / read_device_data / set_clipboard
   - get_app_version / get_foreground_app
-  - tap_element / input_text (需 VLM 在 ctx.screen 上先定位)
+  - tap_element / input_text（定位参数由 Nexus 或脚本 pages 给出，本通道不猜元素）
 """
 from __future__ import annotations
 
@@ -262,7 +262,7 @@ class AdbExecutor:
             SLog.w(TAG, f"input focus capture failed: {type(exc).__name__}")
 
     # 上报给 Nexus 的执行能力：与 Nexus 能力目录同词表（同一批具体事件 id）。
-    # 每个渠道（adb / playwright / desktop）用同一套字段，只声明"我能执行哪些事件"，
+    # 每个渠道（adb / playwright / 原生 mac·win）用同一套字段，只声明"我能执行哪些事件"，
     # 这样跨渠道配置可以直接逐字段对比，排查时不必在两套词汇之间翻译。
     # 观察类事件（screenshot / hierarchy / probe_device_state）也由 adb 提供。
     provides = tuple(sorted(_SUPPORTED_CAPS | {
@@ -594,7 +594,7 @@ class AdbExecutor:
         path = params.get("path") or ""
         url = params.get("url") or ""
         tmp_path = ""
-        # 对齐 ClawNode：支持 url（内部下载到本地再 install），也兼容本地 path
+        # 支持 url（内部下载到本地再 install），也兼容本地 path
         if not path and url:
             try:
                 from mino_scout.platform.android.adb_command import _download_apk
@@ -627,7 +627,7 @@ class AdbExecutor:
                     pass
 
     def _exec_script(self, event, ctx, serial, started_at, t0):
-        """adb 版 EXEC_SCRIPT：委托 adb_script（dsl/shell；js→not_supported），与 ClawNode 协议一致。"""
+        """adb 版 EXEC_SCRIPT：委托 adb_script（dsl/shell；js→not_supported）。"""
         from mino_scout.platform.android.adb_script import run_adb_script
 
         res = run_adb_script(serial, event.params or {})

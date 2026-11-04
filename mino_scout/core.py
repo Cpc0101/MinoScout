@@ -107,8 +107,6 @@ class ScoutCore:
         self.router = Router(executors)
         self._started = time.time()
         self._lock = threading.Lock()
-        # (run_id, step_idx) -> (完成时刻, EventResult)
-        self._done: dict[tuple[str, int], tuple[float, EventResult]] = {}
         self._active_runs: set[str] = set()
         from mino_scout.tools.update.fixed_update import loaded_build
         self._loaded_build = loaded_build()
@@ -504,8 +502,6 @@ class ScoutCore:
                 return make_event_result(_event_from_execute(req), status=EventStatus.BLOCKED, executor_used="core",
                     started_at=now_iso(), elapsed_ms=0, error=str(exc), summary="原生平台或设备身份不匹配",
                     raw_response={"execution": {"execution_started": "no", "phase": "resolve", "reason_code": "native_identity_conflict"}})
-        if req.sn.startswith("desktop:") and (req.sn != f"desktop:{self.node_id}:console" or req.platform != "desktop"):
-            return make_event_result(_event_from_execute(req), status=EventStatus.BLOCKED, executor_used="core", started_at=now_iso(), elapsed_ms=0, error="Desktop 目标或平台不匹配", summary="Desktop 目标或平台不匹配")
         if cap == "probe":
             return self._dispatch_probe(req)
         if cap == "screenshot":
@@ -525,19 +521,18 @@ class ScoutCore:
             device,
             run_id=req.run_id,
             step_idx=req.step_idx,
-            capture_prefer=_prefer_for(device),
             shared={"write_stopped": lambda: self._requests.stopped(req.run_id)},
         )
 
     def _dispatch_cancel(self, req: P.Execute) -> EventResult:
-        dropped = self.cancel_run(req.run_id)
+        self.cancel_run(req.run_id)
         return make_event_result(
             _event_from_execute(req),
             status=EventStatus.PASS,
             executor_used="core",
             started_at=now_iso(),
             elapsed_ms=0,
-            summary=f"已阻止 run 的后续写动作（清 {dropped} 条缓存）；底层停止需独立确认",
+            summary="已阻止 run 的后续写动作；底层停止需独立确认",
             raw_response={"execution": {"execution_started": "no", "phase": "cancel", "reason_code": "task_cancelled"},
                           "executor_stopped": False, "stop_confirmation_required": True},
         )
@@ -635,7 +630,7 @@ class ScoutCore:
         device = _device_from_execute(req, node_id=self.node_id)
         params = dict(req.params or {})
         ratio = params.get("compress_ratio")
-        compress = float(ratio if ratio is not None else (1.0 if device.platform in {"desktop", "mac", "win"} else 2.0))
+        compress = float(ratio if ratio is not None else (1.0 if device.platform in {"mac", "win"} else 2.0))
         shot = SCREEN.capture(
             device,
             timeout_sec=float(req.timeout_sec or 15.0),
@@ -689,8 +684,24 @@ class ScoutCore:
         device_id: str = "",
         platform: str = "",
     ) -> tuple[EventStatus, dict[str, Any]]:
-        """本地薄包装。内部转 Execute，step_idx=-1，不做幂等。"""
+        """本地薄包装。内部转 Execute，step_idx=-1，不做幂等。
+
+        `prefer` 只接受一个 executor；留空时按 sn 的平台取唯一通道。
+        """
         cap = P.OBSERVE_CAPS.get(kind, kind)
+        from mino_scout.platform.web.playwright_hub import is_web_slot
+        if platform:
+            dev_platform = _normalize_platform(platform)
+        elif is_web_slot(sn):
+            dev_platform = "web"
+        elif str(sn).startswith("mac:"):
+            dev_platform = "mac"
+        elif str(sn).startswith("win:"):
+            dev_platform = "win"
+        else:
+            dev_platform = "android"
+        device = DeviceRef(sn=sn, platform=dev_platform, adb_serial=_adb_serial_guess(sn))
+        order = list(prefer or []) or sorted(device.compatible_executors)[:1]
         ev = self.execute(
             P.Execute(
                 run_id=run_id,
@@ -698,7 +709,7 @@ class ScoutCore:
                 sn=sn,
                 capability_id=cap,
                 params={"force_fresh": force_fresh, "compress_ratio": compress_ratio},
-                executor_order=list(prefer or []),
+                executor_order=order,
                 timeout_sec=float(timeout_sec or 15.0),
                 device_id=device_id or sn,
                 platform=platform,
@@ -761,12 +772,10 @@ class ScoutCore:
                 "summary": "已读取 iOS 界面结构",
                 "extra": {"hierarchy_text": xml, "text": xml[:4000]},
             }
-        if str(device.platform or "") in {"mac", "win", "desktop"}:
-            import platform as host_platform
-
+        if str(device.platform or "") in {"mac", "win"}:
             from mino_scout.executors.desktop import DesktopUnavailable, get_desktop_runtime
 
-            mac_host = str(device.platform or "") == "mac" or (str(device.platform or "") == "desktop" and host_platform.system() == "Darwin")
+            mac_host = str(device.platform or "") == "mac"
             if mac_host:
                 from mino_scout.platform.mac.actions import hierarchy as read_tree
             else:
@@ -775,9 +784,9 @@ class ScoutCore:
                 return EventStatus.PASS, read_tree(get_desktop_runtime(), dict(device.extra or {}), str((device.extra or {}).get("run_id") or ""))
             except DesktopUnavailable as exc:
                 return EventStatus.FAIL, {"error": str(exc), "source": "mac" if mac_host else "win"}
-        if not device.adb_serial or device.adb_serial.startswith("claw-"):
+        if not device.adb_serial:
             return EventStatus.FAIL, {
-                "error": "hierarchy 目前只支持 adb 通道（remote/ios_wda 待 E3 搬迁）",
+                "error": "hierarchy 需要 adb 通道（iOS 走 WDA，Web 走 DOM，桌面走 AX/UIA）",
                 "source": "adb",
             }
         dump = H.dump_ui_nodes(device.adb_serial, force_fresh=True)
@@ -903,10 +912,11 @@ class ScoutCore:
 
     # ---------------- CANCEL ----------------
 
-    def cancel_run(self, run_id: str) -> int:
-        """丢掉该 run 的幂等缓存并标记不再继续。
+    def cancel_run(self, run_id: str) -> None:
+        """标记该 run 不再继续，并释放它占的资源。
 
         协议 §4.8：语义是"不再继续"，**不是回滚** —— 已经发给设备的动作撤不回来。
+        幂等记录由 RequestGuard 持有；这里只做停止闩 + 资源释放，不替它清缓存。
         """
         self._requests.stop(run_id, "task_cancelled", {}, terminal=True)
         if self._requests.active(run_id):
@@ -918,17 +928,14 @@ class ScoutCore:
             with self._lock:
                 self._active_runs.discard(run_id)
                 self._run_seen.pop(run_id, None)
-            return 0
+            return
         self._web_v5.close(run_id, time.monotonic() + 2)
         with self._lock:
-            keys = [k for k in self._done if k[0] == run_id]
-            for k in keys:
-                self._done.pop(k, None)
             self._active_runs.discard(run_id)
             self._run_seen.pop(run_id, None)
             if run_id:
                 self._cancelled_runs[str(run_id)] = time.time()
-        SLog.i(TAG, f"cancel run={run_id}，清掉 {len(keys)} 条幂等缓存")
+        SLog.i(TAG, f"cancel run={run_id}")
         from mino_scout.executors.desktop import get_desktop_runtime
         get_desktop_runtime().cancel(run_id)
         rid = str(run_id or "").strip()
@@ -943,7 +950,7 @@ class ScoutCore:
                     self._playwright_executor(fake).submit(lambda: _release_playwright_run(rid)).result(timeout=12.0)
             except Exception as exc:
                 SLog.w(TAG, f"cancel run playwright release: {exc!r}")
-        return len(keys)
+        return
 
     def shutdown(self) -> None:
         """进程退出：必须在 playwright 那条线程上停 Chromium。
@@ -1080,27 +1087,10 @@ class ScoutCore:
                     self._active_runs.discard(rid)
                     self._run_seen.pop(rid, None)
 
-    # ---------------- 幂等缓存 ----------------
+    # ---------------- 幂等 ----------------
 
-    def _get_cached(self, key: tuple[str, int]) -> Optional[EventResult]:
-        if key[1] < 0:  # 截图/探活/框架事件每次都要发生
-            return None
-        with self._lock:
-            self._evict_expired()
-            hit = self._done.get(key)
-        return hit[1] if hit else None
-
-    def _put_cached(self, key: tuple[str, int], result: EventResult) -> None:
-        if key[1] < 0:
-            return
-        with self._lock:
-            self._done[key] = (time.time(), result)
-            self._evict_expired()
-
-    def _evict_expired(self) -> None:
-        cutoff = time.time() - _IDEMPOTENT_TTL_SEC
-        for k in [k for k, (ts, _) in self._done.items() if ts < cutoff]:
-            self._done.pop(k, None)
+    # 幂等记录由 runtime/request_guard.py 持有：键 (run_id, step_idx)、内容比较、
+    # 在途拒绝与缓存结果都在那里。这里不再维护第二份缓存。
 
 
 def _release_playwright_run(run_id: str) -> None:
@@ -1112,7 +1102,12 @@ def _release_playwright_run(run_id: str) -> None:
 # ---------------- 载荷 ↔ 内部模型 ----------------
 
 
-_CAP_ALIASES = {"script.run": "script_run"}
+_CAP_ALIASES = {
+    "script.run": "script_run",
+    # 协议 §4.5 的短别名（docs/PROTOCOL.md 节点指令表）
+    "stop": "node.stop",
+    "restart": "node.restart",
+}
 
 
 def _canonical_cap(capability_id: str) -> str:
@@ -1239,24 +1234,15 @@ def _stop_playwright_hub() -> None:
 
 
 def _adb_serial_guess(sn: str) -> str:
-    """claw-* 是 ClawNode 伪 serial，adb 认不出来；web 槽不是设备。
-
-    真实映射由 Nexus 在 `EXECUTE.device_hint.adb_serial` 里给。这里只是
-    没带 hint 时的兜底。
-    """
+    """web 槽不是设备；其余 sn 在没带 device_hint.adb_serial 时按 serial 用。"""
     from mino_scout.platform.web.playwright_hub import is_web_slot
 
-    if not sn or sn.startswith("claw-") or is_web_slot(sn):
+    if not sn or is_web_slot(sn):
         return ""
     return sn
 
 
-def _prefer_for(device: DeviceRef) -> tuple[str, ...]:
-    return tuple(_compatible_executors(device))
 
-
-def _compatible_executors(device: DeviceRef) -> frozenset[str]:
-    return device.compatible_executors
 
 
 def _use_playwright_thread(req: P.Execute) -> bool:
@@ -1292,10 +1278,7 @@ def _probe_executor(ex_id: str, ex: Executor) -> tuple[bool, list[str], str]:
 
 
 def _discover_devices(executors: dict[str, Executor], *, scout_id: str) -> list[P.DeviceManifest]:
-    """当前只发现 adb 设备与 web 虚拟槽。
-
-    remote(ClawNode) / iOS 的发现依赖 EngineFactory 与 clawnode/ 模块（E3），未搬。
-    """
+    """发现本机可执行的设备：桌面宿主、adb 设备、iOS 设备、Web 虚拟槽。"""
     from mino_scout.executors.desktop import get_desktop_runtime
     native = get_desktop_runtime().manifest(scout_id)
     out: list[P.DeviceManifest] = [native] if native is not None else []

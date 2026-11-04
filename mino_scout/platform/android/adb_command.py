@@ -1,18 +1,17 @@
 # !/usr/bin/env python
 # -*-coding:utf-8 -*-
-"""命令级 ClawNode→adb 执行器 (v3, P1)。
+"""命令级 adb 执行器。
 
-`/device/command` 对 adb 直连设备的落地：接收与 ClawNode **完全相同**的命令名与
-params（TAP/SWIPE/OPEN_APP/INPUT_TEXT/INSTALL_APK/EXEC_SCRIPT...），本地经 adb 执行，
-并封装成与 ClawNode 回传 **相同结构**的响应 {status, stdout, stderr, message[, base64_image]}，
-使上层（send_command / rDevice）对两条渠道无感知。
+接收命令名 + params（TAP/SWIPE/OPEN_APP/INPUT_TEXT/INSTALL_APK/EXEC_SCRIPT...），
+经 adb 执行，回 `{status, stdout, stderr, message[, base64_image]}`。命令名与字段形状
+沿用历史命令契约，但**没有远程通道** —— 这里就是纯 adb。
 
 设计要点：
-  - 坐标/时长契约与 ClawNode 对齐：绝对像素 int、duration_ms 毫秒 int
-  - 渠道差异在此内部消化：url→下载再 install、keyevent 名→keycode、activity→am start -n、
+  - 坐标/时长是绝对像素与毫秒
+  - 差异在此内部消化：url→下载再 install、keyevent 名→keycode、activity→am start -n、
     TAP duration_ms→长按转 input swipe
-  - 与回归层的 AdbExecutor(capability 事件级) 互补：此处是命令级、供设备详情页直发
-  - EXEC_SCRIPT 委托 server/services/shared/adb_script.py（与 clawnode_script 隔离）
+  - 与 AdbExecutor（capability 事件级）互补：此处是命令级、供设备详情页直发
+  - EXEC_SCRIPT 委托同目录的 adb_script.py
 """
 from __future__ import annotations
 
@@ -27,7 +26,7 @@ from mino_scout.tools.keep_alive.log import SLog
 
 TAG = "AdbCommand"
 
-# ClawNode keyevent 名 → Android keycode
+# 历史命令名 keyevent → Android keycode
 _KEYEVENT_MAP: Dict[str, int] = {
     "BACK": 4, "HOME": 3, "MENU": 82, "POWER": 26, "ENTER": 66,
     "APP_SWITCH": 187, "RECENT": 187, "VOLUME_UP": 24, "VOLUME_DOWN": 25,
@@ -38,7 +37,7 @@ _KEYEVENT_MAP: Dict[str, int] = {
 
 _LONG_PRESS_MS = 500  # TAP 的 duration_ms ≥ 此值转长按(input swipe 原地)
 
-# 命令别名 → ClawNode 标准命令名（与 wClawNode.translate_control_to_clawnode 的别名对齐）
+# 命令别名 → 标准命令名
 _ALIASES: Dict[str, str] = {
     "CLICK": "TAP", "TAP": "TAP",
     "SWIPE": "SWIPE",
@@ -95,7 +94,7 @@ def _int(v: Any, default: int = 0) -> int:
 
 
 def run_adb_command(serial: str, command: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    """执行一条 ClawNode 契约命令，返回 ClawNode 结构的结果 dict（同步）。"""
+    """执行一条命令，返回 {status, stdout, stderr, message} 结构（同步）。"""
     if not serial:
         return _err("adb serial 未解析")
     params = dict(params or {})
@@ -112,7 +111,7 @@ def run_adb_command(serial: str, command: str, params: Dict[str, Any] | None = N
         return _err(f"exception: {e}")
 
 
-# ---------------- 各命令实现（对齐 ClawNode params） ----------------
+# ---------------- 各命令实现 ----------------
 
 def _h_tap(serial: str, p: Dict[str, Any]) -> Dict[str, Any]:
     x, y = _int(p.get("x")), _int(p.get("y"))
@@ -192,7 +191,7 @@ def _h_input_text(serial: str, p: Dict[str, Any]) -> Dict[str, Any]:
     if p.get("x") is not None and p.get("y") is not None:
         _adb_shell(serial, "input", "tap", str(_int(p.get("x"))), str(_int(p.get("y"))))
     if not text.isascii():
-        return _err("adb input text 不支持非 ASCII(中文)，请走 remote 渠道或 IME")
+        return _err("adb input text 不支持非 ASCII(中文)，请改用 IME 通道")
     safe = text.replace(" ", "%s")
     rc, out, err = _adb_shell(serial, "input", "text", safe)
     return _ok("input text", out) if rc == 0 else _err("input_text failed", err)
@@ -200,7 +199,7 @@ def _h_input_text(serial: str, p: Dict[str, Any]) -> Dict[str, Any]:
 
 def _h_set_clipboard(serial: str, p: Dict[str, Any]) -> Dict[str, Any]:
     # adb 无原生剪贴板写入（需 helper app / IME），明确返回不支持
-    return _err("adb 渠道不支持 SET_CLIPBOARD，请走 remote 渠道")
+    return _err("当前命令层不支持 SET_CLIPBOARD")
 
 
 def _h_install_apk(serial: str, p: Dict[str, Any]) -> Dict[str, Any]:
@@ -225,7 +224,7 @@ def _h_install_apk(serial: str, p: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _download_apk(url: str, file_name: str = "") -> str:
-    """下载 apk 到临时文件，返回本地路径（对齐 ClawNode 的 url 传参）。"""
+    """下载 apk 到临时文件，返回本地路径（支持 url 传参）。"""
     import httpx
 
     suffix = ".apk"
@@ -242,7 +241,7 @@ def _download_apk(url: str, file_name: str = "") -> str:
 
 
 def _h_get_screenshot(serial: str, p: Dict[str, Any]) -> Dict[str, Any]:
-    # exec-out 取二进制 png，转 base64，字段名与 ClawNode 回传对齐(base64_image)
+    # exec-out 取二进制 png，转 base64（字段名 base64_image）
     try:
         proc = subprocess.run(
             ["adb", "-s", serial, "exec-out", "screencap", "-p"],
@@ -266,7 +265,7 @@ def _h_get_foreground_app(serial: str, p: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _h_exec_script(serial: str, p: Dict[str, Any]) -> Dict[str, Any]:
-    """EXEC_SCRIPT 委托 adb_script（协议与 ClawNode 一致，js 返回 not_supported）。"""
+    """EXEC_SCRIPT 委托 adb_script（js 返回 not_supported）。"""
     from mino_scout.platform.android.adb_script import run_adb_script
 
     return run_adb_script(serial, p)

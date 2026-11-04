@@ -34,18 +34,19 @@ class EventStatus(str, Enum):
     server/services/ai/regression/schemas.py::EventStatus 逐字一致（小写），
     以免搬迁时到处做名字翻译。
 
-    Router 的处置（与上游 router.py:150-170 一致）：
+    **V7 合同：EXECUTE 只选定一个 executor，任何状态都结束本次尝试。**
+    Scout 不做 fallback、不改序、不追加通道；换路是 Nexus 的决策。
 
-    | status   | Router 行为          | 语义 |
-    |----------|---------------------|------|
-    | pass     | 立即返回            | 做成了 |
-    | blocked  | 立即返回            | 需要人介入 —— 换 executor 没意义 |
-    | declined | 试下一个 executor    | 主动让位，不算故障（日志 info，不计失败） |
-    | fail     | 试下一个 executor    | 真故障，但仍兜底换通道再试 |
-    | skipped  | 试下一个 executor    | 本次未执行（前置不满足等） |
+    | status   | 语义 |
+    |----------|------|
+    | pass     | 做成了 |
+    | blocked  | 需要人介入（Scout 不问人，上报 Nexus） |
+    | declined | 我不适合做这条，让位 —— 不算故障 |
+    | fail     | 真故障（设备报错、超时、元素找不到） |
+    | skipped  | 本次未执行（前置不满足等） |
 
-    注意：`declined` 与 `fail` 都会走 fallback，区别在**是否算故障**，
-    不在"换个 executor 有没有用"。
+    `declined` 与 `fail` 的区别只在**是否算故障**（污染失败统计与归因），
+    不在"要不要换通道"。
     """
 
     PASS = "pass"
@@ -253,18 +254,23 @@ class Result:
 
 @dataclass
 class ScriptRun:
-    """脚本运行载荷。只含冻结字段，经现有 EXECUTE.params 往返，不是新的消息类型。"""
+    """脚本运行载荷。只含冻结字段，经现有 EXECUTE.params 往返，不是新的消息类型。
+
+    Scout 自己按 repo_url / branch / revision 拉取脚本仓库；Nexus 不打包文件。
+    """
 
     run_id: str
     session_id: str
     case_id: str
     sn: str
     platform: str
-    script_path: str
-    files: dict[str, str] = field(default_factory=dict)
+    repo_url: str
+    branch: str = ""
+    revision: str = ""
+    script_path: str = ""
 
 
-_SCRIPT_RUN_FIELDS = ("run_id", "session_id", "case_id", "sn", "platform", "script_path", "files")
+_SCRIPT_RUN_FIELDS = ("run_id", "session_id", "case_id", "sn", "platform", "repo_url", "branch", "revision", "script_path")
 
 
 def dump_script_run(payload: ScriptRun) -> dict[str, Any]:
@@ -272,13 +278,10 @@ def dump_script_run(payload: ScriptRun) -> dict[str, Any]:
 
 
 def load_script_run(raw: dict[str, Any]) -> ScriptRun:
-    """未知字段忽略。缺冻结字段或 files 不是字符串映射则拒绝。"""
+    """未知字段忽略。缺冻结字段则拒绝。"""
     if not isinstance(raw, dict):
         raise ValueError("script_run_invalid")
     known = {name: raw[name] for name in _SCRIPT_RUN_FIELDS if name in raw}
-    files = known.get("files", {})
-    if not isinstance(files, dict) or any(type(key) is not str or type(value) is not str for key, value in files.items()):
-        raise ValueError("script_run_invalid")
     try:
         body = _decode(ScriptRun, known)
     except (TypeError, ValueError) as exc:

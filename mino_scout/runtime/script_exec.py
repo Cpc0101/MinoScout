@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ast
+import difflib
 import importlib.util
 import sys
 import threading
@@ -17,8 +18,8 @@ from mino_scout.executors.base import DeviceRef, ExecutorContext
 from mino_scout.schemas import PlanEvent
 
 _CELLS = {"android": "uiautomator", "ios": "xcuitest", "web": "playwright", "mac": "ax", "win": "uia"}
-_EXECUTOR = {"android": "adb", "ios": "ios_wda", "web": "playwright", "mac": "desktop", "win": "desktop"}
-_ITEM = {"android": "adb", "ios": "appium", "web": "chromium", "mac": "desktop", "win": "desktop"}
+_EXECUTOR = {"android": "adb", "ios": "ios_wda", "web": "playwright", "mac": "mac", "win": "win"}
+_ITEM = {"android": "adb", "ios": "appium", "web": "chromium", "mac": "mac", "win": "win"}
 _BANNED = {"adbutils", "uiautomator2", "playwright", "facebook", "facebook_wda", "wda", "appium", "selenium", "subprocess"}
 _HIDDEN = {"otp", "password", "text", "image_base64", "image", "secret", "token"}
 _RUN_LOCK = threading.Lock()
@@ -48,19 +49,18 @@ class ActionResult:
 
 
 class _Scope:
-    def __init__(self, case: "Case", number: int, role: str):
+    def __init__(self, case: "Case", number: "int | str", role: str):
         self._case = case
         self._number = number
         self._role = role
 
+    def _body(self, **extra: Any) -> dict[str, Any]:
+        key = "title" if isinstance(self._number, str) else "number"
+        return {"op": "step", "role": self._role, key: self._number, **extra}
+
     def __enter__(self) -> "Case":
         self._case._guard()
-        self._case._callback("script.callback", {
-            "op": "step",
-            "action": "enter",
-            "role": self._role,
-            "number": self._number,
-        }, 15)
+        self._case._callback("script.callback", self._body(action="enter"), 15)
         self._case._step = self._number
         self._case._role = self._role
         return self._case
@@ -68,13 +68,7 @@ class _Scope:
     def __exit__(self, exc_type, exc, tb) -> bool:
         failed = exc_type is not None
         try:
-            self._case._callback("script.callback", {
-                "op": "step",
-                "action": "leave",
-                "role": self._role,
-                "number": self._number,
-                "failed": failed,
-            }, 15)
+            self._case._callback("script.callback", self._body(action="leave", failed=failed), 15)
         except Exception:
             if exc_type is None:
                 raise
@@ -101,11 +95,12 @@ def run(core, payload, root: Path, *, deadline: float, stop) -> dict[str, Any]:
 def _run_locked(core, payload, root: Path, *, deadline: float, stop) -> dict[str, Any]:
     case = None
     try:
-        _reject_source(root, payload.script_path)
         if str(payload.platform) == "web":
             from mino_scout.platform.web.playwright_hub import get_hub
             get_hub().note_lane(str(payload.run_id or ""))
         case = Case(core, payload, root, deadline=deadline, stop=stop)
+        if getattr(payload, "revision", ""):
+            case._report("checkout", ActionResult(ok=True, summary=f"脚本仓库提交 {payload.revision}", status="pass"), "scout", 0)
         _execute_hooks(root, payload.script_path, case)
         return {"status": "pass", "summary": "脚本执行完成", "error": "", "reason_code": "", "touched": bool(case.touched)}
     except ScriptHalt as exc:
@@ -173,11 +168,135 @@ def _execute_hooks(root: Path, script_path: str, case: "Case") -> None:
                 pass
         for name in loaded:
             sys.modules.pop(name, None)
-        for name in [key for key in sys.modules if key == "scripts" or key.startswith("scripts.")]:
+        for name in [key for key in sys.modules if key in {"scripts", "flows"} or key.startswith(("scripts.", "flows."))]:
             sys.modules.pop(name, None)
 
 
+class AppRef:
+    """case.config.<KEY> 的值。只表示 config.yaml 里的一个应用，不能自己构造。"""
+
+    __slots__ = ("key", "app_id", "platform", "package", "url")
+
+    def __init__(self, key: str, platform: str, package: str, url: str, app_id: str = ""):
+        self.key = key
+        self.app_id = app_id
+        self.platform = platform
+        self.package = package
+        self.url = url
+
+
+def _load_apps(root: Path) -> tuple[dict | None, str]:
+    """读脚本仓库根的 config.yaml。返回（apps, 失败原因）。"""
+    path = root / "config.yaml"
+    if not path.is_file():
+        return None, "仓库根目录没有 config.yaml"
+    try:
+        doc = parse_yaml(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, f"config.yaml 解析失败：{exc}"
+    apps = doc.get("apps") if isinstance(doc, dict) else None
+    if not isinstance(apps, dict):
+        return None, "config.yaml 顶层要有 apps"
+    return apps, ""
+
+
+class _Config:
+    """config.yaml 的 apps。行里有 envs 时按本次运行的环境取一份。"""
+
+    def __init__(self, apps: Any, env: str, problem: str = ""):
+        self._apps: dict[str, AppRef] = {}
+        self._missing_env: dict[str, str] = {}
+        self._problem = problem
+        if not isinstance(apps, dict):
+            return
+        for key, row in apps.items():
+            if not isinstance(row, dict):
+                continue
+            envs = row.get("envs")
+            if isinstance(envs, dict):
+                picked = envs.get(env)
+                if not isinstance(picked, dict):
+                    self._missing_env[str(key)] = env
+                    continue
+                row = {**{k: v for k, v in row.items() if k != "envs"}, **picked}
+            package = str(row.get("package") or row.get("bundle_id") or row.get("bundle") or "")
+            self._apps[str(key)] = AppRef(str(key), str(row.get("platform") or ""), package, str(row.get("url") or ""), str(row.get("app_id") or ""))
+
+    def __getattr__(self, name: str) -> AppRef:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        if self._problem:
+            raise ScriptAbort(self._problem, reason_code="config_missing")
+        ref = self._apps.get(name)
+        if ref is None:
+            if name in self._missing_env:
+                raise ScriptAbort(f"config.yaml 里 {name} 没有 env={self._missing_env[name] or '(未指定)'} 的配置", reason_code="config_missing")
+            raise ScriptAbort(f"config.yaml 的 apps 里没有 {name}", reason_code="config_missing")
+        return ref
+
+
+class _Scout:
+    """本机能力。不绑定设备，不需要实例化。"""
+
+    def __init__(self, case: "Case"):
+        self._case = case
+
+    def wait(self, ms: int) -> ActionResult:
+        from mino_scout.platform.scout.run import wait
+
+        return wait(self._case, ms)
+
+    def otp_mail(self) -> str:
+        from mino_scout.server_comm.callbacks import otp_mail
+
+        return otp_mail(self._case)
+
+    def llm(self, prompt: str, text: str = "", schema: dict | None = None) -> Any:
+        from mino_scout.server_comm.callbacks import llm
+
+        return llm(self._case, prompt, text=text, schema=schema)
+
+
+class _Nexus:
+    """写入 Nexus 的能力。不绑定设备，不需要实例化。"""
+
+    def __init__(self, case: "Case"):
+        self._case = case
+
+    def prep(self, number: int) -> _Scope:
+        from mino_scout.platform.scout.run import prep
+
+        return prep(self._case, number)
+
+    def do(self, number: int) -> _Scope:
+        from mino_scout.platform.scout.run import do
+
+        return do(self._case, number)
+
+    def check(self, number: int) -> _Scope:
+        from mino_scout.platform.scout.run import check
+
+        return check(self._case, number)
+
+    def account(self) -> SimpleNamespace:
+        from mino_scout.server_comm.callbacks import account
+
+        return account(self._case)
+
+    def note(self, text: str, **fields: Any) -> None:
+        from mino_scout.server_comm.callbacks import note
+
+        return note(self._case, text, **fields)
+
+    def fail(self, message: str) -> None:
+        from mino_scout.platform.scout.run import fail
+
+        return fail(self._case, message)
+
+
 class Case:
+    """一次运行的共享上下文。设备动作在 case.init(...) 返回的 App 上。"""
+
     def __init__(self, core, payload, root: Path, *, deadline: float, stop):
         self.core = core
         self.run_id = str(payload.run_id)
@@ -185,35 +304,114 @@ class Case:
         self._sn = str(payload.sn)
         self._platform = str(payload.platform)
         self._hint = dict(getattr(payload, "device_hint", None) or {})
-        self._pages = _load_pages(root)
-        self._page_key = ""
-        self._package = str(self._hint.get("target_package") or self._hint.get("package") or self._hint.get("bundle_id") or "")
-        self._url = str(self._hint.get("url") or "")
+        self._all_pages = _load_pages(root)
+        self.env = str(self._hint.get("env") or "")
+        self.app_id = str(self._hint.get("app_id") or "")
+        apps, problem = _load_apps(root)
+        self.config = _Config(apps, self.env, problem)
+        self.scout = _Scout(self)
+        self.nexus = _Nexus(self)
         self.deadline = float(deadline or 0)
         self.stop = stop
         self.touched = False
-        self._shot = None
-        self._frames: list[Any] = []
         self._seq = 0
         self._step: int | None = None
         self._role = ""
         self._started = time.time()
         self._mail_to = ""
+        self._apps: dict[str, App] = {}
 
-    def prep(self, number: int) -> _Scope:
-        from mino_scout.platform.scout.run import prep
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        raise _unknown("case", name, ["config", "env", "app_id", "init", "scout", "nexus"],
+                       "。设备动作写在 app = case.init(case.config.<KEY>) 返回的 app 上")
 
-        return prep(self, number)
+    def init(self, ref: AppRef) -> "App":
+        self._guard()
+        if not isinstance(ref, AppRef):
+            raise ScriptAbort("case.init 只接受 case.config.<KEY>", reason_code="config_invalid")
+        if ref.platform != self._platform:
+            raise ScriptAbort(f"应用 {ref.key} 是 {ref.platform}，本次运行是 {self._platform}", reason_code="platform_mismatch")
+        app = self._apps.get(ref.key)
+        if app is None:
+            app = self._apps[ref.key] = App(self, ref)
+        return app
 
-    def do(self, number: int) -> _Scope:
-        from mino_scout.platform.scout.run import do
+    def _report(self, capability: str, result: ActionResult, executor: str, elapsed: int, image=None,
+                app: str = "", extra: dict[str, Any] | None = None) -> None:
+        body = {
+            "capability_id": capability,
+            "status": result.status,
+            "summary": result.summary[:300],
+            "error": "" if result.ok else result.summary[:300],
+            "executor_used": executor,
+            "elapsed_ms": int(elapsed),
+        }
+        if app:
+            body["app"] = app
+        if extra:
+            body.update(extra)
+        if self._step is not None:
+            body["case_step"] = self._step
+            body["role"] = self._role
+        if image is not None:
+            body["image_base64"] = str(getattr(image, "image_base64", "") or "")
+            body["image_mime"] = str(getattr(image, "image_mime", "") or "")
+            body["width"] = int(getattr(image, "width", 0) or 0)
+            body["height"] = int(getattr(image, "height", 0) or 0)
+        self._callback("script.session", {"op": "tool_result", "event_type": "tool/result", "event": body}, 20)
 
-        return do(self, number)
+    def _callback(self, capability: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
+        from mino_scout.server_comm.nexus_link import call
 
-    def check(self, number: int) -> _Scope:
-        from mino_scout.platform.scout.run import check
+        return call(self, capability, params, timeout)
 
-        return check(self, number)
+    def _guard(self) -> None:
+        if self.stop is not None and self.stop.is_set():
+            raise ScriptHalt("脚本运行超时", reason_code="script_timeout")
+        if self.deadline and time.monotonic() >= self.deadline:
+            raise ScriptHalt("脚本运行超时", reason_code="script_timeout")
+        requests = getattr(self.core, "_requests", None)
+        if requests is not None and self.run_id and requests.stopped(self.run_id):
+            raise ScriptHalt("运行已取消", reason_code="cancelled")
+
+
+def _shared(name: str) -> property:
+    return property(lambda self: getattr(self._case, name), lambda self, value: setattr(self._case, name, value))
+
+
+class App:
+    """被测应用。所有会碰设备的动作都在这里。由 case.init(case.config.<KEY>) 得到。"""
+
+    core = _shared("core")
+    run_id = _shared("run_id")
+    session_id = _shared("session_id")
+    deadline = _shared("deadline")
+    stop = _shared("stop")
+    touched = _shared("touched")
+    _sn = _shared("_sn")
+    _platform = _shared("_platform")
+    _hint = _shared("_hint")
+    _seq = _shared("_seq")
+    _started = _shared("_started")
+    _mail_to = _shared("_mail_to")
+
+    def __init__(self, case: Case, ref: AppRef):
+        self._case = case
+        self.key = ref.key
+        self._package = ref.package
+        self._url = ref.url
+        self._pages = case._all_pages.get(ref.key, {})
+        self._page_key = ""
+        self._shot = None
+        self._frames: list[Any] = []
+
+    # ---- 启停
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        raise _unknown("app", name, _public_names(App))
 
     def launch(self) -> ActionResult:
         return self._device("launch_app", {"package": self._package, "bundle": self._package, "bundle_id": self._package, "url": self._url})
@@ -221,20 +419,104 @@ class Case:
     def close(self) -> ActionResult:
         return self._device("close_app", {"package": self._package, "bundle": self._package, "bundle_id": self._package})
 
+    def kill(self) -> ActionResult:
+        return self._device("kill_app", {"package": self._package, "bundle": self._package, "bundle_id": self._package})
+
+    def install(self, path: str) -> ActionResult:
+        return self._device("install", {"path": str(path or "")})
+
+    def uninstall(self) -> ActionResult:
+        return self._device("uninstall_app", {"package": self._package, "bundle": self._package, "bundle_id": self._package})
+
+    def clear_cache(self) -> ActionResult:
+        return self._device("clear_app_cache", {"package": self._package, "bundle": self._package, "bundle_id": self._package})
+
+    def version(self) -> ActionResult:
+        return self._device("get_app_version", {"package": self._package, "bundle": self._package, "bundle_id": self._package})
+
+    def foreground(self) -> ActionResult:
+        return self._device("get_foreground_app", {})
+
+    # ---- 操作
+    def tap(self, control: str) -> ActionResult:
+        params = self._locate(str(control or ""), "tap")
+        if self._platform == "web":
+            return self._web("tap", params)
+        return self._device("tap_element", params)
+
+    def tap_xy(self, x: int, y: int) -> ActionResult:
+        return self._device("tap_xy", {"x": int(x), "y": int(y)})
+
+    def long_press(self, control: str, duration_ms: int = 1000) -> ActionResult:
+        params = self._locate(str(control or ""), "long_press")
+        params["duration_ms"] = int(duration_ms)
+        return self._device("long_press_element", params)
+
+    def input(self, control: str, text: str) -> ActionResult:
+        params = self._locate(str(control or ""), "input")
+        params["text"] = str(text or "")
+        if self._platform == "web":
+            return self._web("input", params, text=str(text or ""))
+        return self._device("input_text", params)
+
     def swipe(self, direction: str) -> ActionResult:
         name = str(direction or "").strip().lower()
         if name not in {"up", "down", "left", "right"}:
             raise ScriptAbort("滑动方向必须是 up、down、left 或 right", reason_code="script_failed")
         return self._device("swipe_direction", {"direction": name})
 
+    def drag(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 400) -> ActionResult:
+        return self._device("swipe_element_to_element", {
+            "from_x": int(x1), "from_y": int(y1), "to_x": int(x2), "to_y": int(y2),
+            "duration_ms": int(duration_ms), "point_policy": "coordinate"})
+
+    def press(self, key: str) -> ActionResult:
+        return self._device("press_key", {"key": str(key or "")})
+
     def back(self) -> ActionResult:
-        return self._device("press_key", {"key": "back"})
+        return self.press("back")
 
-    def wait(self, ms: int) -> ActionResult:
-        from mino_scout.platform.scout.run import wait
+    def set_clipboard(self, text: str) -> ActionResult:
+        return self._device("set_clipboard", {"text": str(text or "")})
 
-        return wait(self, ms)
+    def set_ime(self, ime: str = "adbkeyboard") -> ActionResult:
+        return self._device("set_input_method", {"ime": str(ime or "adbkeyboard")})
 
+    def read_data(self, key: str = "sim") -> ActionResult:
+        return self._device("read_device_data", {"key": str(key or "sim")})
+
+    def exec(self, script: str, timeout_ms: int = 30000, language: str = "") -> ActionResult:
+        """在该渠道上执行一段命令。设备层兜底的唯一出口。"""
+        import hashlib
+
+        body = str(script or "")
+        params: dict[str, Any] = {"script": body, "timeout_ms": int(timeout_ms)}
+        if language:
+            params["language"] = str(language)
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        return self._device("exec_script", params, extra={"script_sha256": digest, "script_length": len(body)})
+
+    # ---- Web 专有
+    def reload(self) -> ActionResult:
+        return self._device("reload_page", {})
+
+    def open_tab(self, url: str = "") -> ActionResult:
+        return self._device("open_tab", {"url": str(url or self._url)})
+
+    def switch_tab(self, index: int) -> ActionResult:
+        return self._device("switch_tab", {"tab_index": int(index)})
+
+    def upload(self, path: str, control: str = "") -> ActionResult:
+        params = self._locate(str(control), "upload") if control else {}
+        params["file_path"] = str(path or "")
+        return self._device("upload_file", params)
+
+    def wait_ready(self, timeout_ms: int = 20000, control: str = "") -> ActionResult:
+        params = self._locate(str(control), "wait_ready") if control else {}
+        params["timeout_ms"] = int(timeout_ms)
+        return self._device("wait_screen_ready", params)
+
+    # ---- 观察
     def screenshot(self) -> ActionResult:
         self._guard()
         self._require_channel()
@@ -274,42 +556,6 @@ class Case:
 
         return on_page(self, page_key)
 
-    def _locate(self, control: str, kind: str) -> dict[str, Any]:
-        try:
-            return self._locator_params(control)
-        except ScriptAbort as exc:
-            if exc.reason_code in {"locator_missing", "control_unknown"}:
-                self._report(kind, ActionResult(ok=False, summary=exc.reason_code, status="fail"), "script", 0)
-            raise
-
-    def tap(self, control: str) -> ActionResult:
-        params = self._locate(str(control or ""), "tap")
-        if self._platform == "web":
-            return self._web("tap", params)
-        return self._device("tap_element", params)
-
-    def input(self, control: str, text: str) -> ActionResult:
-        params = self._locate(str(control or ""), "input")
-        params["text"] = str(text or "")
-        if self._platform == "web":
-            return self._web("input", params, text=str(text or ""))
-        return self._device("input_text", params)
-
-    def account(self) -> SimpleNamespace:
-        from mino_scout.server_comm.callbacks import account
-
-        return account(self)
-
-    def otp_mail(self) -> str:
-        from mino_scout.server_comm.callbacks import otp_mail
-
-        return otp_mail(self)
-
-    def llm(self, prompt: str, text: str = "", schema: dict | None = None) -> Any:
-        from mino_scout.server_comm.callbacks import llm
-
-        return llm(self, prompt, text=text, schema=schema)
-
     def vlm(self, prompt: str, verdict: str = "") -> str:
         from mino_scout.server_comm.callbacks import vlm
 
@@ -320,24 +566,20 @@ class Case:
 
         return vlm_frame(self, index, prompt, verdict=verdict)
 
-    def note(self, text: str, **fields: Any) -> None:
-        from mino_scout.server_comm.callbacks import note
+    # ---- 内部
+    def _locate(self, control: str, kind: str) -> dict[str, Any]:
+        try:
+            return self._locator_params(control)
+        except ScriptAbort as exc:
+            if exc.reason_code in {"locator_missing", "control_unknown"}:
+                self._report(kind, ActionResult(ok=False, summary=exc.reason_code, status="fail"), "script", 0)
+            raise
 
-        return note(self, text, **fields)
-
-    def fail(self, message: str) -> None:
-        from mino_scout.platform.scout.run import fail
-
-        return fail(self, message)
-
-    def event(self, name: str = "", **params: Any) -> ActionResult:
-        raise ScriptAbort("event_disabled", reason_code="event_disabled")
-
-    def _device(self, capability: str, params: dict[str, Any]) -> ActionResult:
+    def _device(self, capability: str, params: dict[str, Any], extra: dict[str, Any] | None = None) -> ActionResult:
         self._guard()
         executor = self._require_channel()
         if not executor.supports(capability):
-            raise ScriptAbort(f"缺 {_ITEM.get(self._platform, '渠道')}", reason_code="channel_missing")
+            raise ScriptAbort(f"{self._platform} 渠道不支持 {capability}", reason_code="declined")
         self.touched = True
         self._seq += 1
         event = PlanEvent(seq=self._seq, capability_id=capability, event_kind=capability, params=dict(params),
@@ -347,7 +589,7 @@ class Case:
         elapsed = int((time.perf_counter() - started) * 1000)
         status = str(getattr(result.status, "value", result.status) or "fail")
         action = ActionResult(ok=status == "pass", summary=str(result.summary or ""), status=status, data=_public(result.raw_response))
-        self._report(capability, action, str(result.executor_used or _EXECUTOR[self._platform]), elapsed)
+        self._report(capability, action, str(result.executor_used or _EXECUTOR[self._platform]), elapsed, extra=extra)
         return action
 
     def _web(self, kind: str, params: dict[str, Any], text: str = "") -> ActionResult:
@@ -388,7 +630,7 @@ class Case:
             if self._platform == "mac":
                 from mino_scout.platform.mac.script import locator_params
                 return locator_params(selector)
-            if self._platform in {"win", "desktop"}:
+            if self._platform == "win":
                 from mino_scout.platform.win.script import locator_params
                 return locator_params(selector)
         except ValueError:
@@ -414,13 +656,13 @@ class Case:
         return executor
 
     def _device_ref(self) -> DeviceRef:
-        hint = self._hint
+        hint = dict(self._hint)
         extra = {key: value for key, value in hint.items() if key not in {"password", "adb_serial", "udid", "model"}}
         extra["run_id"] = self.run_id
         if self._package:
-            extra.setdefault("target_package", self._package)
+            extra["target_package"] = self._package
         if self._url:
-            extra.setdefault("url", self._url)
+            extra["url"] = self._url
         serial = str(hint.get("adb_serial") or "")
         udid = str(hint.get("udid") or "")
         if self._platform == "android":
@@ -432,86 +674,15 @@ class Case:
         return DeviceRef(sn=self._sn, platform=self._platform, adb_serial=serial,
                          udid=udid, model=str(hint.get("model") or ""), extra=extra)
 
-    def _report(self, capability: str, result: ActionResult, executor: str, elapsed: int, image=None) -> None:
-        body = {
-            "capability_id": capability,
-            "status": result.status,
-            "summary": result.summary[:300],
-            "error": "" if result.ok else result.summary[:300],
-            "executor_used": executor,
-            "elapsed_ms": int(elapsed),
-        }
-        if self._step is not None:
-            body["case_step"] = self._step
-            body["role"] = self._role
-        if image is not None:
-            body["image_base64"] = str(getattr(image, "image_base64", "") or "")
-            body["image_mime"] = str(getattr(image, "image_mime", "") or "")
-            body["width"] = int(getattr(image, "width", 0) or 0)
-            body["height"] = int(getattr(image, "height", 0) or 0)
-        self._callback("script.session", {"op": "tool_result", "event_type": "tool/result", "event": body}, 20)
+    def _report(self, capability: str, result: ActionResult, executor: str, elapsed: int, image=None,
+                extra: dict[str, Any] | None = None) -> None:
+        self._case._report(capability, result, executor, elapsed, image=image, app=self.key, extra=extra)
 
     def _callback(self, capability: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
-        from mino_scout.server_comm.nexus_link import call
-
-        return call(self, capability, params, timeout)
+        return self._case._callback(capability, params, timeout)
 
     def _guard(self) -> None:
-        if self.stop is not None and self.stop.is_set():
-            raise ScriptHalt("脚本运行超时", reason_code="script_timeout")
-        if self.deadline and time.monotonic() >= self.deadline:
-            raise ScriptHalt("脚本运行超时", reason_code="script_timeout")
-        requests = getattr(self.core, "_requests", None)
-        if requests is not None and self.run_id and requests.stopped(self.run_id):
-            raise ScriptHalt("运行已取消", reason_code="cancelled")
-
-
-def _reject_source(root: Path, script_path: str) -> None:
-    paths = [root / script_path]
-    paths.extend(path for path in root.rglob("*.py") if path.is_file())
-    for path in paths:
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except SyntaxError as exc:
-            raise ScriptAbort(f"脚本语法错误：{path.name}", reason_code="script_failed") from exc
-        if _calls_event(tree):
-            raise ScriptAbort("event_disabled", reason_code="event_disabled")
-        if _forbidden(tree):
-            raise ScriptAbort("脚本不能连接 adb、WDA、Playwright 或 Appium，也不能按 platform 分支", reason_code="script_forbidden")
-
-
-def _calls_event(tree: ast.AST) -> bool:
-    for node in ast.walk(tree):
-        func = getattr(node, "func", None)
-        if isinstance(node, ast.Call) and isinstance(func, ast.Attribute) and func.attr == "event" and isinstance(func.value, ast.Name) and func.value.id == "case":
-            return True
-    return False
-
-
-def _forbidden(tree: ast.AST) -> bool:
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            if any(alias.name.split(".", 1)[0] in _BANNED for alias in node.names):
-                return True
-        elif isinstance(node, ast.ImportFrom):
-            if str(node.module or "").split(".", 1)[0] in _BANNED:
-                return True
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"exec", "eval", "__import__"}:
-            return True
-        elif isinstance(node, ast.Attribute) and node.attr in {"system", "popen"} and isinstance(node.value, ast.Name) and node.value.id == "os":
-            return True
-        elif isinstance(node, ast.If) and _mentions_platform(node.test):
-            return True
-    return False
-
-
-def _mentions_platform(node: ast.AST) -> bool:
-    for child in ast.walk(node):
-        if isinstance(child, ast.Name) and child.id == "platform":
-            return True
-        if isinstance(child, ast.Attribute) and child.attr == "platform":
-            return True
-    return False
+        self._case._guard()
 
 
 def _load_hook(path: Path, name: str, module_name: str, loaded: list[str]) -> Callable | None:
@@ -538,19 +709,23 @@ def _load(path: Path, module_name: str, loaded: list[str]):
     return module
 
 
-def _load_pages(root: Path) -> dict[str, dict]:
-    pages: dict[str, dict] = {}
+def _load_pages(root: Path) -> dict[str, dict[str, dict]]:
+    """pages/<APP_KEY>/<page>.yaml → {APP_KEY: {page_key: 文档}}。"""
+    pages: dict[str, dict[str, dict]] = {}
     folder = root / "pages"
     if not folder.is_dir():
         return pages
     for path in sorted(folder.rglob("*")):
         if path.suffix.lower() not in {".yaml", ".yml"} or not path.is_file():
             continue
+        parts = path.relative_to(folder).parts
+        if len(parts) < 2:
+            raise ScriptAbort(f"页面文件要放在 pages/<APP_KEY>/ 下：{path.name}", reason_code="script_failed")
         document = parse_yaml(path.read_text(encoding="utf-8"))
         if not isinstance(document, dict):
             raise ScriptAbort(f"页面文件不是映射：{path.name}", reason_code="script_failed")
         key = str(document.get("page_key") or path.stem)
-        pages[key] = document
+        pages.setdefault(parts[0], {})[key] = document
     return pages
 
 

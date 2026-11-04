@@ -1,17 +1,17 @@
 # !/usr/bin/env python
 # -*-coding:utf-8 -*-
-"""adb 版 EXEC_SCRIPT 脚本库 (v3, P2)。
+"""adb 版 EXEC_SCRIPT 脚本库。
 
-与 ClawNode 方案**协议一致**（相同的 params {script, language, timeout_ms} 与 script_id
-语义、相同的回传结构 {status, stdout, stderr, message}），但脚本**另起一套、绝不 import
-clawnode_script**，内建脚本用 adb 原语重写 —— 改 adb 脚本不影响 ClawNode 方案。
+命令形状沿用历史契约（params `{script, language, timeout_ms}`、script_id
+语义、回传 `{status, stdout, stderr, message}`），但脚本实现**全部用 adb 原语**，
+不 import 任何设备侧代理模块。
 
 language 支持：
   - dsl   ：JSON {"steps":[{op...}]}，逐步映射成 adb 命令
   - shell ：直接作为 adb shell 命令执行（可多行，按行执行）
-  - js    ：ClawNode 的 claw.* API，adb 无对应 → 返回 not_supported
+  - js    ：需要设备侧代理的 claw.* API，adb 无对应 → 返回 not_supported
 
-DSL op（与 clawnode_script 生成的 DSL 对齐）：
+DSL op：
   wake / sleep{ms} / key{key} / open_app_details{package} / foreground{expect} / shell{cmd}
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ from mino_scout.platform.android.adb_command import _adb_shell, _KEYEVENT_MAP, _
 
 TAG = "AdbScript"
 
-# ---------------- 内建脚本（adb 原语重写，与 clawnode_script 的 script_id 同名） ----------------
+# ---------------- 内建脚本（adb 原语重写，script_id 与历史命令层同名） ----------------
 _BUILTIN: Dict[str, Dict[str, Any]] = {}
 
 
@@ -90,10 +90,10 @@ def list_script_ids() -> List[str]:
     return sorted(_BUILTIN.keys())
 
 
-# ---------------- 解析（对齐 clawnode_script.resolve_script 语义） ----------------
+# ---------------- 解析（语义与历史命令层一致） ----------------
 
 def _flatten_params(params: Dict[str, Any] | None) -> Dict[str, Any]:
-    """摊平 {capability_id, params:{...}} 嵌套，与 clawnode 侧一致。"""
+    """摊平 {capability_id, params:{...}} 嵌套。"""
     p = dict(params or {})
     inner = p.get("params")
     if isinstance(inner, dict):
@@ -126,7 +126,7 @@ def resolve_adb_script(
 # ---------------- 执行 ----------------
 
 def run_adb_script(serial: str, params: Dict[str, Any] | None) -> Dict[str, Any]:
-    """执行 EXEC_SCRIPT（adb 渠道）。params 与 ClawNode 一致：script/language/timeout_ms/script_id/script_vars。"""
+    """执行 EXEC_SCRIPT（adb 渠道）。params：script/language/timeout_ms/script_id/script_vars。"""
     if not serial:
         return _err("adb serial 未解析")
     p = _flatten_params(params)
@@ -142,7 +142,7 @@ def run_adb_script(serial: str, params: Dict[str, Any] | None) -> Dict[str, Any]
 
     language = (language or "dsl").lower()
     if language == "js":
-        return {"status": "not_supported", "message": "adb 渠道不支持 js(claw.*) 脚本，请走 remote 渠道",
+        return {"status": "not_supported", "message": "adb 渠道不支持 js(claw.*) 脚本",
                 "stdout": "", "stderr": "js not supported on adb"}
     if language == "shell":
         return _run_shell_script(serial, body)

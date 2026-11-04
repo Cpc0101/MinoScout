@@ -12,9 +12,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Optional, Protocol, runtime_checkable
+from typing import Any, Optional, Protocol, runtime_checkable
 
-from mino_scout.schemas import CapturedScreen, EventResult, EventStatus, PlanEvent
+from mino_scout.schemas import EventResult, EventStatus, PlanEvent
 
 
 @dataclass
@@ -26,8 +26,8 @@ class DeviceRef:
     """
 
     sn: str
-    platform: str = ""          # android | ios | web
-    adb_serial: str = ""               # claw-* 设备解析后的真实 serial
+    platform: str = ""          # android | ios | web | mac | win
+    adb_serial: str = ""               # Android adb serial（device_hint 优先，缺省回退 sn）
     udid: str = ""                     # iOS
     password: str = ""                 # 锁屏密码。禁止入日志
     model: str = ""
@@ -45,10 +45,12 @@ class DeviceRef:
         if self.is_web:
             return frozenset({"playwright"})
         plat = str(self.platform or "").strip().lower()
-        if plat in {"mac", "win"}:
-            return frozenset({"desktop"})
+        if plat == "mac":
+            return frozenset({"mac"})
+        if plat == "win":
+            return frozenset({"win"})
         if plat == "android":
-            return frozenset({"adb", "remote"})
+            return frozenset({"adb"})
         if plat == "ios":
             return frozenset({"ios_wda"})
         return frozenset()
@@ -62,35 +64,24 @@ class ExecutorContext:
     run_id: str = ""
     step_idx: int = -1
 
-    # 若 Nexus 在这一步之前 OBSERVE 过并把帧带下来，放这里，避免重复抓图
-    screen: Optional[CapturedScreen] = None
-
-    # 抓图通道优先序。executor 需在派发中途重新抓图时沿用同一优先级
-    capture_prefer: tuple[str, ...] = ()
-
-    # 可被 executor 之间共享的 KV（如 last_locate_result，下一个事件可复用）
+    # 同一次派发内可被 executor 复用的 KV（如 write_stopped 回调）
     shared: dict[str, Any] = field(default_factory=dict)
 
     # Nexus 从能力目录抄来的 Implementation 元数据（dict 形态，避免依赖目录模型）
     selected_impl: Optional[dict[str, Any]] = None
-
-    # 子事件 dispatch 回调，底层是 router.dispatch 的瘦封装。
-    # 上游给 AiPersonaExecutor 用；该 executor 归 Nexus，本仓保留是为了
-    # low_level 的 shell_seq 之类未来可能的复合动作。
-    dispatch_subevent: Optional[Callable[[PlanEvent], EventResult]] = None
 
 
 @runtime_checkable
 class Executor(Protocol):
     """所有设备执行通道的统一接口。"""
 
-    id: str  # adb | remote | ios_wda | playwright
+    id: str  # adb | ios_wda | playwright | mac | win
 
     def supports(self, capability_id: str, low_level: Optional[dict[str, Any]] = None) -> bool:
         """该 executor 是否处理这条 capability。
 
-        Router 会用它做硬校验。必须便宜、纯判断、**不碰设备** —— 它在 fallback
-        链的每一环都会被调用。
+        Router 会用它做硬校验。必须便宜、纯判断、**不碰设备** —— 它只在这条
+        请求被派发前调用一次（Scout 不做 fallback）。
 
         `low_level` 是 `EXECUTE` 载荷里 Nexus 抄来的 low_level 段。
         **这个参数是相对上游的一处有意改动**：上游 `AdbExecutor.supports()` 通过
@@ -108,7 +99,7 @@ class Executor(Protocol):
 
         **必须捕获自身全部异常，永不抛。** 返回五态之一（见 docs/CONVENTIONS.md §2）：
           pass     做成了
-          blocked  需要人介入 —— Router 立即返回，中断 fallback
+          blocked  需要人介入 —— 结束本次尝试
           declined 我不适合做这条，让位 —— 不算故障
           fail     真故障
           skipped  本次未执行

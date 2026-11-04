@@ -2,14 +2,13 @@
 
 port(scout): 源自 MiniOrangeServer `server/services/regression/screen.py`（578 行）。
 
-**已搬：adb、playwright。** 其余两条通道待后续批次：
-  - remote (ClawNode)  依赖 EngineFactory（MIGRATION.md 的 E3），未搬
-  - ios_wda            依赖 ios_wda_session + EngineFactory，未搬
+四种通道都已实现：adb / ios_wda / playwright / macOS·Windows 原生。按设备平台分派，
+**不做多通道回退** —— 选哪条通道是 Nexus 的事。
 
 与上游的差异：
   - `CapturedScreen` 移到 `mino_scout.schemas`（要进 RESULT 载荷，改成 pydantic）。
     上游的 `image_path` 字段在本仓叫 `path`。
-  - `capture_screen(ctx: RunContext, ...)` 的入口签名改成 `capture(device, prefer=...)`
+  - `capture_screen(ctx: RunContext, ...)` 的入口签名改成 `capture(device)`
     —— Scout 没有 RunContext（那是 Nexus 的）。
   - Web 压缩比上游从 `system_settings_service.get_ai_web_compress_ratio()` 读（Nexus 设置），
     本仓改为由 `OBSERVE.compress_ratio` 下发（协议 §4.4）。
@@ -137,8 +136,6 @@ def compress_web_png(png_bytes: bytes, ratio: float) -> tuple[bytes, str, int, i
 
 
 def _platform_capture(device):
-    import platform as host_platform
-
     name = str(getattr(device, "platform", "") or "")
     if name == "android":
         from mino_scout.platform.android.screen import capture as take
@@ -146,9 +143,9 @@ def _platform_capture(device):
         from mino_scout.platform.ios.screen import capture as take
     elif getattr(device, "is_web", False) or name == "web":
         from mino_scout.platform.web.screen import capture as take
-    elif name == "mac" or (name == "desktop" and host_platform.system() == "Darwin"):
+    elif name == "mac":
         from mino_scout.platform.mac.actions import capture as take
-    elif name in {"win", "desktop"}:
+    elif name == "win":
         from mino_scout.platform.win.actions import capture as take
     else:
         take = None
@@ -158,14 +155,12 @@ def _platform_capture(device):
 def capture(
     device: DeviceRef,
     *,
-    prefer: tuple[str, ...] = (),
     timeout_sec: float = 15.0,
     compress_ratio: float = 2.0,
     allow_blank: bool = False,
     screenshot_params: dict[str, Any] | None = None,
 ) -> CapturedScreen:
     """按设备平台调用该平台自己的截图。"""
-    del prefer
     started = time.time()
     take = _platform_capture(device)
     if take is None:
@@ -174,7 +169,7 @@ def capture(
         shot = take(device, timeout_sec=timeout_sec, compress_ratio=compress_ratio, screenshot_params=screenshot_params)
 
     if shot.has_image():
-        if device.platform in {"desktop", "mac", "win"} or allow_blank or not png_is_blank(base64.b64decode(shot.image_base64)):
+        if device.platform in {"mac", "win"} or allow_blank or not png_is_blank(base64.b64decode(shot.image_base64)):
             SLog.i(
                 TAG,
                 f"capture ok via {shot.source} {shot.width}x{shot.height} "

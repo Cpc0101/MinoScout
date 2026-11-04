@@ -40,14 +40,13 @@ class PlanEvent(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict, description="坐标为 0-1000 千分比")
     case_step_index: Optional[int] = Field(None, description="挂回哪条用例步骤；前置/收尾可为 null")
     needs_vlm: bool = Field(False, description="上游语义：是否需附截图给 VLM。Scout 只透传")
-    expected_executor: str = Field("", description="Nexus 选定的首选 executor")
-    fallback_executors: list[str] = Field(default_factory=list)
+    expected_executor: str = Field("", description="Nexus 选定的的唯一 executor（与 executor_order[0] 一致）")
     ai_reasoning: str = Field("", description="Nexus 为什么选这条；Scout 原样回填进 EventResult")
     label: str = Field("", description="审计文案，例：『点击一键登录按钮』")
 
     # ---- 以下是拆分新增，上游没有 ----
     # Scout 不读能力目录，所以执行所需的一切由 Nexus 塞进来（CLAUDE.md §1 约束 3）
-    executor_order: list[str] = Field(default_factory=list, description="严格按此顺序尝试")
+    executor_order: list[str] = Field(default_factory=list, description="唯一执行器；Scout 只执行这一个，不 fallback")
     low_level: dict[str, Any] = Field(default_factory=dict, description="抄自能力目录 YAML")
     selected_impl: dict[str, Any] = Field(default_factory=dict, description="impl 元数据")
     device_hint: dict[str, Any] = Field(default_factory=dict, description="含凭据，禁止入日志")
@@ -106,6 +105,7 @@ class CapturedScreen(BaseModel):
     path: str = Field("", description="Scout 本地落盘路径，用后即删")
     error: str = ""
     elapsed_ms: int = 0
+    # 字段名沿用协议（历史命名），与远程通道无关：存平台侧截图诊断。
     remote_detail: dict[str, Any] = Field(default_factory=dict)
 
     def has_image(self) -> bool:

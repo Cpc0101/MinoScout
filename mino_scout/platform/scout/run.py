@@ -7,19 +7,19 @@ import time
 def prep(case, number: int):
     from mino_scout.runtime.script_exec import _Scope
 
-    return _Scope(case, int(number), "prep")
+    return _Scope(case, number if isinstance(number, str) else int(number), "prep")
 
 
 def do(case, number: int):
     from mino_scout.runtime.script_exec import _Scope
 
-    return _Scope(case, int(number), "do")
+    return _Scope(case, number if isinstance(number, str) else int(number), "do")
 
 
 def check(case, number: int):
     from mino_scout.runtime.script_exec import _Scope
 
-    return _Scope(case, int(number), "check")
+    return _Scope(case, number if isinstance(number, str) else int(number), "check")
 
 
 def wait(case, ms: int):

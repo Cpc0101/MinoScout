@@ -534,9 +534,10 @@ class NodeTransport:
             if desktop is not None:
                 from mino_scout.executors.desktop import DesktopExecutor
                 # HEARTBEAT.executors is a full snapshot. Preserve every registered
-                # executor when replacing the desktop readiness entry.
+                # executor when replacing the native readiness entry.
+                native_id = desktop.platform
                 by_id = {executor.id: executor for executor in hb.executors}
-                by_id["desktop"] = P.ExecutorManifest(id="desktop", available=desktop.desktop_state == "ready",
+                by_id[native_id] = P.ExecutorManifest(id=native_id, available=desktop.desktop_state == "ready",
                     provides=DesktopExecutor.provides if desktop.desktop_state == "ready" else [],
                     reason=desktop.blocked_reason)
                 hb.executors = list(by_id.values())

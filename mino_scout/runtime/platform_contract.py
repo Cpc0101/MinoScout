@@ -210,7 +210,7 @@ def runtime_capabilities_contract(rows, *, system):
             if key in seen:
                 raise PlatformContractError("runtime_capability_duplicate")
             seen.add(key)
-            if executor == "desktop" and (p not in NATIVE_PLATFORMS or p != system):
+            if executor in NATIVE_PLATFORMS and (p != executor or p != system):
                 raise PlatformContractError("executor_platform_conflict")
             if executor in {"adb", "playwright", "ios_wda"} and p != {"adb": "android", "playwright": "web", "ios_wda": "ios"}[executor]:
                 raise PlatformContractError("executor_platform_conflict")
@@ -221,7 +221,8 @@ def runtime_capabilities_contract(rows, *, system):
         combos = row.get("supported_combinations")
         if not isinstance(combos, list) or not combos or len(combos) > 16:
             raise PlatformContractError("input_combinations_invalid")
-        allowed = {"desktop": {"current_focus": {"replace", "append"}},
+        native_modes = {"current_focus": {"replace", "append"}}
+        allowed = {"mac": native_modes, "win": native_modes,
                    "adb": {"current_focus": {"append"}, "coordinate": {"replace"}},
                    "ios_wda": {"current_focus": {"replace"}},
                    "playwright": {"current_focus": {"replace", "append"}, "coordinate": {"replace"}, "node": {"replace"}}}.get(executor, {})

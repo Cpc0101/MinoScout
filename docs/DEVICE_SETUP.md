@@ -8,10 +8,12 @@
 
 | 通道 | 必需外部依赖 | 探测方式 | 探不到的后果 |
 |---|---|---|---|
-| `adb` | `adb` 在 PATH；设备开 USB 调试并已授权 | `adb -s <sn> shell echo ok` 含 `ok` | 该 Android 设备只能走 `remote`，清缓存 / 读 SIM / 静默装包不可用 |
-| `remote` | 设备装 ClawNode App 并已与本 Scout 配对 | WS 连接状态为 `Authenticated` | 生产手机（无 USB 调试）完全不可控 |
+| `adb` | `adb` 在 PATH；设备开 USB 调试并已授权 | `adb -s <sn> shell echo ok` 含 `ok` | 该 Android 设备不可用（没有备用通道） |
 | `ios_wda` | usbmuxd；WDA 已装并可拉起；真机需签名 | 能建 WDA session | iOS 设备不可控 |
 | `playwright` | `playwright install chromium` 已执行 | `playwright_hub` 能拉起 Chromium | Web 用例不可跑 |
+| `mac` / `win` | macOS/Windows 交互桌面 + Cua Driver 0.34.1 + 屏幕录制/辅助功能权限 | 原生 runtime `state=ready` | 该宿主不能跑 PC 用例 |
+
+`remote`（ClawNode）通道已于 2026-11 删除，不再有“没有 USB 调试就用远程”的备选路径。
 
 ## 2. adb
 
@@ -25,44 +27,18 @@ adb devices -l        # 应看到设备且状态为 device，不是 unauthorized
 | 多台机器抢同一台设备 | adb server 是单机独占的。**同一台设备不要挂在两个 Scout 节点上** —— Nexus 的 `node_id` 归属唯一，重复挂载行为未定义 |
 | TCP adb 断连 | Scout 会在 `HEARTBEAT.device_delta` 里报 `disconnected`，不自行反复重连 |
 
-## 3. ClawNode（`remote` 通道）
-
-**这是相对上游 MiniOrangeServer 的行为变化：ClawNode 连 Scout，不再连 server。**
-
-```
-ClawNode App ──WS──► MinoScout 的监听口（局域网）
-```
-
-配对流程（沿用上游 `PAIR_CONFIG` 语义，端点换成 Scout）：
-
-1. Scout 启动时通过 mDNS 广播自己（服务类型沿用 `_miniorange-gw._tcp`，或按需另定）
-2. ClawNode 发现并请求配对
-3. 人在 UI 上确认 → Nexus 通知 Scout → Scout 下发 `PAIR_CONFIG`（`ws_url` 指向 Scout 自己、`auth_token`）
-4. ClawNode 用该配置连上 Scout，状态推进到 `Authenticated`
-5. Scout 向 ClawNode 请求 `GET_CAPABILITIES`，把结果并入自己的 manifest 上报给 Nexus
-
-**待协同事项**：上述第 3 步的 `ws_url` 从"server 地址"改为"Scout 地址"，需要 `../ClawNode` 仓库配合。这是拆分的已知跨仓依赖，见 [MIGRATION.md](MIGRATION.md) §已知行为变化。
-
-ClawNode 能力受设备授予的运行时权限影响：
-
-| 能力 | 条件 |
-|---|---|
-| `system_pkg_install` | 需用户在 UI 上点"允许安装" |
-| `exec_script` | ClawNode ≥ 1.8.0 |
-| `ui_stream` | ClawNode 独有，adb 只能轮询截图 |
-
-## 4. iOS（`ios_wda` 通道）
+## 3. iOS（`ios_wda` 通道）
 
 | 项 | 要求 |
 |---|---|
 | 真机 | usbmuxd 可用；WDA 已用有效签名安装；设备已信任本机 |
 | 模拟器 | `simctl` 可用；UDID 形态与真机不同，由 `ios_ids` 区分 |
-| Appium | 可选。走的是同一个 `Engine` 协议的另一个实现，**不是 `if backend` 分支**（见 [ENGINES.md](ENGINES.md) §4） |
+| Appium | 当前不走。WDA 直连是唯一实现；新增后端必须新加 executor，不在 `WdaExecutor` 里分叉（见 [ENGINES.md](ENGINES.md) §3） |
 | WDA 挂了 | Scout 发 `EXECUTE {capability_id: node.engine_crashed}`，下次 `get()` 重建 |
 
 `../WebDriverAgent` 是本地的 WDA 工程副本，可用于重新签名与安装。
 
-## 5. Playwright（Web 通道）
+## 4. Playwright（Web 通道）
 
 ```bash
 playwright install chromium
@@ -73,15 +49,15 @@ playwright install chromium
 - Chrome 走 CDP、Firefox 走 BiDi 都由 Playwright 消化。**不要另做 CDP / BiDi 驱动**
 - Web 场景优先按按钮 / 链接名字点，坐标兜底 —— 因此 `playwright` 的实现 `needs_vlm: false`，比 VLM 路径 cost 更低
 
-## 6. 网络
+## 5. 网络
 
 | 项 | 规定 |
 |---|---|
 | Scout → Nexus | 出向 WS。默认 `ws://mino.local:10104/node`（Nexus 启动时注册该名） |
-| Scout 监听 | 只为 ClawNode，绑局域网，配对 token 鉴权 |
+| Scout 监听 | 无。Scout 只 dial 出去，不监听端口 |
 | 系统代理 | 必须绕过 `mino.local` 与 loopback。本仓 `configure_proxy_bypass` 写入 `no_proxy` |
 
-## 7. 自检
+## 6. 自检
 
 ```bash
 mino-scout probe          # 只探测并打印 manifest，不连 Nexus
@@ -119,7 +95,7 @@ Windows 计划任务使用安装用户的 `Interactive` 登录态和 `Limited` �
 3. 在 Workbench 打开应用的配置页，添加 macOS 或 Windows 被测应用渠道，填写“启动标识”并保存。macOS 填 bundle ID，例如 `com.apple.TextEdit`；可用 `defaults read /System/Applications/TextEdit.app/Contents/Info CFBundleIdentifier` 查询，第三方应用替换为其实际 `.app` 路径。Windows 填实际完整 EXE 路径，例如 `C:\Windows\System32\notepad.exe`，或已安装打包应用的 AUMID；可用 PowerShell `Get-StartApps` 查找。显示名称、`.app` 路径和模糊进程名不能替代 macOS bundle ID。
 4. 先建一条冒烟用例：前置条件为应用已安装且桌面已解锁；步骤写“启动并聚焦被测应用，确认主窗口出现，点击输入框并输入测试文本，再核对显示内容”。测试应用的空白文档可用作输入目标，避免首次就在真实业务数据上操作。Desktop 的 `launch_app` 由 Scout 调用原生驱动启动和聚焦，并回读前台身份；PC 不使用 Android 的清缓存或 force-stop。
 5. 在用例运行栏或“新建任务”中，选择对应被测应用渠道和运行环境，执行方式选择“看图 visual”，设备选择该节点的“PC 桌面”，勾选用例并启动。首版 Desktop 不支持 DOM 模式，同一桌面一次只运行一个任务。
-6. 在任务详情查看截图和动作结果，在 session log 查看 `tool/call` / `tool/result`；结果中的 `executor_used=desktop` 以及 `scout` / `attempts` / `desktop` 元数据可用于核对派单节点和会话。Scout 的进程启动、注册与重连日志在本机，不属于某条用例的 session log。
+6. 在任务详情查看截图和动作结果，在 session log 查看 `tool/call` / `tool/result`；结果中的 `executor_used=mac` / `win` 以及 `scout` / `attempts` / 原生元数据可用于核对派单节点和会话。Scout 的进程启动、注册与重连日志在本机，不属于某条用例的 session log。
 
 ## 0.1.78 macOS 图形会话检测
 

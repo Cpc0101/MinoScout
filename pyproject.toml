@@ -22,7 +22,6 @@ dependencies = [
   "httpx>=0.28",          # executors/adb_command.py：按 URL 流式下载 APK（非 LLM，见 verify_no_llm.py）
   "certifi>=2024.0",       # 冻结包 HTTPS（GitHub 更新）；macOS 上 urllib 默认无 CA
   "psutil>=7.1",          # 本机 IP / 进程
-  "zeroconf>=0.148",      # mDNS：给 ClawNode 发现用
 ]
 
 [project.optional-dependencies]

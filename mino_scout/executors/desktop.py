@@ -225,7 +225,7 @@ class DesktopRuntime:
         ready = state["state"] == "ready"
         return P.DeviceManifest(
             sn=native_sn(target, node_id), platform=target, model="Mac 桌面" if target == "mac" else "Windows 桌面",
-            channels={"desktop": "connected" if ready else "disconnected"},
+            channels={target: "connected" if ready else "disconnected"},
             session_key="console", session_generation=state["session_generation"],
             desktop_state=state["state"], blocked_reason=state["blocked_reason"],
             capabilities=list(host_caps()) if ready else [],
@@ -765,10 +765,17 @@ def get_desktop_runtime() -> DesktopRuntime:
 
 
 class DesktopExecutor:
-    """桌面执行器。会话在本模块，Mac / Windows 的动作在各自的 platform 里。"""
+    """macOS / Windows 原生执行器。会话在本模块，动作在各自的 platform 里。
 
-    id = "desktop"
+    `id` 就是宿主平台（`mac` / `win`），不再是历史名 `desktop`。
+    """
+
     provides = list(host_caps())
+
+    def __init__(self):
+        import platform as _system
+        from mino_scout.runtime.platform_contract import host_os_from_system
+        self.id = host_os_from_system(_system.system())
 
     def probe(self):
         state = get_desktop_runtime().state()
@@ -788,8 +795,8 @@ class DesktopExecutor:
         started, tick = now_iso(), time.monotonic()
         status, error, data = EventStatus.PASS, "", {}
         try:
-            if ctx.device.platform not in {"desktop", "mac", "win"}:
-                raise DesktopUnavailable("不是 Desktop 设备")
+            if ctx.device.platform not in {"mac", "win"}:
+                raise DesktopUnavailable("不是 macOS / Windows 原生设备")
             data = get_desktop_runtime().action(event.capability_id, dict(event.params or {}), ctx.device.extra, ctx.run_id)
             effect = (data.get("cua_action") or {}).get("effect")
             if effect == "refused":

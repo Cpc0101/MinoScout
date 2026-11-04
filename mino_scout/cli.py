@@ -45,7 +45,9 @@ def build_core() -> ScoutCore:
         SLog.w(TAG, f"playwright executor 未装载: {exc}")
 
     from mino_scout.executors.desktop import DesktopExecutor
-    executors["desktop"] = DesktopExecutor()
+    native = DesktopExecutor()
+    if native.id in {"mac", "win"}:
+        executors[native.id] = native
     from mino_scout.executors.wda_executor import WdaExecutor
     executors["ios_wda"] = WdaExecutor()
     return ScoutCore(executors)
@@ -243,6 +245,26 @@ def _os_getpid() -> int:
     return os.getpid()
 
 
+def cmd_check(argv: list[str]) -> int:
+    """check [目录]：写完用例后自检，打印提示。有提示退出码 1，没有 0。执行时不做任何预检。"""
+    from pathlib import Path
+
+    from mino_scout.runtime.script_check import check_repo
+
+    ap = argparse.ArgumentParser(prog="mino-scout check")
+    ap.add_argument("path", nargs="?", default=".")
+    ns = ap.parse_args(argv)
+    root = Path(ns.path).expanduser()
+    if not root.is_dir():
+        print(f"不是目录：{root}", file=sys.stderr)
+        return 2
+    hints = check_repo(root)
+    for hint in hints:
+        print(hint)
+    print(f"{len(hints)} 条提示" if hints else "没有提示")
+    return 1 if hints else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     import multiprocessing
     multiprocessing.freeze_support()
@@ -287,6 +309,8 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             print(str(exc), file=sys.stderr)
             return 2
+    if sub == "check":
+        return cmd_check(raw[1:])
     if sub == "identity":
         from mino_scout.config import runtime_identity
         print(json.dumps(runtime_identity(), ensure_ascii=False, indent=2))

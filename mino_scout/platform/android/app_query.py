@@ -1,6 +1,6 @@
 # !/usr/bin/env python
 # -*-coding:utf-8 -*-
-"""从 dumpsys 读安装包版本、当前前台应用。给 adb / remote 技能和前置检查共用。"""
+"""从 dumpsys 读安装包版本、当前前台应用。给 adb 通道和前置检查共用。"""
 from __future__ import annotations
 
 import re

@@ -8,11 +8,13 @@ def runtime_input_capabilities() -> list[dict[str, Any]]:
     import platform
     from mino_scout.runtime.platform_contract import host_os_from_system
     system = host_os_from_system(platform.system())
-    rows = [
-        {
-            "id": "input_text", "executor": "desktop", "platform": system, "contract_version": 2,
+    rows: list[dict[str, Any]] = []
+    if system in {"mac", "win"}:
+        rows.append({
+            "id": "input_text", "executor": system, "platform": system, "contract_version": 2,
             "supported_combinations": [{"target_mode": "current_focus", "write_modes": ["replace", "append"]}],
-        },
+        })
+    rows.extend([
         {
             "id": "input_text",
             "executor": "playwright",
@@ -43,7 +45,7 @@ def runtime_input_capabilities() -> list[dict[str, Any]]:
                 {"target_mode": "current_focus", "write_modes": ["replace"]},
             ],
         },
-    ]
+    ])
 
     rows.append({"id": "node.update", "executor": "core", "platform_scope": "all", "platforms": [],
         "contract_version": 1, "features": ["fixed_build", "status", "rollback"]})
@@ -52,4 +54,4 @@ def runtime_input_capabilities() -> list[dict[str, Any]]:
     from mino_scout.tools.update.app_version import process_build_identity
     for row in rows:
         row["build"] = process_build_identity()
-    return [row for row in rows if row["executor"] != "desktop" or system in {"mac", "win"}]
+    return rows

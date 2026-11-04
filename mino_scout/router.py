@@ -14,7 +14,7 @@ from mino_scout.executors.base import (
 )
 from mino_scout.tools.keep_alive.log import SLog
 from mino_scout.runtime.execution_boundary import normalize_ui_result, ui_write
-from mino_scout.schemas import CapturedScreen, EventResult, PlanEvent
+from mino_scout.schemas import EventResult, PlanEvent
 
 TAG = "Router"
 
@@ -32,6 +32,14 @@ class Router:
     def __init__(self, executors: dict[str, Executor]):
         self.executors = executors
 
+    def _canonical_executor(self, ex: str) -> str:
+        """`desktop` 是 mac/win 的旧 executor id，只做入站兼容。"""
+        if str(ex or "") == "desktop":
+            for candidate in ("mac", "win"):
+                if candidate in self.executors:
+                    return candidate
+        return str(ex or "")
+
     # ---------- 对外 ----------
 
     def dispatch(
@@ -41,17 +49,21 @@ class Router:
         *,
         run_id: str = "",
         step_idx: int = -1,
-        screen: Optional[CapturedScreen] = None,
-        capture_prefer: tuple[str, ...] = (),
         shared: Optional[dict[str, Any]] = None,
     ) -> EventResult:
         started = now_iso()
         t0 = time.time()
 
-        if len(event.executor_order or []) != 1:
+        order = [self._canonical_executor(ex) for ex in (event.executor_order or [])]
+        if len(order) != 1:
             return self._synthetic_fail(event, "executor_order_must_select_one", started_at=started)
-        if (event.selected_impl or {}).get("executor") != event.executor_order[0]:
+        impl = dict(event.selected_impl or {})
+        impl_exec = self._canonical_executor(str(impl.get("executor") or ""))
+        if impl_exec != order[0]:
             return self._synthetic_fail(event, "selected_impl_executor_mismatch", started_at=started)
+        if order != list(event.executor_order or []) or impl_exec != impl.get("executor"):
+            impl["executor"] = impl_exec
+            event = event.model_copy(update={"executor_order": order, "selected_impl": impl})
         ordered = self._resolve_order(event)
         compatible = device.compatible_executors
         skipped = [ex for ex in ordered if ex not in compatible]
@@ -74,72 +86,59 @@ class Router:
             device=device,
             run_id=run_id,
             step_idx=step_idx,
-            screen=screen,
-            capture_prefer=capture_prefer,
             shared=shared if shared is not None else {},
             selected_impl=event.selected_impl or None,
         )
 
-        attempts: list[dict[str, Any]] = []
-        last: Optional[EventResult] = None
-
-        for ex_id in ordered:
-            stop_check = ctx.shared.get("write_stopped")
-            if ui_write(event.capability_id) and callable(stop_check) and stop_check():
-                result = make_event_result(event, status=EventStatus.BLOCKED, executor_used="router",
-                    started_at=started, elapsed_ms=int((time.time() - t0) * 1000),
-                    summary="运行已停止后续写动作，未调用后备执行器",
-                    raw_response={"execution": {"execution_started": "no", "phase": "admission", "reason_code": "run_write_stopped"},
-                                  "execution_control": {"stop_run": True, "reason_code": "run_write_stopped", "resource_isolated": True}})
-                result.attempts = attempts
-                return result
-            executor = self.executors[ex_id]  # _resolve_order 已保证存在且 supports
-            a_t0 = time.time()
-            try:
-                result = executor.execute(event, ctx)
-            except Exception as exc:
-                # executor 契约是「永不抛」。真抛了说明它有 bug —— 兜住，
-                # 缺少写边界证明时停止 fallback，保留未知结果。
-                SLog.e(TAG, f"executor {ex_id} 违反契约抛了异常 cap={event.capability_id}: {exc!r}")
-                result = make_event_result(
-                    event,
-                    status=EventStatus.FAIL,
-                    executor_used=ex_id,
-                    started_at=started,
-                    elapsed_ms=int((time.time() - a_t0) * 1000),
-                    summary=f"executor {ex_id} raised (契约违规)",
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-
-            attempts.append(
-                {
-                    "executor": ex_id,
-                    "status": _status_value(result.status),
-                    "elapsed_ms": result.elapsed_ms or int((time.time() - a_t0) * 1000),
-                    "error": (result.error or "")[:200],
-                }
-            )
-            last = result
-
-            result = normalize_ui_result(result, capability_id=event.capability_id,
-                run_id=run_id, step_idx=step_idx)
-            result.attempts = attempts
-            result.elapsed_ms = result.elapsed_ms or int((time.time() - t0) * 1000)
+        ex_id = ordered[0]
+        stop_check = ctx.shared.get("write_stopped")
+        if ui_write(event.capability_id) and callable(stop_check) and stop_check():
+            result = make_event_result(event, status=EventStatus.BLOCKED, executor_used="router",
+                started_at=started, elapsed_ms=int((time.time() - t0) * 1000),
+                summary="运行已停止后续写动作，未执行本次动作",
+                raw_response={"execution": {"execution_started": "no", "phase": "admission", "reason_code": "run_write_stopped"},
+                              "execution_control": {"stop_run": True, "reason_code": "run_write_stopped", "resource_isolated": True}})
+            result.attempts = []
             return result
 
-        # 全试完都没成
-        if last is None:  # pragma: no cover —— ordered 非空时不可能到这
-            return self._synthetic_fail(event, "router: 没有任何 executor 被实际调用", started_at=started)
-        last.attempts = attempts
-        last.elapsed_ms = last.elapsed_ms or int((time.time() - t0) * 1000)
-        return last
+        executor = self.executors[ex_id]  # _resolve_order 已保证存在且 supports
+        a_t0 = time.time()
+        try:
+            result = executor.execute(event, ctx)
+        except Exception as exc:
+            # executor 契约是「永不抛」。真抛了说明它有 bug —— 兜住，
+            # 缺少写边界证明时由 normalize_ui_result 收口为 blocked。
+            SLog.e(TAG, f"executor {ex_id} 违反契约抛了异常 cap={event.capability_id}: {exc!r}")
+            result = make_event_result(
+                event,
+                status=EventStatus.FAIL,
+                executor_used=ex_id,
+                started_at=started,
+                elapsed_ms=int((time.time() - a_t0) * 1000),
+                summary=f"executor {ex_id} raised (契约违规)",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+        elapsed = result.elapsed_ms or int((time.time() - t0) * 1000)
+        result = normalize_ui_result(result, capability_id=event.capability_id,
+            run_id=run_id, step_idx=step_idx)
+        # 唯一一次尝试。attempts 保留为单元素，供 Nexus 的 trace 字段兼容。
+        result.attempts = [{
+            "executor": ex_id,
+            "status": _status_value(result.status),
+            "elapsed_ms": elapsed,
+            "error": (result.error or "")[:200],
+        }]
+        result.elapsed_ms = elapsed
+        return result
 
     # ---------- 内部 ----------
 
     def _resolve_order(self, event: PlanEvent) -> list[str]:
-        """按 Nexus 给的顺序过滤出「本机确实注册了、且 supports 这条 cap」的 executor。
+        """过滤出「本机确实注册了、且 supports 这条 cap」的 executor。
 
-        **不排序、不补充。** 顺序是 Nexus 的决定（它才有能力目录和连通性）。
+        Scout 只接受唯一执行器；这里保留列表形态只为把「未注册 / 不支持」
+        与「设备类型不匹配」区分成不同的失败原因。**不排序、不补充。**
         """
         out: list[str] = []
         for ex_id in event.executor_order or []:

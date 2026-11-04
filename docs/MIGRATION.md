@@ -3,6 +3,11 @@
 > 上游 `../MiniOrangeServer` **已停止维护，只读，禁止改动**。本仓是它的一半。
 > 本清单由 `../MiniOrangeServer` 于 2026-09-02 的全量文件（392 个 `.py`）分类而来，**无待定项**。
 
+> **2026-11 现状注记**：本文是搬迁当时的计划，不是现状。以下计划项没有落地，且已取消：
+> `engines/` / `EngineFactory`（E3）、`probe/` 目录、`clawnode/` 与 `remote` 通道、
+> `executors/low_level.py`、`executors/multi_tap.py`。现行结构见 [ENGINES.md](ENGINES.md)
+> 与 [CLAUDE.md](../CLAUDE.md) §3；ClawNode/`remote` 通道已删除。
+
 ## 0. 总账
 
 | 去向 | 文件 | 行数 |

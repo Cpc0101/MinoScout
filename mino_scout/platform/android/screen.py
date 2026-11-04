@@ -15,7 +15,7 @@ def capture(device, *, timeout_sec: float = 15.0, compress_ratio: float = 1.0, *
     from mino_scout.screen import compress_web_png, remember_capture_size
 
     adb_serial = str(getattr(device, "adb_serial", "") or "")
-    if not adb_serial or adb_serial.startswith("claw-") or is_web_slot(adb_serial):
+    if not adb_serial or is_web_slot(adb_serial):
         return CapturedScreen(ok=False, source="adb", error="invalid adb serial")
     started = time.time()
     try:

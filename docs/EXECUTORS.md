@@ -1,48 +1,75 @@
 # EXECUTORS — MinoScout
 
-本仓有且只有**四个** executor。它们的共同点是：直接操作设备。
+本仓有三种设备通道：`adb`（Android）、`ios_wda`（iOS）、`playwright`（Web），
+外加**原生通道**：macOS 上是 `mac`，Windows 上是 `win`。另有一个宿主插件面
+`host_plugin`（仅声明 `plugin.gmail.fetch_otp`）。它们共同点是：**直接操作设备**。
+上游另外四个（`hitl` / `vlm` / `ai_persona` / `internal`）零设备访问，归 MinoNexus。
 
-上游 MiniOrangeServer 有八个，另外四个（`hitl` / `vlm` / `ai_persona` / `internal`）**零设备访问**，归 MinoNexus，不出网。
+`remote`（ClawNode）通道已于 2026-11 删除；Scout 不再有第五种设备通道。
 
 ## 1. 能力矩阵
 
-`provides` 是 abstract cap（词表真源在 Nexus 的 `abstract_caps.yaml`）。Scout 在 `REGISTER` 时上报这些字符串。
+`provides` 是具体能力 id（与 Nexus 能力目录同一词表）。Scout 在 `REGISTER` / `HEARTBEAT`
+里上报这些字符串，Nexus 据此选路。
 
-| abstract cap | adb | remote (ClawNode) | ios_wda | playwright |
-|---|:--:|:--:|:--:|:--:|
-| `system_shell` | ✅ | 受限 | — | — |
-| `system_pkg_install` | ✅ 静默 | ⚠️ 需用户点"允许" | — | — |
-| `read_system_data` | ✅ | 受限 | — | — |
-| `ui_native_input` | ✅ | ✅ | ✅ | ✅ |
-| `ui_input_text` | ✅ | ✅ | ✅ | ✅ |
-| `ui_screenshot` | ✅ | ✅ | ✅ | ✅ |
-| `ui_stream` | — | ✅ 独有 | — | — |
-| `app_launch_native` | ✅ | ✅ | ✅ | — |
-| `app_force_stop` | ✅ | ⚠️ | ✅ | — |
-| `clipboard_set` | ✅ | ✅ | — | — |
-| `key_event` | ✅ | ✅ | ✅ | — |
-| `exec_script` | — | ✅（ClawNode ≥ 1.8.0） | — | — |
+| capability | adb | ios_wda | playwright | mac | win |
+|---|:--:|:--:|:--:|:--:|:--:|
+| `launch_app` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `close_app` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `kill_app` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `tap_element` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `tap_xy` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `long_press_element` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `input_text` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `press_key` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `swipe_direction` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `swipe_element_to_element` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `set_clipboard` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `get_foreground_app` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `screenshot` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `hierarchy` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `exec_script` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `install` | ✅ | ✅ | — | ✅ | ✅ |
+| `uninstall_app` | ✅ | ✅ | — | — | — |
+| `get_app_version` | ✅ | ✅ | — | — | — |
+| `read_device_data` | ✅ | — | — | — | — |
+| `set_input_method` | ✅ | — | — | — | — |
+| `clear_app_cache` | ✅ | ⚠️ | — | — | — |
+| `probe_device_state` | ✅ | — | — | — | — |
+| `wake_screen` / `dismiss_keyguard` | ✅（low_level） | — | — | — | — |
+| `read_web_auth` | — | — | ✅ | — | — |
+| `wait_screen_ready` | — | — | ✅ | — | — |
+| `switch_tab` | — | — | ✅ | — | — |
+| `open_tab` | — | — | ✅ | — | — |
+| `upload_file` | — | — | ✅ | — | — |
+| `reload_page` | — | — | ✅ | — | — |
 
-⚠️ = 条件可用。**条件不满足时必须返回 `declined`（让位），不是 `fail`** —— 否则这类「本来就做不到」会被计入失败率。
+平台：`adb` → Android；`ios_wda` → iOS 真机 / 模拟器；`playwright` → Web；`mac` → macOS；`win` → Windows。
+`DeviceRef.compatible_executors` 是这条映射的唯一真源（不在文档里另写一份）。
 
-平台：`adb` / `remote` → Android（`remote` 也覆盖 iOS 的 ClawNode 形态）；`ios_wda` → iOS 真机与模拟器；`playwright` → Web，与 adb 平级（不再单做 CDP / BiDi 驱动）。
+> 上面两列 `mac` / `win` 既是平台名，也是 `REGISTER` 里的 executor id。`desktop`
+> 只作为历史平台别名和旧版载荷的入站兼容值存在，不再出现在新报文里。
+
+⚠️ = 收到时返回 `declined`（让位），不是 `fail` —— 否则“本来就做不到”会被计入失败率。
 
 ## 2. Executor 接口
 
 ```python
 class Executor(Protocol):
-    id: str   # "adb" | "remote" | "ios_wda" | "playwright"
+    id: str   # "adb" | "ios_wda" | "playwright" | "mac" | "win"
 
-    def supports(self, capability_id: str) -> bool:
+    def supports(self, capability_id: str, low_level: dict | None = None) -> bool:
         """Router 的硬校验。便宜、纯判断、不碰设备。"""
 
     def execute(self, event: PlanEvent, ctx: ExecutorContext) -> EventResult:
         """跑这条动作。必须捕获全部异常，返回五态之一，永不抛。"""
 ```
 
-五态语义见 [CONVENTIONS.md](CONVENTIONS.md) §2 —— **这是本仓最容易写错的地方**。
+五态语义见 [CONVENTIONS.md](CONVENTIONS.md) §2 —— **任何状态都结束本次尝试，Scout 不换路。**
 
-`ExecutorContext` 携带：当前屏幕（若 Nexus 已在本步前 `EXECUTE screenshot` 并把帧带下来）、`capture_prefer` 通道优先序、`selected_impl`（Nexus 从能力目录抄来的 impl 元数据）、`shared` KV（同 run 内 executor 之间传递，如上一次定位结果）。
+`ExecutorContext` 携带：`device`（来自 `EXECUTE.device_hint` / `sn`）、`run_id` / `step_idx`、
+`selected_impl`（Nexus 从能力目录抄来的 impl 元数据）、`shared`（同一次派发内的
+`write_stopped` 回调）。没有屏幕帧、没有抓图优先序 —— 那些字段已删除。
 
 ## 3. `low_level`：不写 Python 就能加能力
 
@@ -53,48 +80,46 @@ class Executor(Protocol):
 {"low_level": {"shell": "input tap {x} {y}"}}
 ```
 
-`executors/low_level.py` 负责：占位符 `{x}` 用 `params` 填充 → 按 `shell` / `command` 分派到对应通道 → 组装五态结果。
+`platform/android/low_level.py` 负责：占位符 `{x}` 用 `params` 填充 → 按 `shell` / `command`
+分派到 adb → 组装五态结果。**low_level 只在 adb 通道生效。**
 
-**因此绝大多数新能力在 Scout 侧零改动**：Nexus 加一条 capability YAML + 一条 `implementations`，Scout 自动能执行。只有引入**新原语**（现有 `command` / `shell` 表达不了的动作）时才需要动 Python。
-
-这是上游 Skill Pack 方案定下的规矩，本仓继续遵守：**能用 `low_level` 表达的，不要写 `if capability_id == ...`。**
+**因此绝大多数新能力在 Scout 侧零改动**：Nexus 加一条 capability YAML + 一条 `implementations`，
+Scout 自动能执行。只有引入**新原语**（现有 `command` / `shell` 表达不了的动作）时才需要动 Python。
 
 ## 4. 加一个 executor
 
-以假设的 `mac_applescript` 为例：
-
-1. **Nexus 侧**（不在本仓）：`plugins/executors/mac_apple_script.yaml` 声明 `provides`；相关 capability 补一条 `implementations`
-2. **本仓** `mino_scout/executors/mac_applescript_executor.py`：实现 `supports()` + `execute()`
-3. **本仓** `mino_scout/probe/`：加连通性探测（这台机器上这个通道到底能不能用）
-4. **本仓** `mino_scout/core.py::manifest()`：把它加进上报列表
-5. `docs/EXECUTORS.md` 的矩阵补一列
-6. 跑 `python scripts/verify_all.py`
+1. **Nexus 侧**（不在本仓）：能力目录声明该 executor 的 `provides`，相关 capability 补 `implementations`
+2. 本仓新增 `executors/<id>_executor.py`：实现 `supports()` + `execute()` + `probe()`
+3. `cli.build_core()` 里装配
+4. `DeviceRef.compatible_executors` 里登记它能服务的平台
+5. 本文件矩阵补一列
+6. `mino-scout probe` 确认它被上报为 `available`
 
 **注意第 1 步在另一个仓库。** 只在 Scout 加 executor 不会被用到 —— Nexus 不知道它存在，就不会把它放进 `executor_order`。
 
-## 5. 加一种"新原语"
+## 5. 加一种“新原语”
 
-如果新能力需要现有 `low_level` 表达不了的动作（例如"录屏 10 秒"）：
+如果新能力需要现有 `low_level` 表达不了的动作（例如“录屏 10 秒”）：
 
 1. 先问：能不能拆成已有原语的组合？能就在 Nexus 侧用 `expands_to_events` 表达，本仓零改动
-2. 不能，才在对应 executor 里加一个 `command` 分支，并在 `docs/EXECUTORS.md` §1 矩阵登记新的 abstract cap
-3. 新 abstract cap 必须同时在 Nexus 的 `abstract_caps.yaml` 登记，否则 `REGISTER` 上报的字符串在 Nexus 侧无处匹配
+2. 不能，才在对应 executor 里加一个 `command` 分支，并在本文件 §1 矩阵登记
+3. 新能力必须同时在 Nexus 的能力目录登记，否则 `REGISTER` 上报的字符串在 Nexus 侧无处匹配
 
 ## 6. 反模式
 
 | 不要 | 为什么 |
 |---|---|
 | 在 executor 里判断"这一步该不该做" | 决策在 Nexus。Scout 只执行 |
-| 在 executor 里调 LLM 兜底 | 违反硬约束 2，`verify_no_llm.py` 会拦 |
-| 在 executor 里自行更换通道 | 换通道由 `executor_order` 表达，那是 Nexus 的决定 |
+| 在 executor 里调 LLM 兜底 | 违反 CLAUDE.md §1 约束 2（脚本运行时的本地模型调用是单独合同，不在这里） |
+| 在 executor 里自行更换通道 | 通道由唯一的 `executor_order` 决定；Scout 不换路 |
 | 条件不满足时返回 `fail` | 应返回 `declined`，否则失败统计被污染 |
 | 为一个能力写 `if capability_id == "xxx"` 长链 | 用 `low_level`。上游 `adb_executor.py` 的 if-chain 是被明确批评过的反模式 |
 | 省略 `executor_used` | Nexus 的 trace 与覆盖度依赖它 |
 
 
-## Desktop 执行器（V4）
+## macOS / Windows 原生执行器（V4）
 
-`desktop` 只处理 `platform=desktop`，不在 Android/Web 执行器中 fallback。支持 `screenshot/tap_xy/tap_element/input_text/press_key/launch_app/get_foreground_app`，其中截图复用 ScreenCapture 的 Desktop 分支。Cua Driver 0.34.1 的 `list_apps` 不返回应用版本，SDK/原生工具也未提供 `get_app_version`；不把 `driver_version` 当成应用版本，Nexus 按设备上报能力跳过版本采集。Cua Driver 0.34.1 是可选 native 依赖；manifest 消费 Cua `health_report` 的版本、会话、权限和 AX 状态，实际窗口捕获还须取得有效捕获引用。
+原生通道只处理 `platform=mac` / `platform=win`，不在 Android/Web 执行器中 fallback。支持 `screenshot/tap_xy/tap_element/input_text/press_key/launch_app/get_foreground_app`，其中截图复用 ScreenCapture 的 Desktop 分支。Cua Driver 0.34.1 的 `list_apps` 不返回应用版本，SDK/原生工具也未提供 `get_app_version`；不把 `driver_version` 当成应用版本，Nexus 按设备上报能力跳过版本采集。Cua Driver 0.34.1 是可选 native 依赖；manifest 消费 Cua `health_report` 的版本、会话、权限和 AX 状态，实际窗口捕获还须取得有效捕获引用。
 
 Desktop 首版只接受 visual 流程。截图坐标按 Mino 的千分比转换成当前窗口图像像素，再带 capture ID 和 `ActionTarget.WINDOW(pid, window_id)` 交给 SDK；窗口到屏幕及 Retina/缩图坐标映射由 Cua 处理。输入与按键也需要本任务的新截图、未变化的会话代际和独占租约；精确窗口的前台激活、投递及校验由 Cua `delivery_mode=foreground` 负责。macOS 启动使用已配置 bundle ID，Windows 使用完整 EXE 路径或 AUMID，经结构化 launch 调用确认目标进程并绑定窗口，不要求启动后保持前台，不执行 shell。组合键和 modifiers 按目标 OS 规范化。动作证据保留 Cua effect/route/delivery/error.code；拒绝为 blocked，疑似无效果或部分执行为 fail，不标成功；无业务回读的动作仍需后续截图确认。
 
@@ -139,3 +164,19 @@ ADB 声明的 supports 与实际 low_level 解释器保持一致：shell 使用�
 ## V7 路由约束（2026-10-20）
 
 普通设备动作只执行 EXECUTE 指定的一个 executor，selected_impl.executor 必须一致。任何执行状态都不尝试后备执行器；保留实际 executor_used、attempts 和 execution 写边界证据。旧版依次 fallback 的说明不再适用。
+
+## 7. 原生通道命名
+
+平台语言只有 `mac` / `win`，executor id 与平台同名。`desktop` 不再作为 executor id 出现。
+
+两仓已在同一周期切换：
+
+| 侧 | 落点 |
+|---|---|
+| Scout | `executors` 注册键、`DeviceManifest.channels`、`runtime_input_capabilities.executor`、`compatible_executors`、`platform_contract` / `input_contract` 校验、`script_exec` |
+| Nexus | `executors_for_platform`、`executor_channels`、`device_store._kind_of`、`desktop_catalog` 的 `executor`、`core/platform_contract`、`loop/input_contract`、`run_context` 的通道读取、`page_ready` |
+| 兼容 | 入站 `executor_order=["desktop"]` / 旧 `channels.desktop` / 旧 `platform=desktop` 仍按宿主平台解析；出站只发 `mac` / `win` |
+
+升级顺序：Nexus 与 Scout 同周期发布。切换期新 Nexus 对只上报 `desktop` 的旧 Scout
+保留一条只读回退（`executors_for_platform` 的 `mac/win → 同平台 + desktop`、能力目录按
+节点实际可用 id 改写），旧 Nexus 则认不出 `mac` / `win`，所以 Nexus 必须先升级。
