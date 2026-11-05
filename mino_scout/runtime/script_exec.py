@@ -583,9 +583,14 @@ class App:
         status, fields = self.core._hierarchy_fields(self._device_ref(), run_id=self.run_id)
         text = _visible_text(fields)
         ok = str(getattr(status, "value", status)) == "pass"
+        nodes = _locator_nodes(fields)
+        data: dict[str, Any] = {"text": text[:4000]}
+        if nodes:
+            data["nodes"] = nodes
         result = ActionResult(ok=ok, summary="已读取界面结构" if ok else str(fields.get("error") or "没有读到界面结构"),
-                               status="pass" if ok else "fail", data={"text": text[:4000]})
-        self._report("hierarchy", result, str(fields.get("source") or "core"), int(fields.get("elapsed_ms") or 0))
+                               status="pass" if ok else "fail", data=data)
+        extra = _hierarchy_evidence(fields, nodes)
+        self._report("hierarchy", result, str(fields.get("source") or "core"), int(fields.get("elapsed_ms") or 0), extra=extra or None)
         if not ok:
             raise ScriptAbort(result.summary or "没有读到界面结构", reason_code="script_failed")
         return result
@@ -783,6 +788,56 @@ def _anchors_match(page: dict, text: str) -> bool:
     if not checked:
         raise ScriptAbort("页面没有锚点", reason_code="page_mismatch")
     return False
+
+
+_LOCATOR_KEYS = ("resource_id", "text", "content_desc", "class", "role", "clickable", "editable")
+
+
+def _locator_nodes(fields: dict) -> list[dict[str, Any]]:
+    """界面树里写页面定位要用的字段。沿用本次 hierarchy 已经读到的节点，不另采一份。
+
+    没有文案的可点控件（图片按钮、贴图）也留下，带上 class 和 bounds。
+    """
+    raw = fields.get("nodes")
+    if not isinstance(raw, list):
+        extra = fields.get("extra") if isinstance(fields.get("extra"), dict) else {}
+        raw = extra.get("nodes")
+    if not isinstance(raw, list):
+        return []
+    nodes: list[dict[str, Any]] = []
+    for node in raw:
+        if not isinstance(node, dict):
+            continue
+        row: dict[str, Any] = {}
+        for key in _LOCATOR_KEYS:
+            value = node.get(key)
+            if isinstance(value, bool):
+                row[key] = value
+            elif isinstance(value, str) and value.strip():
+                row[key] = value.strip()[:160]
+        bounds = node.get("bounds")
+        if isinstance(bounds, (list, tuple)) and len(bounds) == 4 and all(isinstance(n, (int, float)) for n in bounds):
+            row["bounds"] = [int(n) for n in bounds]
+        labeled = bool(row.get("resource_id") or row.get("text") or row.get("content_desc"))
+        if labeled or row.get("clickable") or row.get("editable"):
+            nodes.append(row)
+        if len(nodes) >= 160:
+            break
+    return nodes
+
+
+def _hierarchy_evidence(fields: dict, nodes: list[dict[str, Any]]) -> dict[str, Any]:
+    evidence: dict[str, Any] = {}
+    if nodes:
+        evidence["nodes"] = nodes
+        return evidence
+    raw = str(fields.get("hierarchy_text") or "")
+    if not raw:
+        extra = fields.get("extra") if isinstance(fields.get("extra"), dict) else {}
+        raw = str(extra.get("hierarchy_text") or "")
+    if raw.strip():
+        evidence["hierarchy_text"] = raw[:8000]
+    return evidence
 
 
 def _visible_text(fields: dict) -> str:
