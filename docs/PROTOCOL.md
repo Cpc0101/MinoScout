@@ -401,18 +401,16 @@ sequenceDiagram
     S->>N: HEARTBEAT
   end
 
-  Note over N: UI 触发批次，AgentExecutor 循环在 Nexus 内启动
-  loop 每一步
-    N->>S: EXECUTE {capability_id: screenshot, device_id, platform, timeout_sec}
-    S->>D: 截图
-    S-->>N: RESULT {image_base64, data, source}
-    N->>N: planner.decide_next_action (LLM，本地)
-    Note over N: 若 cap ∈ {human_*, assert_visual, persona, wait_ms}<br/>→ Nexus 本地 executor 处理，不出网
-    N->>S: EXECUTE {capability_id, params, device_id, platform, timeout_sec}
-    S->>D: adb / ios_wda / playwright / mac·win
-    S-->>N: RESULT {status 五态, data, executor_used, attempts}
-    N->>N: emit_agent_event → trace → UI WS
+  Note over N: UI 触发批次；Nexus 完成准入后下发脚本
+  N->>S: EXECUTE {capability_id: script.run, device_id, platform, params}
+  S->>S: 拉取 repo_url / revision，读取脚本、config.yaml、pages/
+  S->>D: 执行脚本
+  opt 脚本需要账号 / 租约 / 步骤回执
+    S->>N: EXECUTE {capability_id: script.lease | case.account | script.step | script.session}
+    N-->>S: RESULT {status, data}
   end
+  S-->>N: RESULT {status 五态, data, executor_used, attempts}
+  Note over N: 步骤事件写入 session_events；Nexus 不做逐步决策
 
   S->>N: EXECUTE {capability_id: node.device_lost, sn, params.node_id}
   N-->>S: RESULT {status: pass}
@@ -918,7 +916,7 @@ Nexus 先提交 pending 再发送；丢失应答保持 unknown，仅查询原 ta
 
 文件 `{format:"mino-scout-config",version:1,items:[{class,id,values,extras,application_config?}]}`。values 限 Scout catalog 字段，extras 限微信账号标识/baseurl 和飞书 messages_enabled；application_config 仅限飞书 CLI 应用配置。设备绑定 OAuth 登录不迁移，目标需重新扫码。完整校验先于写入；未知/重复插件及未知字段拒绝，覆盖只作用于文件列出的项目。凭据写入失败尝试恢复原凭据和配置，回滚失败明确报告且不启动服务。
 
-插件状态增加 `import_blocked`，下载中心项目增加 `required_by_config`。缺失插件的导入配置持久停用；调用、消息监听、LangBot 启动均守卫。安装不自动启用，用户在配置页保存/启用后才解除。只有非空导入配置对应的缺失插件进入补装清单。Scout 下载中心使用单 worker FIFO，旧同步安装也共享串行锁；重启中的未完成任务保持 interrupted，不自动重放。
+插件状态增加 `import_blocked`，下载中心项目增加 `required_by_config`。插件尚未安装时，导入的非空配置停用；调用、消息监听、LangBot 启动均守卫。安装成功，或节点再次上线时发现该插件已经安装，即解除 `import_blocked`，已导入的凭据可以继续使用。导入时关掉的对话渠道保持关闭，需在配置页单独开启。只有非空导入配置对应的缺失插件进入补装清单。Scout 下载中心使用单 worker FIFO，旧同步安装也共享串行锁；重启中的未完成任务保持 interrupted，不自动重放。
 
 HTTP POST `/runtime/nodes/{node_id}/configuration/export` 与 `/configuration/import`（`archive,overwrite:true`），仅节点所属账号可调用；覆盖前由 UI 确认目标节点及影响。LangBot 移除入口归下载中心。
 

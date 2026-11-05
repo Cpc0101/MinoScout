@@ -51,11 +51,11 @@ by hand. PLAYWRIGHT_BROWSERS_PATH points at <prefix>/bin/ms-playwright.
 MINO_SCOUT_SKIP_SERVICE=1 installs the payload without registering a
 daemon (CI and self-tests).
 
-Uninstall (macOS, user install):
-  ~/Library/Application Support/MinoScout/bin/mino-scout stop
+Uninstall (user install):
+  ~/.mino/scout/bin/mino-scout stop
   launchctl unload ~/Library/LaunchAgents/com.mino.scout.plist
   rm ~/Library/LaunchAgents/com.mino.scout.plist
-  rm -rf ~/Library/Application\ Support/MinoScout
+  rm -rf ~/.mino/scout
 
 macOS closed-lid execution (including battery power): startup automatically
 requests first-use authorization unless explicitly disabled. Cancellation is

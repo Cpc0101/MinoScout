@@ -42,12 +42,7 @@ if [[ -z "$MANIFEST_URL" ]]; then
   fi
 fi
 
-if [[ "$(uname -s)" == "Darwin" ]]; then
-  DEFAULT_PREFIX="$HOME/Library/Application Support/Mino/scout"
-  PREFIX="${MINO_SCOUT_HOME:-$DEFAULT_PREFIX}"
-else
-  PREFIX="${MINO_SCOUT_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/minoscout}"
-fi
+PREFIX="${MINO_SCOUT_HOME:-$HOME/.mino/scout}"
 
 # One explicit installation root for installer children and CLI commands.
 export MINO_SCOUT_HOME="$PREFIX"

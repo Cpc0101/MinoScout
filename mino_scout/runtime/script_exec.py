@@ -79,11 +79,50 @@ class _Scope:
 
 
 class _BlockImports:
+    """只拦住脚本仓库自己写的 import。Scout 执行时的渠道导入照常放行。"""
+
+    def __init__(self, root: Path):
+        self._root = Path(root).resolve()
+
     def find_spec(self, fullname, path, target=None):
-        root = str(fullname or "").split(".", 1)[0]
-        if root in _BANNED or fullname in _BANNED:
-            raise ScriptAbort("脚本不能连接 adb、WDA、Playwright 或 Appium", reason_code="script_forbidden")
-        return None
+        name = str(fullname or "")
+        top = name.split(".", 1)[0]
+        if top not in _BANNED and name not in _BANNED:
+            return None
+        if not _issued_by_script(self._root):
+            return None
+        raise ScriptAbort("脚本不能连接 adb、WDA、Playwright 或 Appium", reason_code="script_forbidden")
+
+
+def _issued_by_script(root: Path) -> bool:
+    """import 语句所在文件在脚本仓库里，才算脚本自己在连设备。"""
+    hook = Path(__file__).resolve()
+    frame = sys._getframe(1)
+    while frame is not None:
+        filename = frame.f_code.co_filename or ""
+        if _outside_import_machinery(filename) and not _is_hook(filename, hook):
+            try:
+                return Path(filename).resolve().is_relative_to(root)
+            except (OSError, ValueError):
+                return False
+        frame = frame.f_back
+    return False
+
+
+def _is_hook(filename: str, hook: Path) -> bool:
+    try:
+        return Path(filename).resolve() == hook
+    except OSError:
+        return False
+
+
+def _outside_import_machinery(filename: str) -> bool:
+    if filename.startswith("<frozen importlib"):
+        return False
+    if "importlib._bootstrap" in filename:
+        return False
+    normalized = filename.replace("\\", "/")
+    return "/importlib/" not in f"/{normalized}" and not normalized.endswith("/importlib")
 
 
 def run(core, payload, root: Path, *, deadline: float, stop) -> dict[str, Any]:
@@ -125,7 +164,7 @@ def _execute_hooks(root: Path, script_path: str, case: "Case") -> None:
     inserted = str(root) not in sys.path
     if inserted:
         sys.path.insert(0, str(root))
-    blocker = _BlockImports()
+    blocker = _BlockImports(root)
     sys.meta_path.insert(0, blocker)
     loaded: list[str] = []
     try:

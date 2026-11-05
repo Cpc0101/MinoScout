@@ -108,5 +108,8 @@ def install(node_id, tool_id, action, lock):
     from mino_scout.plugins.state import installed
     kind, plugin_id = ('im', 'langbot') if tool_id == 'langbot' else ('cli', tool_id.split('.')[1])
     if action == 'install' and installed(kind, plugin_id):
+        from mino_scout.plugins.state import release_import_block
+
+        release_import_block(kind, plugin_id)
         return '组件已安装，原配置和授权已保留'
     return install_plugin(node_id, kind, plugin_id, _held_lock=lock, update=action == 'update')

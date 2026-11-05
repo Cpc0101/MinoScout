@@ -111,25 +111,167 @@ def read_file(params):
     return {"complete": True, "table": table, "content_digest": hashlib.sha256(content).hexdigest()}
 
 
-def read_sheets(node_id, params):
-    from urllib.parse import quote
-    from mino_scout.plugins.calls import _need, _FEISHU, _feishu_tenant_token, _json
-    from mino_scout.plugins.state import plain_value, secret_value
-    _need(node_id, "cli", "feishu", "飞书插件尚未配置")
-    token = _feishu_tenant_token(plain_value("cli", "feishu", "app_id"), secret_value(node_id, "cli", "feishu", "app_secret"))
-    spreadsheet = str(params.get("spreadsheet_token") or "")
-    sheet_id, cell_range = str(params.get("sheet_id") or ""), str(params.get("range") or "")
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", spreadsheet) or not re.fullmatch(r"[A-Za-z0-9_-]+", sheet_id):
-        raise ValueError("source_sheet_identity_invalid")
+def _bounded_range(cell_range):
     match = re.fullmatch(r"([A-Z]+)([1-9][0-9]*):([A-Z]+)([1-9][0-9]*)", cell_range)
     if not match or int(match[4]) - int(match[2]) + 1 > MAX_ROWS or int(match[4]) < int(match[2]):
         raise ValueError("source_explicit_bounded_range_required")
     if _column_index(match[3] + "1") < _column_index(match[1] + "1"):
         raise ValueError("source_range_invalid")
+    return cell_range
+
+
+def _cli_data(args):
+    from mino_scout.plugins import feishu_auth
+    try:
+        return feishu_auth.run_json(args)
+    except RuntimeError:
+        raise ValueError("source_sheets_read_denied") from None
+
+
+def _sheet_rows(identity, spreadsheet, sheet_id, cell_range):
+    data = _cli_data(["sheets", "+cells-get", "--as", identity, "--spreadsheet-token", spreadsheet,
+        "--sheet-id", sheet_id, "--range", cell_range, "--format", "json"])
+    ranges = data.get("ranges") if isinstance(data, dict) else None
+    if not isinstance(data, dict) or data.get("has_more") is True or not isinstance(ranges, list) or len(ranges) != 1 or not isinstance(ranges[0], dict):
+        raise ValueError("source_sheets_incomplete")
+    block = ranges[0]
+    if block.get("truncated") is True or not isinstance(block.get("cells"), list):
+        raise ValueError("source_sheets_incomplete")
+    table = []
+    for row in block["cells"]:
+        if not isinstance(row, list) or len(table) >= MAX_ROWS:
+            raise ValueError("source_table_size_invalid")
+        values = []
+        for cell in row:
+            value = cell.get("value") if isinstance(cell, dict) else ""
+            if value is None:
+                value = ""
+            elif not isinstance(value, (str, int, float, bool)):
+                value = str(value)
+            values.append(value)
+        table.append(values)
+    while table and not any(str(cell).strip() for cell in table[-1]):
+        table.pop()
+    return table
+
+
+def _read_sheets_cli(params):
+    cell_range = _bounded_range(str(params.get("range") or ""))
+    status = _cli_data(["auth", "status", "--json", "--verify"])
+    identity = status.get("identity") if isinstance(status, dict) else ""
+    if identity not in {"user", "bot"}:
+        raise ValueError("source_sheets_not_configured")
+    spreadsheet = str(params.get("spreadsheet_token") or "")
+    wiki_token = str(params.get("wiki_token") or "")
+    if bool(spreadsheet) == bool(wiki_token):
+        raise ValueError("source_sheet_identity_invalid")
+    if wiki_token:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", wiki_token):
+            raise ValueError("source_sheet_identity_invalid")
+        node = _cli_data(["wiki", "+node-get", "--as", identity, "--node-token", wiki_token, "--format", "json"])
+        if str(node.get("obj_type") or "").lower() != "sheet" or not node.get("obj_token"):
+            raise ValueError("source_sheets_wiki_not_sheet")
+        spreadsheet = str(node["obj_token"])
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", spreadsheet):
+        raise ValueError("source_sheet_identity_invalid")
+    info = _cli_data(["sheets", "+workbook-info", "--as", identity, "--spreadsheet-token", spreadsheet, "--format", "json"])
+    found = []
+    for item in info.get("sheets") or []:
+        if not isinstance(item, dict):
+            continue
+        sheet_id = str(item.get("sheet_id") or "")
+        if re.fullmatch(r"[A-Za-z0-9_-]+", sheet_id):
+            found.append((item.get("index") if type(item.get("index")) is int else 10**9, sheet_id, item.get("is_hidden") is True))
+    requested = str(params.get("sheet_id") or "")
+    if requested:
+        if requested not in {item[1] for item in found}:
+            raise ValueError("source_sheets_tab_required")
+        sheet_id = requested
+    else:
+        visible = [item for item in found if not item[2]]
+        if not visible:
+            raise ValueError("source_sheets_tab_missing")
+        sheet_id = min(visible)[1]
+    snapshots = [_sheet_rows(identity, spreadsheet, sheet_id, cell_range) for _attempt in range(2)]
+    if snapshots[0] != snapshots[1]:
+        raise ValueError("source_sheets_changed_during_read")
+    return {"complete": True, "table": snapshots[1], "sheet_id": sheet_id, "consistency": "conservative_double_read"}
+
+
+def _wiki_spreadsheet(access_token, wiki_token):
+    from mino_scout.plugins.calls import PluginCallError, _FEISHU, _json
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", wiki_token):
+        raise ValueError("source_sheet_identity_invalid")
+    try:
+        response = _json("GET", f"{_FEISHU}/wiki/v2/spaces/get_node",
+            headers={"Authorization": "Bearer " + access_token}, params={"token": wiki_token})
+    except PluginCallError:
+        raise ValueError("source_sheets_read_denied") from None
+    if response.get("code") != 0:
+        raise ValueError("source_sheets_read_denied")
+    node = (response.get("data") or {}).get("node") or {}
+    if str(node.get("obj_type") or "").lower() != "sheet" or not node.get("obj_token"):
+        raise ValueError("source_sheets_wiki_not_sheet")
+    return str(node["obj_token"])
+
+
+def _openapi_sheet(access_token, spreadsheet, requested):
+    from mino_scout.plugins.calls import PluginCallError, _FEISHU, _json
+    if requested:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", requested):
+            raise ValueError("source_sheets_tab_required")
+        return requested
+    try:
+        response = _json("GET", f"{_FEISHU}/sheets/v2/spreadsheets/{spreadsheet}/metainfo",
+            headers={"Authorization": "Bearer " + access_token})
+    except PluginCallError:
+        raise ValueError("source_sheets_read_denied") from None
+    if response.get("code") != 0:
+        raise ValueError("source_sheets_read_denied")
+    found = []
+    for item in ((response.get("data") or {}).get("sheets") or []):
+        if not isinstance(item, dict) or item.get("hidden") is True:
+            continue
+        sheet_id = str(item.get("sheetId") or item.get("sheet_id") or "")
+        if re.fullmatch(r"[A-Za-z0-9_-]+", sheet_id):
+            found.append((item.get("index") if type(item.get("index")) is int else 10**9, sheet_id))
+    if not found:
+        raise ValueError("source_sheets_tab_missing")
+    return min(found)[1]
+
+
+def read_sheets(node_id, params):
+    from urllib.parse import quote
+    from mino_scout.plugins.calls import PluginCallError, _need, _FEISHU, _feishu_tenant_token, _json
+    from mino_scout.plugins.state import plain_value, secret_value
+    try:
+        _need(node_id, "cli", "feishu", "飞书插件尚未配置")
+    except PluginCallError:
+        raise ValueError("source_sheets_not_configured") from None
+    from mino_scout.plugins import feishu_auth
+    if feishu_auth.ready():
+        return _read_sheets_cli(params)
+    try:
+        token = _feishu_tenant_token(plain_value("cli", "feishu", "app_id"), secret_value(node_id, "cli", "feishu", "app_secret"))
+    except PluginCallError:
+        raise ValueError("source_sheets_read_denied") from None
+    spreadsheet = str(params.get("spreadsheet_token") or "")
+    wiki_token = str(params.get("wiki_token") or "")
+    if bool(spreadsheet) == bool(wiki_token):
+        raise ValueError("source_sheet_identity_invalid")
+    if wiki_token:
+        spreadsheet = _wiki_spreadsheet(token, wiki_token)
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", spreadsheet):
+        raise ValueError("source_sheet_identity_invalid")
+    cell_range = _bounded_range(str(params.get("range") or ""))
+    sheet_id = _openapi_sheet(token, spreadsheet, str(params.get("sheet_id") or ""))
     url = f"{_FEISHU}/sheets/v2/spreadsheets/{spreadsheet}/values/{quote(sheet_id + '!' + cell_range, safe='')}?valueRenderOption=ToString"
     snapshots = []
     for _attempt in range(2):
-        response = _json("GET", url, headers={"Authorization": "Bearer " + token})
+        try:
+            response = _json("GET", url, headers={"Authorization": "Bearer " + token})
+        except PluginCallError:
+            raise ValueError("source_sheets_read_denied") from None
         if response.get("code") != 0:
             raise ValueError("source_sheets_read_denied")
         value_range = (response.get("data") or {}).get("valueRange")
@@ -138,7 +280,7 @@ def read_sheets(node_id, params):
         snapshots.append(value_range["values"])
     if snapshots[0] != snapshots[1]:
         raise ValueError("source_sheets_changed_during_read")
-    return {"complete": True, "table": snapshots[1], "consistency": "conservative_double_read"}
+    return {"complete": True, "table": snapshots[1], "sheet_id": sheet_id, "consistency": "conservative_double_read"}
 
 
 def dispatch(core, request):

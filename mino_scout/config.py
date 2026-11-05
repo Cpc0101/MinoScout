@@ -1,9 +1,9 @@
-"""Studio-written node config.
+"""Node config.
 
-Studio writes `{ nexus_url, token }` (and optional `studio_id`) to a per-OS
-Application Support path. Scout persists `scout_id` here on first run.
-CLI flags `--nexus` / `--token` override the file. `nexus_url` is an HTTP
-origin; this module derives the WebSocket `/node` URL.
+Development lives in ``~/.mino-dev/scout``. Production lives in ``~/.mino/scout``.
+Scout persists ``scout_id`` here on first run. CLI flags ``--nexus`` / ``--token``
+override the file. ``nexus_url`` is an HTTP origin; this module derives the
+WebSocket ``/node`` URL.
 """
 from __future__ import annotations
 
@@ -35,24 +35,19 @@ def _environment_dir(dev: bool) -> Path:
     override = str(os.environ.get("MINO_SCOUT_HOME") or "").strip()
     if override:
         return Path(override).expanduser().resolve()
-    if os.name == "nt":
-        return Path(os.environ.get("APPDATA") or Path.home()) / "MinoScout"
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "Mino" / "scout"
-    xdg = str(os.environ.get("XDG_CONFIG_HOME") or "").strip()
-    if xdg:
-        return Path(xdg).expanduser() / "minoscout"
-    return Path.home() / ".config" / "minoscout"
+    return Path.home() / ".mino" / "scout"
 
 
 
 def config_dir() -> Path:
     selected = _environment_dir(development()).resolve()
-    reserved = ([Path.home() / "Library/Application Support/Mino/scout",
-                 Path.home() / "Library/Application Support/MinoScout",
-                 Path.home() / ".config/minoscout",
-                 Path(os.environ.get("APPDATA") or Path.home()) / "MinoScout"]
-                if development() else [Path.home() / ".mino-dev/scout"])
+    home = Path.home()
+    reserved = ([home / ".mino" / "scout",
+                 home / "Library/Application Support/Mino/scout",
+                 home / "Library/Application Support/MinoScout",
+                 home / ".config/minoscout",
+                 Path(os.environ.get("APPDATA") or home) / "MinoScout"]
+                if development() else [home / ".mino-dev" / "scout"])
     for other in reserved:
         other = other.resolve()
         if selected == other or selected in other.parents or other in selected.parents:

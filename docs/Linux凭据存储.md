@@ -2,7 +2,7 @@
 
 Linux 优先使用 Secret Service（secret-tool）。工具不存在、服务未启动/未解锁、执行失败或超过 5 秒时，保存操作改用本地文件；macOS Keychain 与 Windows Credential Manager 不变。
 
-文件位于 Scout 配置目录下的 `plugin-secrets/`。正式环境默认是 `$XDG_CONFIG_HOME/minoscout/plugin-secrets/`，未设置 XDG_CONFIG_HOME 时为 `~/.config/minoscout/plugin-secrets/`；MINO_SCOUT_HOME 可覆盖正式配置目录。源码开发环境使用独立开发配置目录。
+文件位于 Scout 配置目录下的 `plugin-secrets/`。正式默认 `~/.mino/scout/plugin-secrets/`，源码开发默认 `~/.mino-dev/scout/plugin-secrets/`。`MINO_SCOUT_HOME` 覆盖正式配置目录，`MINO_SCOUT_DEV_HOME` 覆盖开发配置目录。
 
 目录权限为 0700，凭据和锁文件为 0600，必须属于 Scout 运行用户。文件名使用完整凭据标识的 SHA-256，沿用账号、节点和插件隔离。内容是明文 JSON，权限限制不等于加密；备份整个配置目录时应按敏感数据处理。容器需要挂载可写、持久化且归运行用户所有的配置目录。
 

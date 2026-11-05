@@ -79,7 +79,11 @@ def _verify_sha256(path: Path, expected: str) -> None:
 
 
 def _install_env(*, inplace: bool) -> dict[str, str]:
+    from mino_scout.config import config_dir
     env = os.environ.copy()
+    # install.sh / install.ps1 only honor MINO_SCOUT_HOME. The running process's
+    # config_dir() is the root, including a source Scout under ~/.mino-dev/scout.
+    env["MINO_SCOUT_HOME"] = str(config_dir())
     if inplace:
         env["MINO_SCOUT_UPDATING"] = "1"
         env["MINO_SCOUT_SKIP_SERVICE"] = "1"

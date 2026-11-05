@@ -422,6 +422,11 @@ class NodeTransport:
         from mino_scout.plugins import wechat as wechat_plugin, langbot_host, feishu_messages
         wechat_plugin.bind_node(self.core.node_id)
         if self.core._plugins_ready:
+            from mino_scout.plugins.state import release_installed_import_blocks
+
+            released = release_installed_import_blocks()
+            if released:
+                SLog.i(TAG, f"已安装插件解除导入停用: {', '.join(released)}")
             wechat_plugin.ensure_listener()
             langbot_host.reconcile(self.core.node_id)
             feishu_messages.set_connection(True)

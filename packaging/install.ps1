@@ -19,7 +19,7 @@ if ($InstallingIdentity.IsSystem) { throw "PC 操作需要登录用户，请在�
 if ($env:MINO_SCOUT_HOME) {
   $Prefix = $env:MINO_SCOUT_HOME
 } else {
-  $Prefix = Join-Path $env:APPDATA "MinoScout"
+  $Prefix = Join-Path $env:USERPROFILE ".mino\scout"
 
 }
 

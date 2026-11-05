@@ -268,7 +268,11 @@ def install(node_id: str, kind: str, plugin_id: str, *, _held_lock=None, update=
         try:
             from mino_scout.plugins import langbot_host
 
-            return langbot_host.install(node_id, update=update)
+            summary = langbot_host.install(node_id, update=update)
+            from mino_scout.plugins.state import release_import_block
+
+            release_import_block(kind, plugin_id)
+            return summary
         except Exception as exc:
             raise PluginInstallError(str(exc).strip() or "LangBot 安装失败") from exc
         finally:
@@ -323,6 +327,9 @@ def install(node_id: str, kind: str, plugin_id: str, *, _held_lock=None, update=
             raise
         PP.emit("done", kind=kind, plugin_id=plugin_id, label="安装完成", percent=100, done=True)
         SLog.i(TAG, f"installed {kind}/{plugin_id}")
+        from mino_scout.plugins.state import release_import_block
+
+        release_import_block(kind, plugin_id)
         return "更新完成，原配置和授权已保留" if update else "安装完成"
     except Exception as exc:
         archive.unlink(missing_ok=True)

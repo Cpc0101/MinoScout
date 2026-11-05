@@ -114,7 +114,7 @@ macOS 会话探测读取系统返回的 `kCGSSessionUserIDKey`、`kCGSSessionOnC
 
 ## 正式与开发 Scout 身份（2026-10-18）
 
-源码运行固定使用 `~/.mino-dev/scout`、独立派生 Scout ID，仅连接本机 Nexus `:50101`；开发 Workbench 为 `:60101`。正式安装保留自身安装与配置目录，默认连接 `mino.local:50104`。不要复制正式 config/token/profile 到开发目录。
+源码运行固定使用 `~/.mino-dev/scout`、独立派生 Scout ID，仅连接本机 Nexus `:50101`；开发 Workbench 为 `:60101`。正式安装使用 `~/.mino/scout`，默认连接 `mino.local:50104`。不要复制正式 config/token/profile 到开发目录。
 
 `python -m mino_scout.cli identity` 只读显示当前入口的 environment、runtime_kind、config_dir、nexus_origin、scout_id、process_build 与 executable。源码/冻结包不单独决定正式/测试：冻结包连接本机 50101 也显示 development；非标准目标显示 custom，不能猜为正式。
 

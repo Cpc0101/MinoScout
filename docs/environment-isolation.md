@@ -6,10 +6,11 @@
 | --- | --- | --- |
 | Scout 启动 | 源码入口与源码解释器 | 安装包与系统服务 |
 | Scout 目录变量 | MINO_SCOUT_DEV_HOME | MINO_SCOUT_HOME |
-| Scout 默认目录（macOS） | ~/.mino-dev/scout | ~/Library/Application Support/MinoScout |
+| Scout 默认目录 | ~/.mino-dev/scout | ~/.mino/scout |
 | 系统凭据服务名 | MinoScout.Development | MinoScout（保留既有正式凭据） |
 | Nexus 目录变量 | MINO_NEXUS_DEV_DATA_DIR | MINO_NEXUS_DATA_DIR |
-| Nexus 默认目录 | ~/.mino-dev/nexus | ~/.mino-nexus |
+| Nexus 默认目录 | ~/.mino-dev/nexus | ~/.mino/nexus |
+| Workbench 默认目录 | ~/.mino-dev/workbench | ~/.mino/workbench |
 
 PID、锁、停止请求、插件文件、日志分别跟随各自目录。源码启动不调用正式 launchd/systemd/计划任务，不搜索安装包作为备用可执行文件。显式目录经过 realpath 检查，禁止相同或互相包含；首次写入目录环境标记，跨环境重用已标记目录直接失败。不要复制或硬链接正式数据到开发目录。开发 Nexus 不再读取正式目录变量，原先以 MINO_NEXUS_DATA_DIR 指定开发临时目录的脚本应改用 MINO_NEXUS_DEV_DATA_DIR。
 

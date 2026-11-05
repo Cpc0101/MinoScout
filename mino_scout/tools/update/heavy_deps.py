@@ -34,22 +34,34 @@ def install_heavy_deps(*, manifest_url: str = "", adb_hook=None) -> dict[str, An
         pick_manifest_item,
     )
 
+    from mino_scout.config import development
+
     prefix = config_dir()
-    bin_dir = prefix / "bin"
-    url = str(manifest_url or manifest_url_from_config()).strip()
-    manifest = fetch_json(url)
-    item = pick_manifest_item(manifest)
-    installed = _installed()
-    plan = plan_heavy_deps(item, installed, bin_dir=bin_dir if bin_dir.is_dir() else None)
+    if development():
+        from mino_scout.plugins.components import chromium, chromium_ready
 
-    if plan.get("mode") == "up-to-date":
-        SLog.i(TAG, "Chromium 层已就绪，跳过下载")
+        if chromium_ready():
+            SLog.i(TAG, "Chromium 已就绪，跳过下载")
+            plan = {"mode": "up-to-date", "reason": "source_scout"}
+        else:
+            SLog.i(TAG, "安装与当前源码 Scout 匹配的 Chromium")
+            plan = {"mode": "installed", "reason": "source_scout", "detail": chromium("install")}
     else:
-        for step in plan.get("steps") or []:
-            SLog.i(TAG, f"安装 {step.get('layer') or 'layer'} …")
-            from mino_scout.service import pid_alive, read_pid
+        bin_dir = prefix / "bin"
+        url = str(manifest_url or manifest_url_from_config()).strip()
+        manifest = fetch_json(url)
+        item = pick_manifest_item(manifest)
+        installed = _installed()
+        plan = plan_heavy_deps(item, installed, bin_dir=bin_dir if bin_dir.is_dir() else None)
 
-            apply_plan_step(step, inplace=pid_alive(read_pid()))
+        if plan.get("mode") == "up-to-date":
+            SLog.i(TAG, "Chromium 层已就绪，跳过下载")
+        else:
+            for step in plan.get("steps") or []:
+                SLog.i(TAG, f"安装 {step.get('layer') or 'layer'} …")
+                from mino_scout.service import pid_alive, read_pid
+
+                apply_plan_step(step, inplace=pid_alive(read_pid()))
 
     adb_ok = False
     adb_err = ""

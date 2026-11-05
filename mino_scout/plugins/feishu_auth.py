@@ -166,9 +166,21 @@ def _worker(home: Path, job: dict, lock) -> None:
             from mino_scout.plugins import feishu_messages
             feishu_messages.reconcile()
 
+def _store_authorized(home: Path) -> dict:
+    """CLI 已验证时把授权写入状态文件。只放在返回值里的话，下一次查询会读到旧的 idle。"""
+    payload = {"state": "authorized", "summary": "已授权，可直接使用", "authorization_url": ""}
+    _save(home, payload)
+    job = _jobs.get(str(home.resolve()))
+    if job is not None and job["public"].get("state") not in _ACTIVE:
+        job["public"].update(payload)
+    return dict(payload)
+
+
 def action(name: str) -> dict:
     home = root()
     key = str(home.resolve())
+    result: dict | None = None
+    reconcile = False
     with _guard:
         job = _jobs.get(key)
         active = bool(job and job["public"]["state"] in _ACTIVE)
@@ -176,32 +188,44 @@ def action(name: str) -> dict:
             result = dict(job["public"] if job else _read(home))
             if not job and result.get("state") in _ACTIVE:
                 result.update(state="interrupted", authorization_url="", summary="节点重启中断了授权；继续时将复用已保存的应用")
-            return result
-        if name == "auth_cancel":
+            elif not active and result.get("state") in (None, "", "idle") and ready():
+                result = _store_authorized(home)
+                reconcile = True
+        elif name == "auth_cancel":
             if active:
                 job["cancel"].set()
                 proc = job.get("process")
                 if proc and proc.poll() is None:
                     proc.kill()
-            return {"state": "cancelling" if active else "idle", "summary": "正在取消" if active else "没有进行中的授权"}
-        if name != "auth_start":
+            result = {"state": "cancelling" if active else "idle", "summary": "正在取消" if active else "没有进行中的授权"}
+        elif name != "auth_start":
             raise ValueError("不支持的授权操作")
-        if active:
-            return dict(job["public"])
-        if ready():
-            return {"state": "authorized", "summary": "已授权，可直接使用"}
-        _safe_entry(home.parent, "invoke")
-        lock = acquire_plugin("cli", "feishu")
-        job = {"public": {"state": "starting", "summary": "正在准备飞书授权", "authorization_url": ""},
-               "cancel": threading.Event(), "process": None}
-        try:
-            _save(home, job["public"])
-            _jobs[key] = job
-            threading.Thread(target=_worker, args=(home, job, lock), daemon=True).start()
-        except Exception:
-            lock.release()
-            raise
-        return dict(job["public"])
+        elif active:
+            result = dict(job["public"])
+        elif ready():
+            stored = _read(home)
+            if stored.get("state") == "authorized":
+                result = dict(stored)
+            else:
+                result = _store_authorized(home)
+                reconcile = True
+        else:
+            _safe_entry(home.parent, "invoke")
+            lock = acquire_plugin("cli", "feishu")
+            job = {"public": {"state": "starting", "summary": "正在准备飞书授权", "authorization_url": ""},
+                   "cancel": threading.Event(), "process": None}
+            try:
+                _save(home, job["public"])
+                _jobs[key] = job
+                threading.Thread(target=_worker, args=(home, job, lock), daemon=True).start()
+            except Exception:
+                lock.release()
+                raise
+            result = dict(job["public"])
+    if reconcile:
+        from mino_scout.plugins import feishu_messages
+        feishu_messages.reconcile()
+    return result or {}
 
 
 def forget_uninstalled() -> None:

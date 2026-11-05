@@ -233,6 +233,51 @@ def installed(kind: str, plugin_id: str) -> bool:
     return marker.is_file()
 
 
+@config_locked
+def release_import_block(kind: str, plugin_id: str) -> bool:
+    """插件已经装好时，去掉导入时留下的停用标记。
+
+    只解除 import_blocked。导入时关掉的对话渠道保持关闭，仍由配置页单独打开。
+    """
+    if not installed(kind, plugin_id):
+        return False
+    root = load_state()
+    items = root.get("items")
+    if not isinstance(items, dict):
+        return False
+    current = items.get(_key(kind, plugin_id))
+    if not isinstance(current, dict) or not current.get("import_blocked"):
+        return False
+    current = dict(current)
+    current.pop("import_blocked", None)
+    items[_key(kind, plugin_id)] = current
+    save_state(root)
+    return True
+
+
+@config_locked
+def release_installed_import_blocks() -> list[str]:
+    """把已经安装、但仍标着 import_blocked 的配置解开。"""
+    root = load_state()
+    items = root.get("items")
+    if not isinstance(items, dict):
+        return []
+    released: list[str] = []
+    for key, current in list(items.items()):
+        if not isinstance(current, dict) or not current.get("import_blocked") or ":" not in str(key):
+            continue
+        kind, plugin_id = str(key).split(":", 1)
+        if not installed(kind, plugin_id):
+            continue
+        current = dict(current)
+        current.pop("import_blocked", None)
+        items[key] = current
+        released.append(str(key))
+    if released:
+        save_state(root)
+    return released
+
+
 def configured(node_id: str, kind: str, plugin_id: str) -> bool:
     """心跳会频繁调用。密钥是否在，只看本机清单里的标记，不去读保险库。"""
     del node_id

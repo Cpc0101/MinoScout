@@ -84,7 +84,7 @@ glibc ≥ 2.35）。Linux 的 browser 层只带 Chromium 二进制，目标机�
 
 ## 5. 安装布局
 
-`bootstrap.sh`（macOS/Linux）和 `bootstrap.ps1`（Windows PowerShell）随 Release 同时发布，使用 manifest 的精确系统/架构条目，缺包或不支持的架构明确失败，不回退为其他架构。两种入口均在启动服务前合并配置，保留已有身份、长期凭证和其他设置；短期安装凭证只写入待绑定字段，注册确认后才替换长期凭证。Windows 配置只使用 APPDATA/MinoScout 或显式 MINO_SCOUT_HOME，不探测 LOCALAPPDATA；计划任务明确使用同一配置目录。安装成功仅代表文件和服务完成，账号接入结果在 Workbench 查看。
+`bootstrap.sh`（macOS/Linux）和 `bootstrap.ps1`（Windows PowerShell）随 Release 同时发布，使用 manifest 的精确系统/架构条目，缺包或不支持的架构明确失败，不回退为其他架构。两种入口均在启动服务前合并配置，保留已有身份、长期凭证和其他设置；短期安装凭证只写入待绑定字段，注册确认后才替换长期凭证。Windows 配置只使用 `%USERPROFILE%\.mino\scout` 或显式 MINO_SCOUT_HOME，不探测 LOCALAPPDATA；计划任务明确使用同一配置目录。安装成功仅代表文件和服务完成，账号接入结果在 Workbench 查看。
 
 ```
 $PREFIX/bin/
@@ -187,7 +187,7 @@ CLI 恢复也须旧进程退出；不能通过删除锁文件清除维护状态�
 
 ## 当前安装根合同（2026-10-20）
 
-macOS 默认且唯一根为 `~/Library/Application Support/Mino/scout`，Windows 为 `%APPDATA%/MinoScout`，Linux 为 `${XDG_CONFIG_HOME:-~/.config}/minoscout`。显式 `MINO_SCOUT_HOME` 是用户选择的安装根，不由旧文件存在与否推导。所有平台日志统一放 `<安装根>/logs`。
+正式默认根在各系统都是 `~/.mino/scout`，开发源码是 `~/.mino-dev/scout`。显式 `MINO_SCOUT_HOME`（开发为 `MINO_SCOUT_DEV_HOME`）是用户选择的安装根，不由旧文件存在与否推导。所有平台日志统一放 `<安装根>/logs`。
 
 bootstrap、install、运行时必须选同一根；bootstrap/install 向子命令导出 MINO_SCOUT_HOME，launchd/systemd/Windows 启动器持久携带该根。删除 macOS MinoScout 及 Windows LOCALAPPDATA 的存在性回退，不自动复制、合并或读取旧目录凭据。自定义根的直接 CLI 调用需携带相同 MINO_SCOUT_HOME。
 

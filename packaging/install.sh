@@ -23,14 +23,8 @@ case "$(uname -s)" in
   *) echo "此脚本仅支持 macOS / Linux；Windows 请使用 install.ps1" >&2; exit 1 ;;
 esac
 
-if [[ "$(uname -s)" == "Darwin" ]]; then
-  DEFAULT_PREFIX="$HOME/Library/Application Support/Mino/scout"
-  PREFIX="${MINO_SCOUT_HOME:-$DEFAULT_PREFIX}"
-  LOG_DIR="$PREFIX/logs"
-else
-  PREFIX="${MINO_SCOUT_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/minoscout}"
-  LOG_DIR="$PREFIX/logs"
-fi
+PREFIX="${MINO_SCOUT_HOME:-$HOME/.mino/scout}"
+LOG_DIR="$PREFIX/logs"
 
 # One explicit installation root for installer children and CLI commands.
 export MINO_SCOUT_HOME="$PREFIX"
