@@ -21,6 +21,7 @@ _REUSE = {
 }
 _CASE_ATTRS = {"config", "env", "app_id", "init", "scout", "nexus"}
 _STEP_CALLS = {"prep", "do", "check"}
+_EMPTY_PREP = {"无", "无前置", "无需前置", "不需要", "不需要前置", "无操作", "none", "n/a", "na"}
 _SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules"}
 
 
@@ -50,6 +51,8 @@ def check_repo(root: Path) -> list[Hint]:
             continue  # 语法错误 agent 自己看得到，这里不重复
         for line, code, text in _scan(tree):
             hints.append(Hint(str(rel), line, code, text))
+        if "tests" in rel.parts:
+            hints.extend(_prep_required(tree, str(rel)))
         for key, line in _config_uses(tree):
             used.setdefault(key, (str(rel), line))
     if keys is not None:
@@ -88,9 +91,10 @@ def _scan(tree: ast.AST) -> list[tuple[int, str, str]]:
                     if not _is_config_ref(node.args[0] if len(node.args) == 1 and not node.keywords else None):
                         out.append((line, "case_init", "case.init 的参数必须是 case.config.<KEY>"))
             if isinstance(func, ast.Attribute) and func.attr in _STEP_CALLS and _is_nexus(func.value):
-                arg = node.args[0] if node.args else None
-                if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str) and arg.value.strip()):
+                if not _titled(node):
                     out.append((line, "step_title", f"case.nexus.{func.attr}() 要写这一步具体做什么的文字标题，它就是测试报告里的步骤名"))
+                elif func.attr == "prep" and _blank_prep(node):
+                    out.append((line, "prep_reason", "前置标题不能只写「无」。写清做了什么；确实不用做，就写为什么"))
         elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "case":
             if node.attr not in _CASE_ATTRS:
                 out.append((line, "case_attr", f"case.{node.attr} 不存在：设备动作写在 app = case.init(case.config.<KEY>) 的 app 上，本机能力 case.scout，Nexus 能力 case.nexus"))
@@ -101,6 +105,39 @@ def _scan(tree: ast.AST) -> list[tuple[int, str, str]]:
 
 def _is_nexus(node: ast.AST) -> bool:
     return isinstance(node, ast.Attribute) and node.attr == "nexus" and isinstance(node.value, ast.Name) and node.value.id == "case"
+
+
+def _titled(node: ast.Call) -> bool:
+    arg = node.args[0] if node.args else None
+    return isinstance(arg, ast.Constant) and isinstance(arg.value, str) and bool(arg.value.strip())
+
+
+def _blank_prep(node: ast.Call) -> bool:
+    arg = node.args[0] if node.args else None
+    if not isinstance(arg, ast.Constant) or not isinstance(arg.value, str):
+        return False
+    return arg.value.strip().lower() in _EMPTY_PREP
+
+
+def _prep_required(tree: ast.AST, rel: str) -> list[Hint]:
+    """tests/ 下的用例文件必须写 prep。没有动作时，标题写明为什么。"""
+    runs = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "run"]
+    if not runs:
+        return []
+    calls = [node for node in ast.walk(tree) if _is_prep_call(node)]
+    if any(_titled(node) and not _blank_prep(node) for node in calls):
+        return []
+    if calls:
+        return []
+    line = int(runs[0].lineno or 1)
+    return [Hint(rel, line, "prep_missing",
+                 "用例要写前置：case.nexus.prep(\"做了什么\")。确实不用做，标题写为什么，这句话会写入 Nexus")]
+
+
+def _is_prep_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        return False
+    return node.func.attr == "prep" and _is_nexus(node.func.value)
 
 
 def _is_config_ref(node: ast.AST | None) -> bool:

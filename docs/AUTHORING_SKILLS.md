@@ -92,6 +92,8 @@ apps:
 
 Scout 对 `do("标题")` 回调传 `title`（传整数时仍传 `number`）。Nexus 以前只认 `number`：它用编号去用例的解析步骤里找原文，写进 `node/enter`，找不到就 `script_step_missing`。标题模式下没有原文可对，Nexus 用递增序号作 `n`，文本取标题。**代价：不再校验“步骤号是否存在于用例原文”，`do` 与 `check` 也不再按同一编号配对。**
 
+一条原文可以拆成多个标题，序号写成 `2-1`、`2-2`。没有前置动作时也写一条 `prep`，标题说明为什么不做，块里可以没有动作。这条标题同样进入 `node/enter`。
+
 ---
 
 ## 4. 自检与执行
@@ -105,6 +107,7 @@ Scout 对 `do("标题")` 回调传 `title`（传整数时仍传 `number`）。Ne
 | `forbidden` | 设备库、`subprocess`、线程 / 进程 / asyncio、`exec`/`eval`/`os.system`、`if platform` |
 | `reuse` | `time.sleep`、`imaplib`/`poplib`、`openai`/`anthropic`（Scout 已有对应能力） |
 | `case_attr` / `case_init` / `step_title` | 旧写法、`case.init` 参数、步骤没标题 |
+| `prep_missing` / `prep_reason` | `tests/` 下的用例没有 `prep`；标题只写了「无」 |
 | `config_*` / `page_layout` | `config.yaml` 缺失或格式、脚本引用了不存在的应用、页面文件位置 |
 
 它不检查方法名（变量名不固定），也不能保证脚本能跑通。
