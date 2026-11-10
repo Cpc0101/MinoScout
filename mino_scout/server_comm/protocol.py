@@ -68,18 +68,8 @@ NODE_COMMAND_CAPS = frozenset({
     "node.config_export", "node.config_import",
     "node.tools", "node.tool_task_submit", "node.tool_task_get",
 })
-NODE_EVENT_CAPS = frozenset({
-    "node.device_lost",
-    "node.device_found",
-    "node.channel_changed",
-    "node.engine_crashed",
-    "node.shutting_down",
-    "node.update_progress",
-    "node.plugin_progress",
-    "node.plugin_wechat_message",
-    "node.plugin_im_message",
-})
-FRAMEWORK_CAPS = NODE_COMMAND_CAPS | NODE_EVENT_CAPS
+# 事件白名单已删除：Scout 发什么事件由发送侧决定，Nexus 收到后按自己的
+# `resources/node_registry.py:_NODE_EVENT_HANDLERS` 查表处理；处理不了的回 FAIL。
 
 OBSERVE_CAPS = {
     "screenshot": "screenshot",

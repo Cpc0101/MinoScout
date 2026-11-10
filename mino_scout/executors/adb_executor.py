@@ -28,6 +28,94 @@ from mino_scout.executors.base import (
 
 TAG = "AdbExecutor"
 
+_INSTALL_FLAG_WORDS = {"1", "true", "yes", "on"}
+# `adb install` 明确按第一段输出判定成败；`Success` / `Performing Streamed Install` 混合出现。
+_ADB_INSTALL_FAIL_WORDS = ("Failure", "failed", "Exception", "INSTALL_FAILED", "Error")
+
+
+def _install_timeout(params: dict) -> float:
+    try:
+        value = float(params.get("install_timeout_sec") or 300.0)
+    except (TypeError, ValueError):
+        value = 300.0
+    return max(30.0, min(value, 3600.0))
+
+
+def _install_flags(params: dict) -> list[str]:
+    """`-r` 重装、`-t` 允许测试包；`-d` 允许降级、`-g` 授予全部运行时权限按需追加。"""
+    flags = ["-r", "-t"]
+    if str(params.get("allow_downgrade") or "").strip().lower() in _INSTALL_FLAG_WORDS:
+        flags.append("-d")
+    if str(params.get("grant_permissions") or params.get("grant") or "").strip().lower() in _INSTALL_FLAG_WORDS:
+        flags.append("-g")
+    return flags
+
+
+def _adb_install_ok(rc: int, out: str, err: str = "") -> bool:
+    """成败只看 stdout 的 `Success`，但同时扫 stderr 的失败词：
+    `adb` 会把 `Failure [INSTALL_FAILED_…]` 写 stderr、把 `Performing Streamed Install`
+    写 stdout，只看一边会判错。"""
+    if rc != 0:
+        return False
+    text = f"{out or ''}\n{err or ''}"
+    lowered = text.lower()
+    if any(word.lower() in lowered for word in _ADB_INSTALL_FAIL_WORDS):
+        return False
+    return "success" in lowered
+
+
+def _adb_install_error(rc: int, out: str, err: str) -> str:
+    """把 adb 的原文压缩成一句能看懂的失败原因。
+
+    `adb install` 把 `Performing Streamed Install` 写 stdout、把真正的
+    `Failure [...]` 写 stderr；只读 stdout 会得到一句「安装失败」的空话。
+    """
+    stdout = str(out or "").strip()
+    stderr = str(err or "").strip()
+    detail = "\n".join(part for part in (stdout, stderr) if part)
+    if rc == -1 and "timeout" in detail.lower():
+        return f"adb install 超时：{stderr or stdout}（大包或设备慢时提高 install_timeout_sec）"
+    if rc == -2:
+        return "adb 不在 PATH"
+    for line in (stderr, stdout):
+        for row in line.splitlines():
+            row = row.strip()
+            if row and any(word.lower() in row.lower() for word in ("failed", "failure", "error", "exception")):
+                return row[:300]
+    return detail[:300] or f"adb install rc={rc}"
+
+
+def _split_apks(source, params: dict):
+    """装 split APK。
+
+    显式给了 `splits` / `split_files` 时，**基包 `path` 一起装**；
+    `.apks` / `.xapk` / `.apkm` 是压缩的拆分包，解开后整体安装。
+
+    → (要装的文件列表, 需要清理的解包目录)。普通 `.apk` 返回 `([], None)`。
+    """
+    from pathlib import Path
+
+    path = Path(source)
+    related = params.get("split_files") or params.get("splits")
+    if isinstance(related, list) and related:
+        extras = [Path(str(item)) for item in related if Path(str(item)).exists()]
+        return ([path, *extras] if extras else []), None
+    if path.suffix.lower() not in {".apks", ".xapk", ".apkm"}:
+        return [], None
+    import tempfile
+    import zipfile
+
+    work = Path(tempfile.mkdtemp(prefix="mino_splits_"))
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = [name for name in archive.namelist() if name.lower().endswith(".apk")]
+            if not names:
+                return [], work
+            archive.extractall(work, members=names)
+        return sorted(work / name for name in names), work
+    except (OSError, zipfile.BadZipFile):
+        return [], work
+
 # `adb shell input tap` 在 Android 14+ / 部分 OEM 上常返回 0 但事件到不了 App。
 # 用短 swipe（按下停留）代替零时长 tap，u2 不可用时的主路径。
 _TAP_HOLD_MS = 80
@@ -496,20 +584,28 @@ class AdbExecutor:
         )
 
     def _uninstall_app(self, event, ctx, serial, started_at, t0):
-        pkg = str((event.params or {}).get("package") or (event.params or {}).get("bundle") or "").strip()
+        params = event.params or {}
+        pkg = str(params.get("package") or params.get("bundle") or "").strip()
         if not pkg:
-            return self._fail(event, started_at, t0, "uninstall_app 缺 params.package")
-        rc, out, err = self._adb(serial, "uninstall", pkg)
+            return self._fail(event, started_at, t0, "uninstall_app 缺 params.package", raw_response={
+                "execution": {"execution_started": "no", "phase": "validate",
+                              "reason_code": "missing_package_parameter", "source": "adb.native.v1"}})
+        args = ["uninstall"]
+        if str(params.get("keep_data") or "").strip().lower() in _INSTALL_FLAG_WORDS:
+            args.append("-k")
+        rc, out, err = self._adb(serial, *args, pkg)
         elapsed = int((time.time() - t0) * 1000)
         if rc == 0 and "Success" in out:
             return make_event_result(
                 event, status=EventStatus.PASS, executor_used=self.id, started_at=started_at,
                 elapsed_ms=elapsed, summary=f"已卸载 {pkg}",
-                raw_response={"execution": {"execution_started": "yes", "phase": "completed", "source": "adb.native.v1"}},
+                raw_response={"package": pkg, "execution": {"execution_started": "yes", "phase": "completed", "source": "adb.native.v1"}},
             )
         return make_event_result(
             event, status=EventStatus.FAIL, executor_used=self.id, started_at=started_at,
             elapsed_ms=elapsed, summary=f"卸载 {pkg} 失败", error=err or out or f"rc={rc}",
+            raw_response={"execution": {"execution_started": "yes", "phase": "completed",
+                                        "reason_code": "uninstall_failed", "source": "adb.native.v1"}},
         )
 
     def _swipe_direction(self, event, ctx, serial, started_at, t0):
@@ -590,41 +686,88 @@ class AdbExecutor:
         )
 
     def _install_apk(self, event, ctx, serial, started_at, t0):
+        """装 APK/APKS/XAPK。找不到包时**在启动 adb 之前**就返回，不让空路径落到 adb 参数位。"""
+        from mino_scout.tools import app_package
+
         params = event.params or {}
-        path = params.get("path") or ""
-        url = params.get("url") or ""
-        tmp_path = ""
-        # 支持 url（内部下载到本地再 install），也兼容本地 path
-        if not path and url:
-            try:
-                from mino_scout.platform.android.adb_command import _download_apk
-
-                path = _download_apk(url, params.get("file_name") or "")
-                tmp_path = path
-            except Exception as e:
-                return self._fail(event, started_at, t0, f"apk 下载失败: {e}")
-        if not path:
-            return self._fail(event, started_at, t0, "install_apk 缺 params.path 或 params.url")
+        timeout = _install_timeout(params)
         try:
-            rc, out, err = self._adb(serial, "install", "-r", "-t", path, timeout_sec=300.0)
-            elapsed = int((time.time() - t0) * 1000)
-            if rc == 0 and "Success" in out:
-                return make_event_result(
-                    event, status=EventStatus.PASS, executor_used=self.id, started_at=started_at,
-                    elapsed_ms=elapsed, summary=f"安装 {path}",
-                )
-            return make_event_result(
-                event, status=EventStatus.FAIL, executor_used=self.id, started_at=started_at,
-                elapsed_ms=elapsed, summary="安装失败", error=err or out,
+            source, temp = app_package.resolve_source(params, platform="android")
+        except app_package.PackageError as exc:
+            return self._fail(
+                event, started_at, t0, str(exc),
+                raw_response={"execution": {"execution_started": "no", "phase": "validate",
+                                            "reason_code": "package_missing", "source": "adb.native.v1"}},
             )
-        finally:
-            if tmp_path:
-                import os as _os
+        try:
+            package = app_package.inspect_package(source, platform="android")
+            if not package.get("sha256"):
+                return self._fail(
+                    event, started_at, t0, f"读不到安装包：{package.get('reason') or source}",
+                    raw_response={"execution": {"execution_started": "no", "phase": "validate",
+                                                "reason_code": "package_unreadable", "source": "adb.native.v1"}},
+                )
+            splits, work = _split_apks(source, params)
+            try:
+                if splits:
+                    rc, out, err = self._adb_multi(serial, splits, timeout)
+                    installed = splits
+                else:
+                    rc, out, err = self._adb(serial, "install", *_install_flags(params), str(source),
+                                             timeout_sec=timeout)
+                    installed = [source]
+                elapsed = int((time.time() - t0) * 1000)
+                if _adb_install_ok(rc, out, err):
+                    verified = self._verify_android_installed(serial, package, params)
+                    return make_event_result(
+                        event, status=EventStatus.PASS, executor_used=self.id, started_at=started_at,
+                        elapsed_ms=elapsed,
+                        summary=f"已安装 {verified.get('package') or source.name} {package.get('version') or ''}".strip(),
+                        raw_response={
+                            **package,
+                            "installed_files": [item.name for item in installed],
+                            "splits": len(installed) - 1,
+                            "verified": verified,
+                            "execution": {"execution_started": "yes", "phase": "completed", "source": "adb.native.v1"},
+                        },
+                    )
+                return make_event_result(
+                    event, status=EventStatus.FAIL, executor_used=self.id, started_at=started_at,
+                    elapsed_ms=elapsed, summary="安装失败", error=_adb_install_error(rc, out, err),
+                    raw_response={**package, "stdout": out[:800], "stderr": err[:800], "rc": rc,
+                                  "execution": {"execution_started": "yes", "phase": "completed",
+                                                "reason_code": "install_failed", "source": "adb.native.v1"}},
+                )
+            finally:
+                if work is not None:
+                    import shutil as _shutil
 
-                try:
-                    _os.remove(tmp_path)
-                except OSError:
-                    pass
+                    _shutil.rmtree(work, ignore_errors=True)
+        finally:
+            app_package.release(temp)
+
+    def _adb_multi(self, serial: str, files: list, timeout: float) -> tuple[int, str, str]:
+        return self._adb(serial, "install-multiple", "-r", "-t", *[str(item) for item in files],
+                         timeout_sec=timeout)
+
+    def _verify_android_installed(self, serial: str, package: dict, params: dict) -> dict:
+        """装完回读 `dumpsys package`：确认包在设备上，并比对 versionName。"""
+        from mino_scout.platform.android.app_query import parse_package_version, version_dump_shell
+
+        target = str(params.get("package") or package.get("bundle_id") or "").strip()
+        if not target:
+            return {"ok": False, "reason": "package_unknown"}
+        rc, out, err = self._adb_sh_script(serial, version_dump_shell(target), timeout_sec=20.0)
+        if rc != 0:
+            return {"ok": False, "reason": f"read_failed: {(err or out)[:120]}"}
+        info = parse_package_version(out)
+        if not info:
+            return {"ok": False, "reason": "not_found_after_install"}
+        expected = str(package.get("version") or "")
+        found = str(info.get("version_name") or "")
+        return {"ok": True, "package": target, "version": found,
+                "expected_version": expected,
+                "version_matches": (found == expected) if expected and found else None}
 
     def _exec_script(self, event, ctx, serial, started_at, t0):
         """adb 版 EXEC_SCRIPT：委托 adb_script（dsl/shell；js→not_supported）。"""
@@ -1069,8 +1212,15 @@ class AdbExecutor:
         if not H.has_target(params):
             return None, None, {}
         target = dict(params.get("target") or {})
-        match = H.resolve_target(dump.nodes, target)
-        if match is None:
+        raw_index = target.pop("index", params.get("index"))
+        index: Optional[int] = None
+        if raw_index is not None and str(raw_index).strip() != "":
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                index = None
+        match = H.resolve_target(dump.nodes, target, index=index)
+        if match is None and index is None:
             label = str(target.get("text") or target.get("content_desc") or "").strip()
             if label:
                 match = H.resolve_bottom_tab_text(dump.nodes, label)

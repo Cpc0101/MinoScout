@@ -36,7 +36,7 @@
 
 | 工具   | 事件 |
 |------|---|
-| Scout | - `wait`<br>- `sample`<br>- `on_page`<br>- `otp_mail`<br>- `llm`<br>- `vlm`<br>- `vlm_frame` |
+| Scout | - `wait`<br>- `sample`<br>- `on_page`<br>- `otp(account)`<br>- `llm`<br>- `vlm`<br>- `vlm_frame` |
 | Nexus | - `account`<br>- `note`<br>- `prep`<br>- `do`<br>- `check`<br>- `fail` |
 
 Android 的 `install_apk` 进来后改写成 `install`。`wake_screen`、`dismiss_keyguard`、`probe_device_state` 没有单独分支，载荷带了可执行的 `low_level` 才跑。`low_level` 的 shell 只在 Android 生效。iOS 接到 `clear_app_cache` 会拒绝。Mac 的安装包是 `.app`、`.pkg`、`.dmg`。Windows 的安装包是 `.exe`、`.msi`。Scout 和 Nexus 不是设备渠道。验证码和模型在 Scout 本机完成，密钥和视觉判断用的截图不回 Nexus。`prep`、`do`、`check` 把步骤进入和离开直接写入 Nexus 会话，`fail` 把失败原因直接写入，`account` 和 `note` 也直接交给 Nexus。

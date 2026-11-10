@@ -12,7 +12,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from mino_scout.executors.base import DeviceRef, ExecutorContext
 from mino_scout.schemas import PlanEvent
@@ -35,6 +35,32 @@ class ScriptAbort(Exception):
     def __init__(self, message: str, *, reason_code: str):
         self.reason_code = reason_code
         super().__init__(message)
+
+
+def _public_names(obj: Any) -> list[str]:
+    """这个对象上能用的公开方法名，报错时给出来。"""
+    names: list[str] = []
+    for name in dir(type(obj)):
+        if name.startswith("_") or name in {"core", "nexus", "scout"}:
+            continue
+        attr = getattr(obj, name, None)
+        if callable(attr):
+            names.append(name)
+    return sorted(set(names))
+
+
+def _unknown(owner: str, name: str, available: list[str], hint: str = "") -> ScriptAbort:
+    """写错属性名时给出相近的名字和可用列表，而不是干巴巴一句报错。"""
+    close = difflib.get_close_matches(str(name or ""), list(available or []), n=3, cutoff=0.4)
+    bits = [f"{owner} 上没有 {name}"]
+    if close:
+        bits.append("最相近的是 " + "、".join(close))
+    if available:
+        bits.append("可用：" + "、".join(sorted(set(available))))
+    text = "；".join(bits)
+    if hint:
+        text += hint
+    return ScriptAbort(text, reason_code="method_unknown")
 
 
 class ActionResult:
@@ -285,6 +311,12 @@ class _Scout:
 
         return wait(self._case, ms)
 
+    def otp(self, account) -> str:
+        """按这个账号的登录策略取验证码；Gmail 只是其中一条渠道。"""
+        from mino_scout.server_comm.callbacks import otp
+
+        return otp(self._case, account)
+
     def otp_mail(self) -> str:
         from mino_scout.server_comm.callbacks import otp_mail
 
@@ -446,6 +478,11 @@ class App:
         self._shot = None
         self._frames: list[Any] = []
 
+    @property
+    def case(self) -> "Case":
+        """这个 app 所属的运行上下文；app.expect 用它写证据。"""
+        return self._case
+
     # ---- 启停
     def __getattr__(self, name: str):
         if name.startswith("_"):
@@ -477,8 +514,8 @@ class App:
         return self._device("get_foreground_app", {})
 
     # ---- 操作
-    def tap(self, control: str) -> ActionResult:
-        params = self._locate(str(control or ""), "tap")
+    def tap(self, control: str, index: Optional[int] = None) -> ActionResult:
+        params = self._locate(str(control or ""), "tap", index=index)
         if self._platform == "web":
             return self._web("tap", params)
         return self._device("tap_element", params)
@@ -486,13 +523,13 @@ class App:
     def tap_xy(self, x: int, y: int) -> ActionResult:
         return self._device("tap_xy", {"x": int(x), "y": int(y)})
 
-    def long_press(self, control: str, duration_ms: int = 1000) -> ActionResult:
-        params = self._locate(str(control or ""), "long_press")
+    def long_press(self, control: str, duration_ms: int = 1000, index: Optional[int] = None) -> ActionResult:
+        params = self._locate(str(control or ""), "long_press", index=index)
         params["duration_ms"] = int(duration_ms)
         return self._device("long_press_element", params)
 
-    def input(self, control: str, text: str) -> ActionResult:
-        params = self._locate(str(control or ""), "input")
+    def input(self, control: str, text: str, index: Optional[int] = None) -> ActionResult:
+        params = self._locate(str(control or ""), "input", index=index)
         params["text"] = str(text or "")
         if self._platform == "web":
             return self._web("input", params, text=str(text or ""))
@@ -600,6 +637,17 @@ class App:
 
         return on_page(self, page_key)
 
+    def expect(self, page: str = "", prompt: str = "", verdict: str = "pass") -> str:
+        """断言一条预期，按 on_page → llm → vlm 的顺序取。
+
+        - 有 page 且页面锚点对得上，直接算过，不调模型；
+        - 锚点对不上或没给 page 时，先用文本模型读界面文字（省一次看图）；
+        - 文本读不出结论，才让视觉模型看截图。
+        """
+        from mino_scout.platform.scout.run import expect as _expect
+
+        return _expect(self, page=page, prompt=prompt, verdict=verdict)
+
     def vlm(self, prompt: str, verdict: str = "") -> str:
         from mino_scout.server_comm.callbacks import vlm
 
@@ -611,9 +659,9 @@ class App:
         return vlm_frame(self, index, prompt, verdict=verdict)
 
     # ---- 内部
-    def _locate(self, control: str, kind: str) -> dict[str, Any]:
+    def _locate(self, control: str, kind: str, index: Optional[int] = None) -> dict[str, Any]:
         try:
-            return self._locator_params(control)
+            return self._locator_params(control, index=index)
         except ScriptAbort as exc:
             if exc.reason_code in {"locator_missing", "control_unknown"}:
                 self._report(kind, ActionResult(ok=False, summary=exc.reason_code, status="fail"), "script", 0)
@@ -641,7 +689,7 @@ class App:
 
         return act(self, kind, params, text)
 
-    def _locator_params(self, control: str) -> dict[str, Any]:
+    def _locator_params(self, control: str, index: Optional[int] = None) -> dict[str, Any]:
         self._guard()
         page_key, control_id = self._split_control(control)
         page = self._pages.get(page_key)
@@ -658,28 +706,56 @@ class App:
         kind = str(selector.get("kind") or "")
         value = str(selector.get("value") or "")
         name = str(selector.get("name") or "")
+        # 一个控件可以同时带多把选择器：按顺序喂给解析器，命中哪把算哪把。
+        extra = [s for s in (cell.get("selectors") or []) if isinstance(s, dict) and str(s.get("kind") or "")]
         if not kind or not (value or name):
-            raise ScriptAbort("locator_missing", reason_code="locator_missing")
+            if extra:
+                kind = str(extra[0].get("kind") or "")
+                value = str(extra[0].get("value") or "")
+                name = str(extra[0].get("name") or "")
+                extra = extra[1:]
+            else:
+                raise ScriptAbort("locator_missing", reason_code="locator_missing")
         label = name or value
+        params: dict[str, Any] = {}
         try:
             if self._platform == "android":
                 from mino_scout.platform.android.script import locator_params
-                return locator_params(kind, value, name, label)
-            if self._platform == "ios":
+                params = locator_params(kind, value, name, label)
+            elif self._platform == "ios":
                 from mino_scout.platform.ios.script import locator_params
-                return locator_params(kind, value, name, label)
-            if self._platform == "web":
+                params = locator_params(kind, value, name, label)
+            elif self._platform == "web":
                 from mino_scout.platform.web.script import locator_params
-                return locator_params(kind, value, name, label)
-            if self._platform == "mac":
+                params = locator_params(kind, value, name, label)
+            elif self._platform == "mac":
                 from mino_scout.platform.mac.script import locator_params
-                return locator_params(selector)
-            if self._platform == "win":
+                params = locator_params(selector)
+            elif self._platform == "win":
                 from mino_scout.platform.win.script import locator_params
-                return locator_params(selector)
+                params = locator_params(selector)
         except ValueError:
             raise ScriptAbort("locator_missing", reason_code="locator_missing") from None
-        raise ScriptAbort("locator_missing", reason_code="locator_missing")
+        if not params:
+            raise ScriptAbort("locator_missing", reason_code="locator_missing")
+        if extra and isinstance(params.get("target"), dict):
+            # 备用选择器挂在 target 上，解析器按 resource_id → text → content_desc 的顺序试。
+            fallback = dict(params["target"])
+            for row in extra:
+                key = str(row.get("kind") or "")
+                val = str(row.get("value") or row.get("name") or "")
+                if key in ("text", "content_desc", "resource_id", "class") and val:
+                    fallback.setdefault(key, val)
+            params["target"] = fallback
+        if index is not None:
+            if self._platform != "android":
+                # 其他渠道的执行器还不消费 index；静默忽略会让人以为点到了第 N 个。
+                raise ScriptAbort(
+                    f"{self._platform} 渠道暂不支持 index 选择第几个控件",
+                    reason_code="declined",
+                )
+            params["index"] = int(index)
+        return params
 
     def _split_control(self, control: str) -> tuple[str, str]:
         text = str(control or "").strip()
@@ -773,11 +849,48 @@ def _load_pages(root: Path) -> dict[str, dict[str, dict]]:
     return pages
 
 
+def _visible_nodes(page: dict) -> list[dict[str, Any]]:
+    """这一屏的结构化节点；没有时返回空列表，调用方退回文字锚点。"""
+    nodes = page.get("_live_nodes") if isinstance(page.get("_live_nodes"), list) else []
+    return [n for n in nodes if isinstance(n, dict)]
+
+
 def _anchors_match(page: dict, text: str) -> bool:
+    """页面锚点命中判定。
+
+    states[].anchors 里的一组全部出现才算在这一页（老规则，保留）。
+    另外支持两种更具体的形式，缺参数时再用它们：
+      states[].any   —— 任一出现即可
+      states[].nodes —— [{kind, value}]，按界面节点精确比对
+    """
     states = page.get("states") if isinstance(page.get("states"), list) else []
     checked = False
     for state in states:
         if not isinstance(state, dict):
+            continue
+        nodes = state.get("nodes") if isinstance(state.get("nodes"), list) else []
+        if nodes:
+            checked = True
+            visible = _visible_nodes(page)
+            for row in nodes:
+                if not isinstance(row, dict):
+                    continue
+                kind = str(row.get("kind") or "")
+                value = str(row.get("value") or "").strip()
+                if not value:
+                    continue
+                key = {"resource_id": "resource_id", "text": "text", "content_desc": "content_desc", "class": "class"}.get(kind)
+                if not key:
+                    continue
+                if any(value in str(node.get(key) or "") for node in visible):
+                    return True
+            if visible:
+                continue
+        anchors_any = [str(item) for item in (state.get("any") or []) if str(item).strip()]
+        if anchors_any:
+            checked = True
+            if any(anchor in text for anchor in anchors_any):
+                return True
             continue
         anchors = [str(item) for item in (state.get("anchors") or []) if str(item).strip()]
         if not anchors:
@@ -791,7 +904,6 @@ def _anchors_match(page: dict, text: str) -> bool:
 
 
 _LOCATOR_KEYS = ("resource_id", "text", "content_desc", "class", "role", "clickable", "editable")
-
 
 def _locator_nodes(fields: dict) -> list[dict[str, Any]]:
     """界面树里写页面定位要用的字段。沿用本次 hierarchy 已经读到的节点，不另采一份。

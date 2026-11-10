@@ -1,8 +1,8 @@
-# PROTOCOL — MinoNexus ⇄ MinoScout
+# 协议 — MinoNexus ⇄ MinoScout
 
 > **本文在 MinoNexus 与 MinoScout 两个仓库各有一份，必须逐字相同。**
-> 契约真源是两仓同步的本文和协议实现；`tests/fixtures/protocol/*.json` 仅供本地校验，不提交 Git。改协议的流程见各仓开发指引 §5。
-> 协议版本：`2`
+> 契约真源是两仓同步的本文和两仓 `protocol.py` 实现。改动必须在同一个 PR 周期内完成两仓同步：先改本文，再改两边实现。本地 fixture 仅供调试，不提交 Git。
+> 没有版本号字段，也没有 `version` 键。`script.run` 的 `params` 只有明文列出的字段。
 
 用例步骤与框架指令的统一出入口是 `EXECUTE` → `RESULT`。截图、层级、探活、取消 run、节点 stop/restart/update、设备热插拔都是 `capability_id`，走同一套形状。线上只有五种 `type`：`REGISTER` / `REGISTERED` / `HEARTBEAT` / `EXECUTE` / `RESULT`。没有 `OBSERVE` / `PROBE` / `CANCEL_RUN` / `NODE_EVENT` / `NODE_COMMAND`。
 
@@ -17,7 +17,7 @@
 | 传输 | WebSocket，文本帧，UTF-8 JSON，一帧一条消息 |
 | 方向 | **Scout 主动 dial Nexus**。Scout 永不监听对外端口 |
 | 端点 | `ws(s)://<nexus-host>:<port>/node` |
-| 单机默认 | `ws://mino.local:10104/node` |
+| 单机默认 | `ws://mino.local:50104/node`（开发 `:50101`） |
 | 鉴权 | 首帧 `REGISTER` 携带 `token`（配对时由 Nexus 下发）。Nexus 校验失败即关闭连接，close code `1008` |
 | 重连 | Scout 侧指数退避（1s → 2s → 4s → … 上限 30s），无限重试 |
 | 心跳 | Scout 每 15s 发 `HEARTBEAT`；Nexus 45s 未收到视为节点掉线 |
@@ -40,7 +40,7 @@
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `v` | int | 协议版本。收到不认识的版本：Nexus 关连接并在 UI 报错；Scout 关连接并退避重连 |
+| `v` | int | 信封格式编号，收发双方必须一致，不做协商。收到不一致：Nexus 关连接并在 UI 报错；Scout 关连接并退避重连 |
 | `type` | str | 见 §3 |
 | `msg_id` | str | ULID。发送方生成，全局唯一 |
 | `reply_to` | str \| null | 应答类消息填对应请求的 `msg_id` |
@@ -62,7 +62,7 @@
 | 5 | 双向 | `RESULT` | — | `EXECUTE` 的应答，靠 `reply_to` 配对 |
 
 > **协议里没有 `DECIDE` / `STEP_EVENT` / `RUN_FINISH` / `NEED_HUMAN`。**
-> 执行循环在 Nexus（见 [ARCHITECTURE.md](ARCHITECTURE.md)），决策、trace 落库、问人全部在 Nexus 本地完成，不过网。
+> 执行循环在 Nexus（见本仓 `docs/架构/系统架构.md`），决策、trace 落库、问人全部在 Nexus 本地完成，不过网。
 > 用例主通信只剩 `EXECUTE` ↔ `RESULT`。
 
 ---
@@ -108,7 +108,7 @@
 | `node_id` | 节点稳定标识，**不等于任何 `sn`**。取值 `[a-z0-9]{16}`（Scout 持久化的 `scout_id`），重启后不变。Playwright 槽 `sn` 为 `web` + `node_id` |
 | `hostname` | 本机主机名，可空。只作展示 |
 | `studio_id` | 写入本机 Scout 配置的工作台 id（`[a-z0-9]{16}`），可空。Nexus 据此记归属 |
-| `executors[].id` | 必须是 `adb` / `ios_wda` / `playwright` / `mac` / `win` 之一（`host_plugin` 仅用于插件读取面）。原生 executor id 与平台同名；`desktop` 只作为旧版载荷的入站兼容值，新报文不得再发 |
+| `executors[].id` | 必须是 `adb` / `ios_wda` / `playwright` / `mac` / `win` 之一。另有宿主插件面 `host_plugin`，只声明 `plugin.gmail.fetch_otp`，不操作设备（`remote` 已随 ClawNode 删除；`desktop` 仅作旧载荷入站别名） |
 | `executors[].provides` | **具体能力 id 列表**（与 Nexus `catalog_entries` 同一词表，例如 `tap_element`/`clear_app_cache`）。每个渠道用同一套字段声明自己能执行哪些事件，实现可以不同（adb/WDA/playwright/mac/win 各写一份），但字段名与取值域一致，便于跨渠道逐字段对比。旧 Scout 上报的抽象通道名（`ui_native_input`/`system_shell`…）仍按 `requires_caps` 兼容匹配 |
 | `account_isolation_version` | 新版 Scout 固定上报 `1`，表示会在收到已认证 owner 后才恢复本地插件；缺失或不支持时 Nexus 拒绝注册（1008），不会消费安装凭证。旧节点需升级后重新连接 |
 | `executors[].available` | `false` 时 `provides` 必须为空数组，并给 `reason` |
@@ -140,7 +140,7 @@ Nexus 收到后：`provides` ∩ 能力目录 → 该节点可执行的 capabili
 
 安装凭证由登录账号签发，15 分钟有效。首次注册在 SQLite 同一事务内绑定账号和节点、消费凭证并生成独立长期凭证；重复登记仅允许同一节点在有效期内恢复同一长期凭证。不同节点使用已消费凭证、无效/过期/吊销凭证、长期凭证与 node_id 不匹配及跨账号重装必须拒绝。拒绝后关闭连接（1008），不接受任意非空或共享环境 token。`studio_id` 仅兼容，不授予账号权限。
 
-Scout 重装保留 `scout_id` 和已有长期 token，先以 `pending_install_token`、`pending_nexus_url` 尝试本次绑定；成功持久化长期凭证后清理临时字段。明确拒绝时清理临时字段并恢复原账号连接；新机器没有旧凭证则停止等待用户重新生成命令。协议版本仍为 2，REGISTERED 增加可选解码字段 `owner_user_id`；新版在线执行要求该值非空。同步更新 golden fixtures。
+Scout 重装保留 `scout_id` 和已有长期 token，先以 `pending_install_token`、`pending_nexus_url` 尝试本次绑定；成功持久化长期凭证后清理临时字段。明确拒绝时清理临时字段并恢复原账号连接；新机器没有旧凭证则停止等待用户重新生成命令。REGISTERED 增加可选解码字段 `owner_user_id`；新版在线执行要求该值非空。同步更新 golden fixtures。
 
 `accepted: false` 时必须给 `reason`，Scout 记录后按退避重连（不要立刻重试，避免打爆）。
 
@@ -180,7 +180,7 @@ Scout 重装保留 `scout_id` 和已有长期 token，先以 `pending_install_to
 
 `plugins` 可省略。省略表示这台 Scout 还不认识插件状态，网页显示「需更新后才能配置插件」。每项必有 `class` / `id` / `installed` / `configured`。非密钥明文放在 `values`（如 Gmail `inbox_address`），已写入保险库的字段名放在 `saved_secrets`。密钥值不上报。`class` 为 `cli` / `mcp` / `bot` / `mail` / `im`。`REGISTER` 使用同一份列表。
 
-LangBot（`class=im,id=langbot`）的 `status` 描述进程，`platforms[平台]` 描述渠道，各含 `enabled/holding/connected/error/last_message_at`。新增可选的 `connection_verified: bool` 和 `connection_source: recent_message|unconfirmed`：`connected` 保留旧客户端的进程与配置判定，只有 `connection_verified=true` 才能展示真实连接；字段缺失或 false 时显示「待确认」，不能仅凭配置、安装或进程推断在线。当前确认来源为本次进程启动后 120 秒内收到的真实渠道消息，超期重新待确认；不能提供适配器持续连接保证。Nexus 原样保留这些字段，再统一输出规范化 `im_channels`。微信与普通通知机器人不混算。此为可选字段扩展，协议版本保持 2。
+LangBot（`class=im,id=langbot`）的 `status` 描述进程，`platforms[平台]` 描述渠道，各含 `enabled/holding/connected/error/last_message_at`。新增可选的 `connection_verified: bool` 和 `connection_source: recent_message|unconfirmed`：`connected` 保留旧客户端的进程与配置判定，只有 `connection_verified=true` 才能展示真实连接；字段缺失或 false 时显示「待确认」，不能仅凭配置、安装或进程推断在线。当前确认来源为本次进程启动后 120 秒内收到的真实渠道消息，超期重新待确认；不能提供适配器持续连接保证。Nexus 原样保留这些字段，再统一输出规范化 `im_channels`。微信与普通通知机器人不混算。此为可选字段扩展，不新增消息类型。
 
 `runtime_capabilities` 可省略。省略表示这台正在运行的进程没有上报输入契约，Nexus 不凭版本号猜测它是否支持当前焦点输入。列表只含执行器实际实现的组合：`id`、`executor`、`platform`、`contract_version`、`supported_combinations`（`target_mode` + `write_modes`）。`REGISTER` 与 `HEARTBEAT` 使用同一份列表；心跳带上它，重启后的新进程才会被当成支持新契约。
 
@@ -201,7 +201,7 @@ LangBot（`class=im,id=langbot`）的 `status` 描述进程，`platforms[平台]
   "params": {"x": 512, "y": 830},
   "executor_order": ["adb"],
   "low_level": {"command": "TAP", "params": {"x": "{x}", "y": "{y}"}},
-  "selected_impl": {"id": "adb_tap", "executor": "adb", "runs_on": "scout"},
+  "selected_impl": {"id": "tap.adb", "executor": "adb", "runs_on": "scout"},
   "device_hint": {"adb_serial": "R5CT30xxxx", "password": "***", "ttl_sec": 3600},
   "timeout_sec": 30
 }
@@ -214,7 +214,7 @@ LangBot（`class=im,id=langbot`）的 `status` 描述进程，`platforms[平台]
 | `device_id` | 可选。设备唯一 ID；空则回退 `sn` / `device_hint`。**dumps 时空字符串省略** |
 | `platform` | 可选。`android` \| `ios` \| `web` \| `playwright` \| `other`。空则从 `sn` / `device_hint` 猜测。**dumps 时空字符串省略** |
 | `sn` | 设备串号；web/playwright 可为槽位 sn 或字面 `playwright` |
-| `executor_order` | **由 Nexus 按这台 `sn` 算好，且必须恰好一个元素**。该元素必须服务此设备：android→`adb`，ios→`ios_wda`，web→`playwright`，mac→`mac`，win→`win`。`selected_impl.executor` 必须与之一致。旧载荷里的 `desktop` 按宿主平台解析。**Scout 不 fallback、不改序、不追加通道**；长度不为 1 或类型不符时返回 `fail`，不碰设备。空列表视为非法，不再按 platform 自动补 |
+| `executor_order` | **由 Nexus 按这台 `sn` 算好，且必须恰好一个元素。** 该元素必须是服务此设备的通道：android→`adb`，ios→`ios_wda`，web→`playwright`，mac→`mac`，win→`win`；宿主插件操作用 `host_plugin`。`selected_impl.executor` 必须与之一致。`desktop` 只作旧载荷入站别名。**Scout 不 fallback、不改序、不追加通道**；长度不为 1 或类型不符返回 `fail`，不碰设备。空列表视为非法，不按 platform 自动补 |
 | `low_level` | 抄自能力目录 YAML 的 `low_level` 段。`{x}` 这类占位符由 Scout 用 `params` 填充 |
 | `device_hint` | Nexus 注入的设备凭据，避免 Scout 回查。Web 可含 `headless: true`（Chromium 无头）。**含敏感字段，不得写入 Scout 的日志** |
 | `timeout_sec` | 本动作上限。超时回 `fail`，见 §6 |
@@ -229,8 +229,10 @@ LangBot（`class=im,id=langbot`）的 `status` 描述进程，`platforms[平台]
 |---|---|---|
 | `screenshot` | N→S | 截图。`params.compress_ratio` 对 playwright 与 adb 都生效 |
 | `hierarchy` | N→S | UI 层级 dump |
-| `get_app_version`（别名 `app_version`） | N→S | 目标包版本 |
+| `get_app_version`（别名 `app_version`） | N→S | 目标包版本。回执在原有 `package` / `version_name` / `version_code` 上追加同一份 dumpsys 里的 `install_path` 与 `signing`（见 §4.4.3） |
 | `get_foreground_app`（别名 `foreground_app`） | N→S | 前台包名 / bundle id |
+| `self_prove` | N→S | 一次取回当前执行环境自证。形状见 §4.4.3。不新增消息类型 |
+| `read_device_data` | N→S | 既有单键读取。`key=serial` / `serialno` 读 `ro.serialno`，`key=boot_serial` 读 `ro.boot.serialno`。整份环境自证用 `self_prove`，不要把多次 getprop 当成自证 |
 | `probe`（别名 `probe_device`） | N→S | 重探连通性，结果在 `RESULT.data` / `extra.channels` |
 | `cancel_run` | N→S | 不再继续该 run，不回滚已发到设备的动作 |
 | `node.stop`（别名 `stop`） | N→S | 应答 RESULT 后 Scout 退出 |
@@ -321,9 +323,111 @@ S→N 的框架事件可丢（超时未等到 RESULT 时 Scout 只记 warn）；
 `hierarchy` 是观察类能力，每次新观察使用独立 `step_idx< -1`；同请求的重取仍经过完整请求守卫。Scout 侧有 1.5s 的 TTL dump 缓存，
 动作执行后会主动失效；调用方要最新一帧就跟在动作之后取。
 
-Nexus 侧收到 `fail` 时**不得**让本 turn 失败：按 `docs/NAVIGATION_ATLAS.md` §10.0.2 降级
+Nexus 侧收到 `fail` 时**不得**让本次运行失败：按导航图谱（本仓 `docs/专题/导航图谱.md`，Scout 仓对应设计在 `docs/ARCHITECTURE.md`）的层级降级策略处理
 （`hierarchy_text` 置空、localize 退回 session + history、GuardGate 本 turn 不 block）。
 
+#### 4.4.3 `self_prove` 的 RESULT 形状（用例自证，两仓钉死）
+
+用例脚本用这一条能力核对「现在这台手机 / 这台 Mac 上的 Scout，跑的是哪一个包」。它不建立第二套设备清单：Android 复用 `get_app_version` 的 `dumpsys package`、`read_device_data` 的 `getprop`，以及 `pm path` 指向的已安装 APK；iOS 复用同一份字段，证据来自已有的 `ideviceinfo` / `ideviceinstaller`（在 PATH 上时）和 `device_hint` 里已经给出的 WDA 地址。
+
+`RESULT.data` 与 `RESULT.extra` 都带这份文档（与 hierarchy 一样两处镜像）。传输层仍可能往 `extra` 追加 `execution_identity`；脚本读 **`data`**。`data.schema` 必须是 `self_prove.v1`。
+
+调用仍走普通设备动作的选路规则：`executor_order` 只有一个元素，`selected_impl.executor` 与它相同。
+
+| 通道 | `executor_order` | `platform` | 设备地址 |
+|---|---|---|---|
+| adb | `["adb"]` | `android` | `device_hint.adb_serial`（缺省时用 `sn`） |
+| ios_wda | `["ios_wda"]` | `ios` 或省略 | `device_hint.udid`，没有则用 `sn` |
+
+`platform=ios` 只允许出现在这条能力、且执行器为 `ios_wda` 时。它不是目标平台集合的新成员；其它能力仍只接受 `mac` / `win` / `android` / `web`。`ios_wda` 配上 `android` / `mac` / `win` / `web` 拒绝为 `self_prove_platform_conflict`。
+
+`params.package` 可选。Android 是包名，iOS 是 bundle id。给出之后才会去读安装身份；不给出则只证明设备和节点，`missing` 里不出现 `app.*`。
+
+```json
+{
+  "status": "pass",
+  "summary": "self_prove android R5CT30xxxx com.example.app sha256=0123456789ab",
+  "executor_used": "adb",
+  "data": {
+    "schema": "self_prove.v1",
+    "device": {
+      "id": "R5CT30xxxx",
+      "serial": "R5CT30xxxx",
+      "reported_serial": "R5CT30xxxx",
+      "udid": "",
+      "platform": "android",
+      "model": "SM-S9210",
+      "name": "",
+      "os_version": "14",
+      "id_source": "ro.serialno",
+      "ids_agree": true,
+      "hint_id": "R5CT30xxxx",
+      "hint_match": true
+    },
+    "app": {
+      "package_id": "com.example.app",
+      "installed": true,
+      "version_name": "1.2.3",
+      "version_code": 120,
+      "install_path": "/data/app/~~xx==/com.example.app-yy==/base.apk",
+      "digest": {
+        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "md5": "0123456789abcdef0123456789abcdef",
+        "source": "installed_base_apk",
+        "path": "/data/app/~~xx==/com.example.app-yy==/base.apk",
+        "reason": ""
+      },
+      "signing": {
+        "apk_signing_version": 3,
+        "cert_sha256": "",
+        "source": ""
+      },
+      "splits": []
+    },
+    "runtime": {
+      "scout_version": "0.1.29",
+      "node_id": "3f8a1c0e9b2d4f71",
+      "build_id": "dev-0123456789abcdef01234567",
+      "identity_kind": "source",
+      "source_unchanged": true
+    },
+    "drivers": {
+      "adb": {"serial": "R5CT30xxxx", "server_port": null},
+      "wda": {"url": "", "port": null, "reachable": null, "version": "", "udid": "", "error": ""},
+      "appium": {"url": "http://127.0.0.1:4723", "port": 4723}
+    },
+    "missing": ["app.signing.cert_sha256"]
+  }
+}
+```
+
+| 字段 | 规定 |
+|---|---|
+| `device.id` | 设备自己报出来的标识。Android 优先 `ro.serialno`，否则 `ro.boot.serialno`，都没有则用这次实际拨到的 adb serial。iOS 优先 `ideviceinfo -k UniqueDeviceID`，否则用 WDA `/wda/device/info` 的 uuid。没有读到设备应答时为空，此时 `status=fail` |
+| `device.serial` | 这次 adb 拨号用的 serial。iOS 为空串 |
+| `device.reported_serial` | Android `getprop` 读到的 serial。没有第二来源时为空串 |
+| `device.udid` | iOS 读到的 UDID。Android 为空串 |
+| `device.platform` | 证明所属家族：`android` 或 `ios`。不是把 `ios` 写进目标平台枚举 |
+| `device.id_source` | `ro.serialno` / `ro.boot.serialno` / `adb_serial` / `ideviceinfo` / `wda` / 空串 |
+| `device.ids_agree` | 两个及以上设备侧标识都存在时，是否完全相同。只有一个来源时为 `null` |
+| `device.hint_id` | 调用方传入的 serial 或 udid。不是设备应答 |
+| `device.hint_match` | 设备应答与 `hint_id` 是否一致。设备没有报出可比较的标识时为 `null`。换机后这里应为 `false`，或根本 `fail`（旧 serial / udid 已不应答） |
+| `app.installed` | 未请求包时为 `null`。请求了且确认安装为 `true`，确认未安装为 `false` |
+| `app.digest` | Android：已安装 APK 字节的 sha256 与 md5，优先 `base.apk`（`source=installed_base_apk`）。这是手机上的安装路径，不是安装前宿主机 APK 的 `apk_sha256`。读不到文件时 digest 为空，`reason` 说明（常见 `unreadable` / `not_installed` / `pm_path_empty`）。iOS 不宣称安装包字节摘要，`reason=ios_bundle_bytes_not_readable` |
+| `app.signing` | 只解析本次 dumpsys 里已经出现的 `apkSigningVersion`、`certDigest` / `SHA-256 digest`，或 `signatures:[...]` 里完整证书 DER 的 sha256。没有这些文本则 `cert_sha256` 为空，不额外拉取 apksigner |
+| `app.splits` | 除主 APK 外、最多再哈希 7 个 split。主 APK 不重复列入 |
+| `runtime.scout_version` | 本进程已加载的 Scout 版本，与 REGISTER / HEARTBEAT 的 `scout_version` 同一来源 |
+| `runtime.node_id` | 本进程 Scout 节点 id |
+| `runtime.build_id` | 与 `execution_identity.build.build_id` 同一进程身份。源码进程在磁盘已变时 `source_unchanged=false` |
+| `drivers.adb.server_port` | 仅当进程环境变量 `ANDROID_ADB_SERVER_PORT` 有合法端口时填写。未设置则为 `null`，不把默认 5037 写成已观测事实 |
+| `drivers.wda` / `drivers.appium` | 只回显 `device_hint.wda_url` / `wda_port` / `appium_url` / `appium_port`。URL 必须是带显式端口的 `http` 或 `https`，不能带账号、query、fragment。Android 不拨这些地址。iOS 只对通过校验的 WDA URL 请求固定路径 `/wda/device/info` 与 `/status`，不扫端口，不调用 Appium |
+| `missing` | 字典序。设备 id、Scout 版本、节点 id 为空时列入。只有请求了 `params.package` 才列入 `app.package_id`、`app.installed`、`app.digest.sha256`、`app.digest.md5`、`app.signing.cert_sha256` |
+
+`status=pass` 表示设备应答了，标识已写入 `device.id`。包摘要或签名缺失仍是 `pass`，差距在 `missing` 和 `digest.reason`；脚本自己决定这算不算换错了包。`status=fail` 表示 serial / udid / WDA 都没有让设备应答。`executor_used` 为 `adb` 或 `ios_wda`。
+
+`get_app_version` 不改为计算摘要（避免每次查版本都哈希安装包）。它只把同一份 dumpsys 里的 `install_path` 与 `signing` 附加进原回执。包字节摘要只在 `self_prove`。
+
+同一 `(run_id, step_idx)` 的重复请求仍返回缓存，不重新读设备。要换机后再证，使用新的 `step_idx`。
 
 ### 4.5 `RESULT`（双向）
 
@@ -334,7 +438,7 @@ Nexus 侧收到 `fail` 时**不得**让本 turn 失败：按 `docs/NAVIGATION_AT
   "run_id": "run_20260902_153001_R5CT30",
   "step_idx": 7,
   "status": "pass",
-  "summary": "adb TAP (512,830) -> ok",
+  "summary": "TAP (512,830) -> ok",
   "error": "",
   "executor_used": "adb",
   "source": "adb",
@@ -355,7 +459,7 @@ Nexus 侧收到 `fail` 时**不得**让本 turn 失败：按 `docs/NAVIGATION_AT
 |---|---|
 | `status` | **五态之一（小写）**：`pass` / `fail` / `skipped` / `blocked` / `declined`。取值与上游 `EventStatus` 逐字一致。Router 的处置见 §4.5.1。超时用 `fail` |
 | `executor_used` | 实际执行的 executor id。**不可省略**，Nexus 的 trace 与覆盖度依赖它 |
-| `attempts` | 本次唯一尝试的记录，固定一个元素（`executor` / `status` / `elapsed_ms` / `error`） |
+| `attempts` | fallback 链的逐次记录。全部失败时 `status` 取最后一次的结果 |
 | `image_*` / `width` / `height` | 截图时填；也同时放进 `data` |
 | `data` | 任意返回参数（截图、层级 nodes、probe channels、能力原始结果）。**空 dict 时 dumps 省略** |
 | `error` | 失败原因，面向人。**不得包含 `device_hint` 里的凭据** |
@@ -366,7 +470,7 @@ Scout→Nexus 的 `RESULT.extra.execution_identity` 是可选的执行证据 v1�
 `{schema_version:1,node_id,scout_process_generation,node_connection_generation,build:{build_id,source_commit,dirty,identity_kind,source_unchanged,source_digest?}}`。
 代际必须与本次派发所属的已认证连接一致，不从磁盘新版本或当前重连节点补造历史身份。发布包沿用进程启动时的 BUILD.json；源码进程使用启动时包内源码摘要产生 `dev-<摘要前24位>`，并检查源码是否已变化。`source_unchanged=false` 时该回执不能证明所测 build，需要重启并重新执行。该摘要只标识源码快照，不代表发布包的文件摘要。
 
-Nexus 在 `session/provenance` 固化实例/build，并将实际结果中的 `scout.execution_identity`、派发时 `scout.nexus_identity` 写入普通与 V5 会话。旧节点无字段时明确证据不足；REGISTER、版本字符串或准备操作成功不能代替实际执行回执。本扩展只增加既有 extra 字段，不提升 wire 版本，不宣称正式 Web 闭环或 MCP 全工具回归通过。
+Nexus 在 `session/provenance` 固化实例/build，并将实际结果中的 `scout.execution_identity`、派发时 `scout.nexus_identity` 写入普通与严格 Web 会话。旧节点无字段时明确证据不足；REGISTER、版本字符串或准备操作成功不能代替实际执行回执。本扩展只增加既有 extra 字段，不改消息结构，不宣称正式 Web 闭环或 MCP 全工具回归通过。
 
 #### 4.5.1 五态与 Router 处置
 
@@ -374,14 +478,13 @@ Nexus 在 `session/provenance` 固化实例/build，并将实际结果中的 `sc
 
 | status | Router 行为 | 语义 |
 |---|---|---|
-| `pass` | 返回 | 做成了 |
-| `blocked` | 返回 | 需要人介入（结果未核验 / 需隔离） |
-| `declined` | 返回本次结果 | 主动让位，**不算故障**（日志 info，不计失败） |
-| `fail` | 返回本次结果 | 真故障 |
-| `skipped` | 返回本次结果 | 本次未执行（前置不满足等） |
+| `pass` | 立即返回 | 做成了 |
+| `blocked` | **立即返回** | 需要人介入 —— 换 executor 没有意义 |
+| `declined` | 试下一个 executor | 主动让位，**不算故障**（日志 info，不计失败） |
+| `fail` | 试下一个 executor | 真故障，但仍兜底换通道再试一次 |
+| `skipped` | 试下一个 executor | 本次未执行（前置不满足等） |
 
-**V7：任何状态都结束本次尝试。** Scout 不切换 executor、不改序、不追加通道；
-`declined` 与 `fail` 的区别只在**是否算故障**。换路由 Nexus 用新的 `EXECUTE` 决定。
+**只读或有写前 no 回执时，`declined` 与 `fail` 才允许走 fallback**，区别在**是否算故障**，不在"换个 executor 有没有用"。只有 `blocked` 会中断 fallback 链。
 
 `skipped` 是 executor 也会返回的值（上游 executors 里出现 6 次），不是 Nexus 独有的编排态。
 
@@ -429,7 +532,7 @@ sequenceDiagram
 | Nexus 重启 | Scout 的 `REGISTER` 会重建节点登记。在途 run 由 Nexus 侧判为中断，不尝试续跑 |
 | S→N 框架 `EXECUTE` / `HEARTBEAT` 丢失 | 允许。状态最终由下一次 `HEARTBEAT` 收敛 |
 
-**Scout 侧不做业务重试，也不换 executor。** 一次 `EXECUTE` 只执行 `executor_order` 里的唯一通道；失败由 Nexus 重新选路并下发新请求。同一 executor 内的机械重试（如 adb 偶发 `device offline`）不单独记 `attempts` —— `attempts` 只记录这次唯一尝试。
+**Scout 侧不做业务重试。** `executor_order` 必须恰好一个元素；任何状态（`pass` / `fail` / `blocked` / `declined` / `skipped`）都结束本次尝试，由 Nexus 重新决定是否再发。同一 executor 内的机械重试（如 adb 偶发 `device offline`）允许，但必须记进 `attempts`。
 
 ---
 
@@ -442,7 +545,7 @@ sequenceDiagram
 
 ---
 
-## 8. 本地 Fixture 哈希
+## 8. 本地 fixture 校验
 
 本地调试时可用 `tests/fixtures/protocol/` 校验协议实现，两仓若有样例应保持一致；这些文件不纳入 Git。
 
@@ -455,9 +558,9 @@ fixtures_sha256 = 0be21298b045a908bb1a829cdb12413035724416327ff26eea33812a2ffebf
 哈希算法：按 JSON 文件名字典序拼接每份 `文件名 UTF-8 + 换行 + 原始文件字节`，再取 SHA-256。
 
 
-## 9. Desktop additive contract (2026-10-12)
+## 9. 桌面通道补充契约
 
-协议保持 v2；新字段均可缺省，不按 Scout 版本猜桌面能力。旧设备 fixture 不增加空字段。
+新字段均可缺省，不按 Scout 版本猜桌面能力。旧设备 fixture 不增加空字段。
 
 - `REGISTER.host` 与 `HEARTBEAT.host` 由 Scout 上报实际 OS/arch/hostname 与 `desktop` 探测状态。持久化在 SQLite `nodes.extra`。
 - `DeviceManifest` 增加 `os`（macos/windows/linux）、持久逻辑槽 `session_key`、临时 `session_generation`、`desktop_state`、`blocked_reason`、可空 `capabilities` 和 `readiness`。持久化在 SQLite `m_device.extra`，设备平台为 `mac` / `win`。
@@ -471,13 +574,13 @@ fixtures_sha256 = 0be21298b045a908bb1a829cdb12413035724416327ff26eea33812a2ffebf
 - Native macOS/Windows 采用 Cua Driver 0.34.1，按锁定 SDK wheel API 对齐；会话、权限与平台 readiness 消费 Cua health_report，窗口捕获和输入准入由 Cua 校验，Linux 暂不开放执行。Windows fixtures 覆盖就绪、锁屏与 Session 0；真实硬件验收与二进制发布另行记录，不将契约验证当作实机通过。Cua perception 不在此切片。
 - `RESULT.extra` 保留精简动作证据 `cua_action`（effect/route/delivery/error.code/escalation），不保存输入正文或 SDK 原始 JSON。Nexus 在 `tool/result` 追加可信派单元信息 `scout`、`attempts` 和 `desktop`；未涉及任务的进程启动/注册/重连日志仍仅在 Scout 本地日志中。
 
-## Desktop 输入与执行证据补充（0.1.76）
+### 桌面输入与执行证据
 
 不改变消息 envelope 或 fixture 字段。Desktop `input_contract` 按 executor 上报 `current_focus` + `replace` / `append`，Nexus 不复用 Android 的 ADB 输入准入规则。点击使用服务端注入的、绑定 run_id 与事件 seq 的 focus_ref；Scout 保存窗口与字段落点，在新窗口捕获中经 Cua 重新定位字段，再执行窗口输入，引用不能跨代际或任务复用。不再使用项目原生焦点探针。
 
 OBSERVE 的 screenshot 与 RESULT 的执行诊断通过 capture_id、session_generation 对齐。Nexus 的 Session Log 主动作和恢复子动作记录实际 executor、节点、尝试链、桌面 effect/route 与 evidence.kind；不复制原生证据自由文本详情。截图引用来自 Scout，网页所属系统不能替代节点上报的宿主 OS。
 
-## Desktop 窗口托管补充（2026-10-12）
+### 桌面窗口托管
 
 消息 envelope 和 protocol dataclass 不变；以下元数据经既有 screenshot `remote_detail` 与 RESULT `extra` 传输。
 
@@ -489,9 +592,9 @@ OBSERVE 的 screenshot 与 RESULT 的执行诊断通过 capture_id、session_gen
 - 前台状态读取使用 Cua list_apps.active，仅作为真实全局前台诊断；窗口准备只确认进程与窗口绑定，不消费 bring_to_front 的激活回执，不以全局前台归属作为截图准入条件。Nexus 的全局前台自动恢复不用于 Desktop。launch 成功元数据为 stage=window_ready、window_verified=true、foreground_source=not_required、activated=false、foreground_verified=false；这些前台字段表示未请求或验证持续激活。截图必须取得 SDK 的有效窗口捕获；点击与输入仍由 Cua foreground 模式在动作时处理投递准入，不能由 launch 成功推定动作成功。健康、权限和会话诊断使用 health_report，不读取项目自研平台探针。generation 跟随 Scout 生命周期及 Cua readiness 状态变化；窗口与捕获是否仍可动作由 SDK 最终校验。
 - tool/call 在窗口准备派发前写入；tool/result.desktop 保留窗口 target/capture_scope、捕获身份和安全动作证据，observe/screen 保留 pid/window_id、图像尺寸及缩放信息，便于核对是否确实为指定窗口。
 
-### IM Envelope 与投递增量契约（2026-10-13）
+### IM 消息信封与投递增量
 
-协议保持 v2；`EXECUTE.params` 保持可扩展对象。`node.plugin_im_message` 的 `params.im` 采用两仓相同的 `ImEnvelope`：channel、instance_id、tenant、chat_id、chat_type、sender_id、msg_id，加上可选 text、mentioned、event_type、reply_to、thread_id、target_message_id、revision、delivery_key、received_at、reply_ctx、recent_turns、capabilities、attachments、callback。未上报能力的旧发送端按纯文本处理。
+`EXECUTE.params` 保持可扩展对象。`node.plugin_im_message` 的 `params.im` 采用两仓相同的 `ImEnvelope`：channel、instance_id、tenant、chat_id、chat_type、sender_id、msg_id，加上可选 text、mentioned、event_type、reply_to、thread_id、target_message_id、revision、delivery_key、received_at、reply_ctx、recent_turns、capabilities、attachments、callback。未上报能力的旧发送端按纯文本处理。
 
 - `reply_to` 是平台实际引用的消息标识，需经本地映射定位业务对象；`target_message_id` 明确编辑/撤回的来源。不可取消另一个最新请求，也不能从引用文本猜 request_id。
 - `reply_ctx.source_message_id` 保存已验证原消息。飞书线程回复接口使用 `om_` 消息编号，不把 `omt_` 线程号当消息编号。历史正文还需匹配 instance/tenant/sender/thread 和本次绑定起点。
@@ -510,9 +613,9 @@ OBSERVE 的 screenshot 与 RESULT 的执行诊断通过 capture_id、session_gen
 | `execute_node_plugin_im_stream.json` | `cd7494afcd545220478c2d1a667fe09cd9e325a460d99f254af5d1f59beea131` |
 
 
-## 10. V5 Web 写安全与证据补充契约（2026-10-14）
+## 10. Web 写安全与证据
 
-协议信封仍为 v2；新增容量字段可缺省。V5 是显式选择的执行模式，不能根据版本号、旧 agent 字段或连接形态猜测支持。未报契约、未发布配置或模式不符时拒绝 V5；legacy 路径保持独立。
+新增容量字段可缺省。严格 Web 写安全是显式选择的执行模式，不能根据 Scout 版本号、旧 agent 字段或连接形态猜测支持。未报契约、未发布配置或模式不符时拒绝；legacy 路径保持独立。
 
 ### 10.1 准入、定位与写动作
 
@@ -526,10 +629,10 @@ OBSERVE 的 screenshot 与 RESULT 的执行诊断通过 capture_id、session_gen
 - `(run_id,step_idx)` 是 wire 身份，logical seq 只是显示关联。正编号由 Nexus 按 run 加锁、单调分配；辅助负编号由 Nexus 全进程原子递减分配并以启动微秒分代，不消耗任何 run 的正写编号。`-1` 为待分配哨兵。现有任务 run_id 保持原值；无任务 RPC 的 run_id 仍为空，不伪造活动任务。插件/主机命令也可使用辅助编号，负编号本身不代表只读。不同意图绝不复用键；同请求重取必须保持整个 Execute 内容一致。
 - Scout 原子登记完整请求。相同键但内容不同返回 `request_key_conflict`，相同键正在执行返回 `request_inflight`；完成重复请求只返回已有结果。完整内容只在内存比较，不能为了幂等将密码等秘密做 hash 后输出。
 - 负编号只读请求可以刷新事实；正请求缓存不能以等待超时冒充真实完成。legacy Future 超时冻结并缓存已返回的未知结论，worker 仍活动的事实单独保留，迟到结果不能覆盖。
-- V5 正编号 EXECUTE 不做网络重发。丢 RESULT、超时或写后异常归为 effect_unknown，不能再点击同一动作补绿。允许的恢复是：用例已声明可复位且发布重试策略，开全新 run 整案重跑最多一次，后通过标 flaky，原尝试保留 unverified。
+- 正编号 EXECUTE 不做网络重发。丢 RESULT、超时或写后异常归为 effect_unknown，不能再点击同一动作补绿。允许的恢复是：用例已声明可复位且发布重试策略，开全新 run 整案重跑最多一次，后通过标 flaky，原尝试保留 unverified。
 - `data.execution={execution_started:no|yes|unknown,phase,reason_code}` 表示写 API 的实际进入边界，不由错误字符串反推。写前拒绝为 no；已进入写 API 后异常为 yes/effect_unknown；无法确定为 unknown。
 - 写故障锁住 run 的第一个停止原因。`data.execution_control` 带 `stop_run/state/reason_code/action_ref`；后续写返回 `run_write_stopped`，只读和清理可继续。close/cancel 置 terminal，迟到成功不能解除停止或翻绿。
-- V5 设备故障返回 fail 及上述领域原因；不将所有驱动异常标成需要人介入的 blocked，也不进入 legacy executor fallback。
+- 设备故障返回 fail 及上述领域原因；不将所有驱动异常标成需要人介入的 blocked，也不进入 legacy executor fallback。
 
 ### 10.3 原始事实与秘密
 
@@ -539,7 +642,7 @@ OBSERVE 的 screenshot 与 RESULT 的执行诊断通过 capture_id、session_gen
 
 ### 10.4 容量与回收
 
-`HEARTBEAT.device_workload[]` 在 Web 设备行可带 `lanes_total/lanes_free/lanes_quarantined`，Nexus 以实际报告为准。V5 默认 4 个独立进程 lane，每个 run 独占一 lane 与 Playwright 线程；第 5 个排队。legacy/headed 不与 V5 lane 混用。超时终止 worker 和浏览器后代，未确认全部停止的 lane 隔离；close 与 dispatch 竞争时，不能在请求锁释放前宣称 lane 空闲。`close_web_v5/cancel_run` 返回 executor_stopped，未回收成功不能宣称干净结束。
+`HEARTBEAT.device_workload[]` 在 Web 设备行可带 `lanes_total/lanes_free/lanes_quarantined`，Nexus 以实际报告为准。严格 Web 默认 4 个独立进程 lane，每个 run 独占一 lane 与 Playwright 线程；第 5 个排队。legacy/headed 不与严格 Web lane 混用。超时终止 worker 和浏览器后代，未确认全部停止的 lane 隔离；close 与 dispatch 竞争时，不能在请求锁释放前宣称 lane 空闲。`close_web_strict/cancel_run` 返回 executor_stopped，未回收成功不能宣称干净结束。
 
 ### 10.5 终结
 
@@ -547,12 +650,12 @@ Nexus 将 Evidence、verification/verdict、session_meta、计数在一个 SQLit
 
 ### 辅助请求发送闸门（2026-10-14，cr-72f483f92cdf）
 
-Nexus 的 `NodeConnection.request` 在序列化 EXECUTE 前统一补齐未编号辅助请求；插件调用在建立载荷时使用同一 helper，RouterProxy 取证、插件和结束通知使用同一负编号分配器。重复发送同一载荷不重新编号；传入的正编号、任务归属、focus_ref 与动作证据引用不变。V5 缺 run_id 必须拒绝，不能补伪造任务。
+Nexus 的 `NodeConnection.request` 在序列化 EXECUTE 前统一补齐未编号辅助请求；插件调用在建立载荷时使用同一 helper，RouterProxy 取证、插件和结束通知使用同一负编号分配器。重复发送同一载荷不重新编号；传入的正编号、任务归属、focus_ref 与动作证据引用不变。严格 Web 缺 run_id 必须拒绝，不能补伪造任务。
 
 辅助取证的新请求使用独立编号，不靠复用 `-1` 绕过完整内容比对。Scout 现有 `read_web_target_facts/screenshot/probe` 在同内容完成后的只读刷新规则不变；新增观察的身份与重取的身份必须分清。微信/其他 IM 的发送、确认、流更新、历史查询和持有权配置也经过相同发送闸门；保留业务 delivery_id 和入站 receipt 去重，不能为消除冲突关闭 Scout RequestGuard。
 
 
-## DOM 优先观察合同（2026-10-14）
+## DOM 优先观察
 
 任务策略 `action_scheme` 接受 `dom_preferred` / `visual`；旧任务的 `dom` 归一为 `dom_preferred`。策略不等于能力目录实现类别；目录 `schemes` 继续是 `dom` / `visual`。每个 EXECUTE 的实际定位方式由 `params.point_policy=node|coordinate` 声明，一条写请求只能选一种方式。
 
@@ -565,16 +668,16 @@ DOM 点击可携带 `params.node_ref` 与 `params.snapshot_id`，Nexus 绑定本
 Android 的层级请求在 Scout 强制重新采集，先筛选可见且有语义的节点再限制到 320 个；enabled/focused/checkable/checked/editable 与 password 标记从真实 XML 属性解析。密码字段文本不回传。原生树暂不发行 Web DOM handle 引用，继续使用既有节点锚点，不伪造 ref。
 
 
-## 2026-10-15 R5 / N0：普通执行写边界与停止语义
+## 普通执行写边界与停止语义
 
-普通 UI 写结果复用 `data.execution={execution_started:no|yes|unknown,phase,reason_code}`。旧执行器的显式布尔回执由接收入口适配；缺失/异常为 unknown，不能由 fail/declined/skipped 推定为 no。只有能证明未进入写 API 的 no 允许 Nexus 重新选路；yes/unknown 失败返回 blocked 表示结果未核验，不等于需要人工输入。pass 只表示执行器已返回，不替代业务断言。
+普通 UI 写结果复用 `data.execution={execution_started:no|yes|unknown,phase,reason_code}`。旧执行器的显式布尔回执由接收入口适配；缺失/异常为 unknown，不能由 fail/declined/skipped 推定为 no。只有能证明未进入写 API 的 no 允许后备实现；yes/unknown 失败立即停止 fallback，返回 blocked 表示结果未核验，不等于需要人工输入。pass 只表示执行器已返回，不替代业务断言。
 
 普通 Future 超时只停止等待，不能宣称线程或设备动作已终止。缓存首个超时结论，同键重发不重做，迟到结果不得翻成 pass；相同 run 的后续写被锁住。cancel 仅请求不再继续；worker 仍活动时不能回收页面/桌面资源。`stop_confirmed=false` 与 `resource_isolated=true` 分别表示停止尚未确认和需保留隔离，不用任务终态推导两者。
 
 Nexus 普通任务在已有 run payload 记录不含动态输入/秘密的写意图，派发前持久化；回执缺失、写后异常或回执无法落库时保留 pending/isolated。设备预约、设备×包租约和账号租约不得因任务终态、TTL、重启清扫或旧投影覆盖而释放；隔离记录不参与常规历史裁剪。本阶段不提供自动解除隔离，需 N2 后续的受控停止证据合同；不冒称已经获得严格绑定、原子终结或底层强杀能力。
 
 
-### V5 R5：HEARTBEAT executor 快照 v1（2026-10-15）
+### 心跳 executor 快照
 
 两端 HEARTBEAT 的 `executor_snapshot_version` 必须显式为整数 `1`，`executors` 必须提供完整数组：`[]` 撤销全部；非空数组完整替换当前连接清单，不能按 id 合入。dataclass 缺省 `0` 仅用于识别缺字段并拒绝，不是有效协议值。缺失/null、bool 或未知版本拒绝心跳。`available=false` 不参与准入。
 
@@ -583,12 +686,12 @@ Nexus 普通任务在已有 run payload 记录不含动态输入/秘密的写意
 协议包版本沿用现有版本，以这个可选字段显式区分更新语义；旧载荷解码为 0。新增字段两仓同步，合法/缺省/空数组载荷须各自 round-trip。本切片没有新增 binding_id/进程代际的 Execute 校验，不能据此声称完整 ExecutionBinding wire 合同已完成。
 
 
-### V5 R5：普通原生动作的显式完成回执（2026-10-15）
+### 原生动作的显式完成回执
 
 `execution.execution_started` 仍为 yes/no/unknown。Router 不得从任意 executor 的 status=pass 推断 yes；缺失即 unknown，即使 pass 也必须停止后备、保留资源隔离，不能让消费端收到合成的安全回执。已核实的原生动作在实际设备调用成功的完成出口写显式 yes 和 source（adb.native.v1 / playwright.native.v1）；本地等待/纯取证写 no。yes 是设备执行边界事实，不证明业务预期已满足。失败或未适配实现没有边界事实时仍 unknown，不为了维持成功率默认为 no 或 yes。普通/严格原有更强检查保留；迟到结果不覆盖已冻结未知结论。
 
 
-### V5 R5：执行绑定代际载荷与旧节点兼容（2026-10-15）
+### 执行绑定代际载荷
 
 以下字段均可缺省；缺省仍为旧执行合同，不能凭 Scout 包版本推断支持。
 
@@ -606,27 +709,27 @@ capability_revision 是完整 executor 声明（id/available/provides）与 runt
 Scout 在请求准入、队列后的执行入口，以及严格 Web 取得 lane 和发送 worker IPC 前分别复核代际。校验拒绝返回 blocked、execution_started=no；不得因拒绝释放既有未知写隔离。尚未使用的新 lane 可回收，已启动或隔离的 worker 仍走原停止/回收合同。本切片仅实现 wire 和副作用前复核，不会自动把所有现合同任务切到新绑定合同；旧安装 Scout 继续报告绑定版本 0。
 
 
-### V5 R5：low_level 实际调用回执与恢复停止（2026-10-15）
+### low_level 实际调用回执与恢复停止
 
 原生分支以外的声明式 shell/shell_seq/shell_batch 同样必须提供 execution 回执。执行前模板/白名单拒绝以及本地明确找不到 adb 二进制为 no；实际 shell 完成提供 yes（来源 adb.low_level.v1）；超时、远端非零、调用异常无法证明没有副作用，保持 unknown。先前已执行后发生声明/解析失败不能回退成 no。known read 的最佳努力部分取证仍允许，write 的 shell_batch 只有所有项成功才算完成。聚合 pass 不生成调用边界；回执来自实际 shell 调用出口。
 
 恢复规则收到 resource_isolated 或 execution_control.stop_run 时必须立即结束本规则，不再执行解锁、后续恢复动作或下一轮 verify。停止信息贯通 RecoveryOutcome、屏幕守护、本地屏幕就绪工具及 agent 的 blocked 终结；新截图可读不能冲掉未结算写动作。内存停止信号仅用于停止循环，不能释放任何持久未知写隔离；任务终态、版本升级、重启均不是解除依据。
 
 
-### I02/I03 接续合同（2026-10-15）
+### 接续合同
 
 write_stop_status 是仅在任务结束后由 Nexus 显式复核的管理请求，参数 action_ref 与 scout_process_generation 必须来自原写意图。Scout 返回 stop_evidence(contract=write_stop.v1、action_ref、sn、进程代际、stop_confirmed)。同代际、同设备、同动作的实际 worker 已返回且有明确 no 或成功 yes 回执、该旧 run 无活动请求才确认；封存旧 run 禁止后续业务写。未知回执、缺历史身份或进程更换继续隔离。确认只表示执行结束，不证明业务成功或账号状态干净；原 verdict 不改，后续任务仍须做账号/页面基线检查。
 
-Nexus POST /case-runner/tasks/{task_id}/write-safety/recheck 校验任务所有者、任务已结束、在线节点所有者与代际，重新读取持久动作后保存复核证据，全部未结算动作收口才释放相应租约。终态、升级、TTL、重启不能代替证据。无证据的旧隔离不提供强制清除入口。
+Nexus POST /case-runner/tasks/{task_id}/write-safety/recheck 校验任务所有者、任务已结束、在线节点所有者与代际，重新读取持久动作后保存复核证据。终态、升级、TTL、重启不能代替证据。无证据的旧隔离不提供强制清除入口。停止证明只写入账本，不提前清空 `device_app_sessions.lease_run_id`，也不释放号池。解除隔离走 POST /case-runner/tasks/{task_id}/write-safety/baseline：当前画面截到之后，同一次提交放开这些设备的写隔离、设备会话、执行资源、设备租约、预约，以及任务 / 动作 / 用例会话 id 上的号池租约。不能先放设备再单独放号。非 Web 执行资源键仍是 `device:<sn>`，Web 槽位仍是 `device:<sn>:<run_id>`。
 
 **旧进程退役证据（2026-10-15 补充）**：原写意图的进程代际与当前不同或缺失时，Nexus 发送 write_stop_status 并带 params.mode=retired_generation、scout_process_generation=原值（缺失为空串）。Scout 若在本进程仍持有该 action_ref 的请求记录，按同进程规则返回 mode=same_process、action_present=true；否则封存该 run 并返回 mode=retired_generation、action_present=false、single_instance_lock（本进程持有 scout.lock）、process_started_at（本进程启动 epoch 秒）、foreign_processes（安装目录下非本进程树的运行时进程，以及指定 sn 的 adb 客户端进程数；无法判定为 -1）。仅 single_instance_lock=true、foreign_processes=0 时 stop_confirmed=true，reason_code=predecessor_retired。Nexus 接受条件：证据为当前在线代际；原代际存在且不同，或原代际缺失且 process_started_at 晚于任务 finished_at 至少 120 秒；缺代际的同进程证据仅在 action_present=true 时接受。复核记录 recovery.mode。该证据只证明执行进程及其运行时子进程已不在，写入结果仍为 unknown，原 verdict 不改。源码运行（非安装包）无法判定运行时目录，保持隔离。
 
-**严格 v5 与解除后基线（2026-10-15 补充）**：execution_mode=v5 的任务可复核。Nexus 在 write_stop_status 参数带 execution_mode；Scout 同进程证据在 action_present 且 worker_active=false 时关闭该 attempt 的 lane，并在 lane 进程树确认终止后返回 lane_terminated=true、reason_code=lane_process_terminated，否则为 lane_quarantined。Nexus 对 v5 同进程证据要求 lane_terminated=true；旧进程退役证据规则不变。每条动作记为 recovered 之前，Nexus 先把该 sn × 被测包的 device_app_sessions 置为 session=unknown、stale=1、stale_reason=write_recovered_unknown 并清除绑定账号，再写持久证据，避免预约释放后下一个任务沿用旧登录态或身份。全部收口后释放任务资源；v5 另按各 attempt run_id 释放账号租约。响应 baseline_required 列出被标记的设备。写入结果仍为 unknown，原 verdict 不改。
+**严格 v5 与解除后基线（2026-10-15 补充，2026-10-29 收口）**：execution_mode=v5 的任务可复核。Nexus 在 write_stop_status 参数带 execution_mode；Scout 同进程证据在 action_present 且 worker_active=false 时关闭该 attempt 的 lane，并在 lane 进程树确认终止后返回 lane_terminated=true、reason_code=lane_process_terminated，否则为 lane_quarantined。Nexus 对 v5 同进程证据要求 lane_terminated=true；旧进程退役证据规则不变。停止复核只登记停止，不把动作标成 recovered，也不清设备会话。`write-safety/baseline` 在当前画面可用之后，同一次提交把对应设备上的动作记为 recovered，并把 sn × 被测包的 device_app_sessions 置为 session=unknown、stale=1、stale_reason=write_recovered_unknown、lease_run_id 为空，同时释放这些设备的执行资源、设备租约、预约，以及任务 / 动作 / 用例会话 id 上的号池租约。截图失败则一段都不放。原 verdict 不改。人工观察恢复仍可用，并释放同一别名集合上的号池租约，不要求执行资源 detail 里已经写了 account_id。
 
 含 not_visible 的检查在新发布计划固化 single_observation.v1/max_reads=1；复合谓词同一次取证，其他谓词默认等待不变。旧冻结否定计划拒绝并要求重新发布，不静默更改历史。Scout 在读取事实前确认 document.readyState=complete，回传 page_ready 和 observation_contract；Nexus 缺此证据不可判不存在。这只证明页面文档就绪，业务异步加载是否结束仍须由用例已有前置/检查点保证，不声称检测了持续不出现。
 
 
-## I04 平台合同影子阶段（2026-10-15）
+## 平台合同
 
 新增纯校验模块 `platform_contract.py`（Nexus/Scout 同步副本，Workbench 为同语义 TypeScript）：被测平台严格四值 mac/win/android/web；集合显式 all/explicit，未填写与空集合不同；宿主单独 host.os；server 是渠道 kind，不携带 platform；顶层与 device_hint 冲突拒绝；不从 SN 猜 Android、不接收运行别名。常量 version=1 是目标合同版本，不是已协商/已启用声明。本切片未改变 REGISTER/HEARTBEAT/EXECUTE wire 字段或默认运行行为，旧协议仍在使用。
 
@@ -636,7 +739,7 @@ Nexus 节点列表新增只读 `platform_contract_audit`：mode=shadow、activat
 
 原子切换仍依赖 N1/N2 与受控数据迁移。不能提前宣称新词表已全局生效；Scout 注册与输入能力、Nexus 运行消费者及 Workbench 写入口将在整体切换切片同步调整。
 
-## N1/N2 固定装配与绑定关联补充（2026-10-15）
+## 固定装配与绑定关联
 
 ExecutionBinding v1 的 Scout 候选须按当前 manifest 逐个验证：事件本身出现在 provides，或 selected_impl.requires_caps 中全部抽象能力均已提供。Nexus 与 Scout 使用同一规则；available=false、撤销、连接/进程/能力代际变化均使旧绑定不能继续派发。不新增协议 dataclass 字段，不放宽缺装配写前拒绝。
 
@@ -645,7 +748,7 @@ runs_on=nexus 只由 Nexus 已知本地适配器产生，不发送给 Scout；�
 普通 attempt 在业务 UI 操作前提交绑定事务；失败不进入循环，也不通过外层清理新建无绑定 close_app。完成时在绑定内清理，再原子写会话终结；外层仅发送管理性取消通知。未知写的隔离与停止确认仍遵循既有 I02 合同。动态插件执行没有 v1 装配时拒绝，不复用普通设备绑定越权派发。
 
 
-## I04 原生平台消费路径准备（2026-10-16）
+### 原生平台消费路径
 
 新增 mac/win 原生身份的消费支持，不切换默认 Scout manifest，不宣称平台合同已协商或启用。目标平台 mac/win 与历史 executor/channel=desktop 是不同字段；共享资源键仍为 desktop:<node_id>:console。旧 desktop 接收路径作为切换期兼容保留，不能用兼容路径证明全量迁移完成。
 
@@ -656,7 +759,7 @@ Nexus 的路由家族、动态能力目录、观察/恢复分支、输入合同�
 下一步仍需同步切换 Scout host/device/runtime_capabilities 上报、协议激活/旧节点拒绝边界和历史引用迁移。当前通过的是隔离消费路径检查，未执行真实原生操作、未迁移业务数据。
 
 
-## I04 平台合同 v1 默认启用（2026-10-16）
+### 平台合同默认启用
 
 本节取代影子阶段的默认上报约定。REGISTER/REGISTERED/HEARTBEAT 新增 platform_contract_version（缺省 0）；Scout 发 1，Nexus 接受后明确回 1。缺失、bool 或其他版本拒绝，不凭包版本推断。REGISTER.platform 保留空串以兼容 dataclass 构造；宿主只由 host.os=mac/win/linux 声明。设备只允许 mac/win/android/web，原生 SN 为 <platform>:<node_id>:console，不带 os；Linux 不注册原生桌面槽。executor/channel 使用 `mac` / `win`；资源锁键仍沿用历史 `desktop:<node_id>:console`。
 
@@ -665,26 +768,26 @@ Nexus 的路由家族、动态能力目录、观察/恢复分支、输入合同�
 用户已取消历史 SN 迁移，选择清空后重新导入；清空范围尚待明确，因此本切换不删除业务配置或历史数据。新合同只接受规范输入，旧配置须重新导入或在正式入口修正。源码启用不等于真机/业务验收通过，运行版本和 session 证据另记统一开发记录。
 
 
-### 平台实机联调回执与探索合同补充（2026-10-16）
+### 平台实机回执
 
 REGISTER 的空 platform 必须保留在编码中，保证旧必需 dataclass 字段可回读；系统身份仍仅使用 host.os。DesktopRuntime 在实际 SDK 调用成功返回后给出 execution={execution_started:yes,phase:completed,source:desktop.cua.v1}；复用已确认运行窗口而没有再次启动为 no，异常/超时不补造 yes/no。hierarchy 属于只读取证，原生不支持时的拒绝不触发写停止或资源隔离。取消内部请求带明确空 sn；取消不等于回滚。
 
 探索限制和 case_scene 必须随任务快照保留，支持 max_steps=1 的单次观察；这是观察路由验收，不提供普通/严格业务绑定保证，也不改变业务单次弹窗断言语义。实际业务验收仍需对应编译/发布与 session 证据。
 
 
-### N5 严格 Web 取消与超时补充（2026-10-16）
+### Web 取消与超时
 
 取消尚未租到 lane 的 run 也必须唤醒排队等待者。租到 lane 后及发送 worker IPC 前重新核对取消状态；取消与 IPC 发送按同一条件锁排序，明确写前拒绝为 no。发送开始后发生异常不能声称未执行，保留 unknown 并清理所属 worker；外层超时同样封闭本 attempt。清理释放 lane 不等于允许相同 run_id 重新执行，超时/取消的 run 继续拒绝后续请求。取消后迟到响应不作为 pass 返回。请求锁或进程树未释放时，不宣布 lane 空闲。未变更 wire 字段或放宽旧绑定准入。
 
 
-### 2026-10-16 同节点 Gmail 取码绑定
+### 同节点 Gmail 取码绑定
 
 `plugin.gmail.fetch_otp` 是具名只读宿主插件操作；绑定运行使用 executor `host_plugin`，不得借用设备 executor 或空 executor_order 降级。Scout 在插件账号归属核验后才声明 `host_plugin` 可用，provides 精确为该能力；插件 configured 状态单独上报并由 Nexus 按同一 owner、node_id 和连接/进程代际检查。其他 plugin 能力不因此取得绑定执行资格。
 
 Nexus 在编译需求中有界展开 get_otp 的 Gmail 子事件，固定码分支无需该子事件。动态 Gmail 来源需同时满足目录 active、版本 1 参数/结果合同、同节点 manifest 和插件 configured，才能计为 ready。实际取码前从已持久化 binding 重新核对 phase、operation_ref、binding_id 及三个 epoch；EXECUTE 携带已有 execution_binding.v1 的全部字段，executor_order=["host_plugin"]、selected_impl.runs_on="scout"、low_level={}。Scout 校验后才交给现有 Gmail 处理器，回执 executor_used="host_plugin"。参数不携带密码；未配置、合同不支持、节点或代际变化均保持阻断。ready 仅代表可发起取码，不代表已取到验证码或登录成功。
 
 
-## V5 Gmail 动态取码固定子合同（2026-10-16）
+## Gmail 动态取码
 
 - 不新增 wire 字段。`get_otp` 仅可展开固定程序子事件 `plugin.gmail.fetch_otp`，阶段 prep/do，caller=program；两者独立进入持久绑定，子操作不进模型菜单。不开放通用插件动态递归。固定验证码路径不要求邮箱插件。
 - Scout 注册执行器 `host_plugin`，提供 `plugin.gmail.fetch_otp`；绑定实现为 `program.v1:plugin.gmail.fetch_otp`，参数与结果合同版本均为 1。仅已上报该实现的节点可接受绑定取码，旧包明确需要升级。继续校验连接代际、进程代际、能力版本、运行及阶段。
@@ -693,14 +796,14 @@ Nexus 在编译需求中有界展开 get_otp 的 Gmail 子事件，固定码分�
 - 返回验证码仅供既有凭据消费和脱敏管线，摘要不含验证码、邮箱密码、邮件正文或服务端原始异常。超时区分未收到邮件、过滤不匹配、正文未匹配验证码；失败不转为成功。
 
 
-### R03 条件必需观察扩展（2026-10-16）
+### 条件必需观察扩展
 
 沿用 hierarchy observation v1，可选新增 form_controls：version=1、snapshot_id、credential_forms、checkable_count、complete。仅当前结构事实，不含凭据或业务结论。complete 要求唯一包含凭据字段和提交控件的原生 HTML form 完整位于视口、文档就绪且没有截断、观察缺口或不透明自定义渲染；checkable_count 覆盖文档中的 checkbox/radio/switch。缺字段、原生树或不完整范围不能据此证明不存在。
 
 Nexus 在当前新鲜快照的完整范围内 count=0 时记录条件 not_applicable，不计通过证据。已勾/未勾需明确 checked_known；未知最多三次观察后阻断。条件适用且缺实现不得跳过。该扩展不改变 OBSERVE/wire 结构，不授予调用权限。
 
 
-### V5 协议范围视觉复核与邮箱连接恢复（2026-10-16）
+### 视觉复核与邮箱连接恢复
 
 hierarchy observation v1 可选增加 viewport_wh（CSS 像素）及 login_scope v1（snapshot_id、candidate_count、bounds、complete、checkable_count）。唯一可见 form/dialog 必须包含输入及按钮、范围及其可见内容完整位于视口、无滚动裁切/遮挡/不透明子树，才可 complete。此事实仅为候选范围，不等同登录或无协议。Nexus 另以当前截图确认登录目的、完整可见范围及没有交互协议控件；只有结构 count=0 与视觉证据同时成立才可 not_applicable。未知仍最多三次观察后阻断。Web 显式自绘勾选目标使用视觉状态复核，动作仍按原绑定、当前 node_ref 仅执行一次并核验新状态。ARIA 缺 checked 不再默认为 false。
 
@@ -709,7 +812,7 @@ Gmail 在原请求/收件地址/发码窗口/截止时间内允许最多两次�
 补充：login_scope 支持含凭据输入的最外层有界自定义容器（不依赖 form/ARIA）；scope_kind、incomplete_reasons 仅为结构诊断。多个范围、滚动/越界/遮挡/不透明内容仍拒绝。SVG defs/clipPath/mask/pattern/symbol 非绘制定义不计可见范围；非滚动装饰的内在溢出不等于表单裁切，实际绘制边界及可滚动内容仍核对。自定义范围必须经截图独立确认完整登录界面及无协议控件，不能只按 DOM 零计数跳过。
 
 
-## V6 B：开发准备 v1
+## 开发准备
 
 保持现有 wire 版本与 EXECUTE/RESULT 结构。新增程序系统能力 `node.ide_prepare`，
 REGISTER/HEARTBEAT runtime_capabilities 声明 id、executor=ide、contract_version=1。
@@ -735,18 +838,18 @@ check 返回真实 support.stop/restart 和 restart_mode=run_control_mcp/debugge
 配置级 runtime.scope=configuration，instances 可携带 session_id、debug_state、execution_mode、pid。普通 Run 以 IDE 返回的配置会话识别，调试模式匹配 runConfigurationName。停止后不将列表中隐藏 terminating 会话视为进程已退出；核对旧进程身份或完整项目会话/进程快照实际减少，再启动同一配置并确认新 session_id。普通 Run 无需先手工停止或改为 Debug；已运行时 execute 只复用，不重复启动。
 副作用调用只发一次；超时或丢回执记 unknown，Scout 持久原操作阶段、旧会话及进程标识。读取原回执仅做会话状态查询，不重新停止或启动。Nexus 中断恢复后自动读取原停止/重启回执，核对 owner 与 digest，不清空不确定结果。未配置 HTTP 地址只证明进程/会话存在，不宣称服务或业务验证通过。不得通过终端 kill/SIGTERM 冒充 IDE 重启。HTTP/SSE 复用现有 httpx，无新增运行依赖。
 
-V6 B APK 增补：action=install 只接受绑定中的 apk_path/android_serial/apk_package/apk_version_code。
+APK 增补：action=install 只接受绑定中的 apk_path/android_serial/apk_package/apk_version_code。
 Nexus 创建和派发时复核设备属于同一活 Scout；Scout 要求源目录内的本地 APK，固定副本后以
 Android SDK aapt2 验证包名/versionCode。安装使用 -r -t，不降级、不卸载、不清数据；成功后
 回读设备包版本。构建由独立 build 操作显式触发，未改代码无需重复构建。没有设备/SDK不宣称完成。
 
-V6 B 日志增补：action=logs 只读取绑定中的 service_log_path，真实路径必须位于 source_dir 内。
+日志增补：action=logs 只读取绑定中的 service_log_path，真实路径必须位于 source_dir 内。
 仅返回文件末尾最多 32768 字节，receipt.source=configured_service_log，包含 output、
 truncated、byte_offset；输出经过秘密脱敏。不提供任意路径读取或持续日志订阅。
 
 
 
-## V6 D1：固定 Scout 更新合同 v1
+## Scout 更新合同
 
 不变更 wire 版本或 EXECUTE/RESULT dataclass。runtime_capabilities 新增
 node.update / executor=core / contract_version=1 / platform_scope=all / platforms=[]。
@@ -779,7 +882,7 @@ update-status <operation_id> 只读，不能自行宣布在线核验通过。
 源码交付不代表各平台安装验收通过。真实 clean release、兼容性演练及目标平台运行证据另记。
 
 
-## V6 B：结果恢复与连接扩展（2026-10-17）
+## 结果恢复与连接扩展
 
 保持现有 wire 与开发准备 contract_version=1。Scout features 增加 receipt；Nexus 先检查声明。
 action=receipt 携带新 operation_id、target_operation_id 与原参数的 SHA256 target_digest；
@@ -806,7 +909,7 @@ Workbench 可显式开启 3 秒刷新，最多 10 分钟，隐藏页面暂停，
 并非服务器日志流或无限续读。构建版本、服务可访问和用例通过独立展示。
 安装超时/连接中断保留 unknown，不误报确定失败后重复安装。
 
-### 2026-10-18：来源读取与维护范围调整
+### 来源读取与维护范围
 
 `runtime_capabilities` 可声明 `node.source_read`、`contract_version=1` 和
 `features=[csv,xlsx,sheets,case_api,complete_snapshot]`。Nexus 只向来源所属用户的在线 Scout
@@ -849,9 +952,9 @@ REGISTER / HEARTBEAT 可携带 `plugins_ready: bool | null`、`plugin_warning: s
 
 开发与正式 Scout 为独立进程，配置、PID、锁、插件目录和凭据命名空间互不共用。开发启动不得调用正式系统服务；禁止跨环境回退或自动继承旧凭据。
 
-## V7 当前版本执行合同（2026-10-20，优先于历史示例）
+## 当前执行合同
 
-- 目标平台只有 `mac / win / android / web`，不得由 SN 推断、接受别名或缺失时补 Android。宿主 OS 另用 host.os；Linux 可以是宿主，不能作为当前被测目标平台。
+- 目标平台只有 `mac / win / android / web`，不得由 SN 推断、接受别名或缺失时补 Android。宿主 OS 另用 host.os；Linux 可以是宿主，不能作为当前被测目标平台。唯一例外是 §4.4.3：`self_prove` 且 `executor_order=["ios_wda"]` 时，`platform` 可以为 `ios` 或省略，用来标明证明家族；其它能力收到 `ios` 仍然拒绝。
 - Web 设备身份必须为 `web{node_id}`；不接收 web-local、web_local、web 或 web- 前缀旧身份，也不迁移其归属。
 - HEARTBEAT 必须提供 `executor_snapshot_version=1` 和完整 executors；旧增量快照不再合并。
 - 普通设备动作必须携带且只携带一个 `executor_order` 元素，selected_impl.executor 必须与之相同。Nexus 只能选择明确请求的或唯一可用的实现；缺失、歧义、不可用均拒绝。
@@ -860,12 +963,12 @@ REGISTER / HEARTBEAT 可携带 `plugins_ready: bool | null`、`plugin_warning: s
 - 产品执行模式只接受 `agent / v5`：普通 Agent 使用 `agent`，严格 Web 使用 `v5`。不接受 `legacy`、空串或别名，不从发布状态推导模式。HTTP 创建入口省略模式时采用声明的 `agent` 默认值；校验在幂等摘要之前完成。绑定必须保存明确模式，派发在 `device_hint.execution_mode` 携带该值；Scout 在任何设备动作前拒绝缺失或非法的绑定模式，返回 `execution_mode_unsupported`、`execution_started=no`。不属于任务执行的节点管理指令可不携带模式；显式携带时同样校验。合同版本仍由 `execution_contract_version` 独立表示。
 
 
-### V7 心跳所有发送入口统一（2026-10-20）
+### 心跳发送入口统一
 
-ScoutCore.heartbeat 统一生成完整 executors、executor_snapshot_version=1，并用同一快照计算 capability_revision。注册后的即时心跳、定时心跳、插件通知前心跳、停止前心跳均遵守此合同；设备重探失败不省略执行器快照。定时心跳若更新原生就绪状态，必须重新计算该帧 capability_revision。Nexus 拒绝时返回具体合同错误码，不再统一提示“请升级 Scout”；不恢复旧增量兼容。
+ScoutCore.heartbeat 统一生成完整 executors、executor_snapshot_version=1，并用同一快照计算 capability_revision。注册后的即时心跳、定时心跳、插件通知前心跳、停止前心跳均遵守此合同；设备重探失败不省略执行器快照。定时心跳若更新 desktop 就绪状态，必须重新计算该帧 capability_revision。Nexus 拒绝时返回具体合同错误码，不再统一提示“请升级 Scout”；不恢复旧增量兼容。
 
 
-## Scout 下载中心首期（2026-10-20）
+## Scout 下载中心
 
 REGISTER / HEARTBEAT 可选 `tool_tasks_version: 1` 声明下载中心合同；缺失、0 或未知值为不支持。只有已认证 owner 且 plugins_ready=true 的节点可受理安装。不得以 Scout 版本号推断支持。
 
@@ -884,11 +987,11 @@ Nexus 先提交 pending 再发送；丢失应答保持 unknown，仅查询原 ta
 核心自动升级/回退保持拒绝；Chromium 启动准备、ADB Keyboard 保持只读。LangBot 复用既有独立 venv 安装器，进入相同异步任务与插件互斥；缺少 Python 3.11+ 时不可安装。管理员没有其他账号节点的执行权。账号绑定不继承其他 origin/owner 的插件和任务，当前绑定函数继续拒绝跨身份重绑。
 
 
-### 扫码本人自动关联
+### 扫码本人关联
 
 微信 iLink 使用扫码确认响应中的 ilink_user_id，经 Scout status.account_id 上报；飞书 CLI 使用验证过的授权用户身份。Nexus 仅在私聊、当前节点归属与实例/持有权有效、实际发送者与登录身份一致时关联节点主人，不覆盖既有其他归属。微信断开连接时不自动关联；其他发送者仍走绑定码。Meego 是工作项工具，凭据验证后直接调用，不增加聊天接收或助手绑定步骤。应用密钥/Webhook 不代表消息发送者身份，不适用本人免绑定。
 
-### 飞书 CLI 私聊消息接入
+### 飞书 CLI 私聊
 
 - CLI 登录本人免二次绑定：Scout 在验证用户授权后，以同一应用 `whoami --as user` 的 `onBehalfOf.openId` 上报 status.authorized_sender_id。Nexus 仅在私聊发送者与该已验证身份一致、节点归属及实例校验通过时关联当前节点主人；不从消息自报字段推断身份，不覆盖其他账号的既有绑定。其他发送者保留绑定流程。
 
@@ -898,7 +1001,7 @@ Nexus 先提交 pending 再发送；丢失应答保持 unknown，仅查询原 ta
 - 同一节点同一应用已启用 LangBot 接收时，CLI 启动失败并提示，不能并行抢收。断线与账号切换停止监听；重连按当前账号已验证授权自动恢复，不再依赖 messages_enabled。授权成功立即启动监听，未授权、导入隔离、卸载或节点断线时不启动；im_hold 仲裁仍有效。messages_start/messages_stop 仅保留兼容调用，页面不提供单独开关。
 
 
-## 2026-10-22：私聊图文与受控 Meego 附件上传 v1
+## 私聊图文与附件上传
 
 - CLI 出站 IM 命令统一使用应用机器人身份（`--as bot`）；用户身份仅用于文档/表格等用户态命令。入站私聊仍按用户身份校验，入站和出站身份不混用。
 - `im.send` 的 `feishu_cli` 在活跃入站监听存在时走原回复路由；没有监听但调用方提供 `chat_id` 时，回退到 bot CLI 发送，主动推送不再被“回复型”路由卡死。入站私聊仍只接收用户私聊。`text/post/image/file/audio` 保留文字并提取资源；兼容 CLI 已渲染的 `[Image: img_…]`、`![Image](img_…)`、`<file …/>` 与 `<audio …/>`，也接受原始 JSON 内容。不支持的消息、缺失资源、超过 4 个附件或下载失败必须带 `media_error` 或附件 `error` 交给 Nexus 回复，不能静默丢弃整条图文。
@@ -909,7 +1012,7 @@ Nexus 先提交 pending 再发送；丢失应答保持 unknown，仅查询原 ta
 - 带附件创建先完成全部本地校验、再上传、最后携带文件 token/富文本地址发一次创建请求。附件上传失败时不创建空工作项。附件字段按官方格式使用 JSON 字符串数组及 `fileToken`、字符串 `size`；富文本图片使用带 file_token 注释的 Markdown。单独上传仅确认上传，不声称已关联。原写收据继续去重，保留 file_token/file_url；超时、缺少上传回执或创建回执时标记结果未知，不自动重放。多附件增加节点等待预算，不缩短单次 CLI 的安全超时。
 - 本次实现未修改共享业务数据库，不自动创建真实 Bug。运行验收需受管加载新版 Nexus/Scout，确认新快照，再用获授权的真实图文和文件核对 Meego 实际字段；离线校验不能替代授权、下载、上传和关联验收。
 
-## Scout 配置迁移（2026-10-21）
+## Scout 配置迁移
 
 
 新增 owner-only 节点指令 `node.config_export`、`node.config_import`，复用 EXECUTE/RESULT，不改顶层字段。导出返回 `extra.archive`（UTF-8 JSON 的 base64 传输编码，不是加密）；导入参数为 `archive`，返回 `missing_tools/warnings/count`。仅用于用户显式配置迁移，不进入心跳、插件快照或持久业务日志。文件包含凭据，UI 必须提示妥善保管，响应 Cache-Control: no-store。
@@ -921,9 +1024,9 @@ Nexus 先提交 pending 再发送；丢失应答保持 unknown，仅查询原 ta
 HTTP POST `/runtime/nodes/{node_id}/configuration/export` 与 `/configuration/import`（`archive,overwrite:true`），仅节点所属账号可调用；覆盖前由 UI 确认目标节点及影响。LangBot 移除入口归下载中心。
 
 
-## 2026-10-21：恢复 Scout 在线升级与下载中心合同 v2
+## Scout 在线升级与下载中心
 
-本节替代此前“升级与回退功能移除”和下载中心核心只读的规定。Workbench、Nexus 和 Scout 支持由用户主动触发的 Scout 固定版本升级，以及 cli.feishu、cli.meego、langbot、chromium、adb.keyboard、appium 的 install/update。普通业务请求不隐式安装或更新。
+本节替代此前“升级与回退功能移除”和下载中心核心只读的规定。Workbench、Nexus 和 Scout 支持由用户主动触发的 Scout 固定版本升级，以及 cli.feishu、cli.meego、langbot、chromium、adb.keyboard 的 install/update。普通业务请求不隐式安装或更新。
 
 REGISTER/HEARTBEAT 的 tool_tasks_version=2 仍使用现有字段；Nexus 保留识别 v1 首次插件安装，v1 不接收新增组件或 update。node.tools 返回 version=2、installable、updatable 与真实已安装版本；HTTP 工具状态返回 contract_version。node.tool_task_submit 参数 action=install|update，RESULT 回执必须匹配 task_id/tool_id/action。同一操作编号不得换参数，未知应答只查询或显式重试同一编号。组件任务与 Scout 更新互斥，刷新和切换账号不能重放安装。
 
@@ -935,13 +1038,11 @@ CLI 新包在独立暂存目录校验后替换，原目录和授权保留；失�
 
 ADB Keyboard 的电脑 APK 缓存与手机已安装事实独立：缓存缺失不表示已安装设备不可用。界面使用“下载 APK / 更新 APK 缓存”，不将缓存操作标成手机安装；无任务时不展示安装步骤。install 发现现有可用 APK 时直接复用，只有显式 update 才重新下载并校验缓存。
 
-## 脚本运行载荷（Nexus → Scout）
+## 脚本运行载荷
 
 这一包放在既有 `EXECUTE` 的 `params` 中，`capability_id` 为 `script.run`。`params` 只有下表字段，不另加版本号。
 
-### 2.1 脚本运行载荷（Nexus → Scout）
-
-Nexus 只触发任务，不打包、不读脚本仓库。Scout 用本机 git 自己拉取仓库并执行。
+### 载荷字段
 
 | 字段 | 含义 |
 |---|---|
@@ -950,19 +1051,128 @@ Nexus 只触发任务，不打包、不读脚本仓库。Scout 用本机 git 自
 | `case_id` | 用例 id |
 | `sn` | 本趟设备 |
 | `platform` | `android` / `ios` / `web` / `mac` / `win` |
-| `repo_url` | 项目脚本仓库地址，已去掉内嵌凭据 |
-| `branch` | 分支，可空（空则取仓库默认分支） |
-| `revision` | 提交，可空（空则取分支最新）；对 Nexus 是不透明字符串 |
-| `script_path` | 可空；空时 Scout 在 `tests/**/<case_id>.py` 里找 |
+| `repo_url` | 项目脚本仓库地址，必填；Nexus 下发前去掉内嵌凭据。私有仓库由 Scout 本机的 git 凭据（SSH agent / credential helper）访问，Nexus 不保存、不下发令牌 |
+| `branch` | 分支，可空 |
+| `revision` | 提交，可空。空表示 Scout 取分支最新；非空是不透明字符串，Nexus 不校验是否存在，取不到由 Scout 以 `revision_missing` 返回 |
+| `script_path` | 仓库内相对路径，必须是 `.py`，可空。空表示 Scout 自己按 `tests/**/<case_id>.py` 定位 |
 
-`EXECUTE.device_hint` 只含：`env`（本次环境）、`app_id`（本次应用）、以及 Nexus 设备记录里已有的 `adb_serial` / `udid` / `model`。应用清单、包名、URL 由 Scout 读仓库根目录的 `config.yaml`，不经 Nexus。
+不再有 `files`：Nexus 不读取、不打包脚本仓库。Scout 自己拉取 `repo_url`，在 `revision`（或分支最新）上读脚本、`config.yaml`、`pages/` 并执行；应用与环境的对应由 Scout 读仓库里的 `config.yaml`。
+
+`EXECUTE.device_hint` 只带 `env`（本次环境）、`app_id`（本次运行的应用 id）和设备记录里已有的 `adb_serial` / `udid` / `model`。
 
 约束：
 
-- 私有仓库用 Scout 本机 git 凭据（SSH agent / credential helper）；Nexus 不接收、不保存令牌；取不到返回 `repo_unavailable`，不弹认证。
-- `revision` 取不到返回 `revision_missing`；不回退分支最新。找不到或有多份用例脚本分别返回 `script_missing` / `script_ambiguous`。
-- 开跑前 Scout 不做脚本预检；写法问题由 agent 写完用 `mino-scout check` 自检。
-- Scout 本地缓存仓库在配置目录的 `script-repos/` 下，每次运行用 `git archive` 取出干净副本到临时目录，运行后删除。
-- Scout 不因这次运行执行 pip。
-
+- `branch`、`revision` 不得以 `-` 开头、不含空白与控制字符；`script_path` 必须落在仓库内，禁止 `..` 和绝对路径。
+- Scout 看不到 Nexus 的 `case_workspaces` 绝对路径。禁止把本机路径当作节点上的路径。
 - 令牌无效、设备与 `sn` 不符、节点未登记该渠道：整次 `declined`，不执行脚本。
+
+
+
+## 仓库应用清单同步
+
+Nexus 不读脚本仓库。脚本仓库根 `config.yaml` 的 `apps` 改动并 push 后，agent 必须调用 MCP `repo_apps_sync` 告知 Nexus；选应用前可用 `repo_apps_get` 查看。
+
+- `PUT /project/{project_id}/repo-apps`（project_maintainer）：body `{revision, branch, apps, remove}`，按差异更新：`apps` 里的应用按 key 新增或整项替换，`remove`（key 数组）删除，其余保留；两者不能同时为空，同一 key 不能同时出现。
+- `GET /project/{project_id}/repo-apps`：返回 `{project_id, revision, branch, apps, synced_by, synced_at}`，未同步时 `apps={}`、`revision=""`。
+- 校验（不合格 422，`reason_code=repo_apps_invalid`，message 指明应用与字段）：本次提交的 apps 逐项校验，合并后 ≤32 个；key 匹配 `^[A-Za-z][A-Za-z0-9_]{0,31}$`；每项必须有 `app_id`（Nexus 应用 id）和 `platform ∈ {android,ios,web,mac,win}`；身份字段只允许 `package` / `bundle_id` / `url`（url 须 http/https），可带 `envs: {环境名: {package|bundle_id|url}}`；含 password / token / otp / secret / key 等敏感键名一律拒绝。
+- `case_run`：项目已有清单且 app 不在其中 → 400 `app_not_in_repo_config`；项目无清单则不校验。
+
+## 应用安装与卸载
+
+安装包**不经 Nexus 传输**。调用方只给「包在哪」，Scout 负责取包并装到目标设备。
+装包与卸载都不启动 WDA、不需要桌面就绪、不要求截图或独占租约。
+
+### 能力 id 与平台
+
+| capability_id | android | ios | mac | win | web |
+|---|:--:|:--:|:--:|:--:|:--:|
+| `install` / `install_apk` / `install_app` | ✅ | ✅ | ✅ | ✅ | — |
+| `uninstall_app` | ✅ | ✅ | ✅ | ✅ | — |
+
+三个安装 id 等价：Scout 在 `supports()` 与内部实现里都按同一个处理器处理，
+Nexus 侧不需要为不同平台选不同 id。
+
+### 参数
+
+| 参数 | 平台 | 说明 |
+|---|---|---|
+| `path` | 全部 | **Scout 主机上**的绝对路径。SMB/NFS 已挂载后就是普通路径 |
+| `url` | 全部 | `http(s)` 直链，或 macOS 上的 `smb://[用户@]主机/共享名/文件路径`。smb 由 `open -g` 挂载，凭证走钥匙串，**不接受明文密码** |
+| `file_name` | 全部 | 下载落盘用的文件名；缺省从 URL 末段推断 |
+| `install_timeout_sec` | 全部 | 安装超时。Android 默认 300s、iOS 默认 600s、桌面默认 1800s |
+| `split_files` / `splits` | android | 拆分包列表；给了就与 `path`（基包）一起用 `install-multiple` 装 |
+| `allow_downgrade` / `grant_permissions` | android | 追加 `-d` / `-g` |
+| `bundle_id` / `package` | ios / desktop | 装完校验收到的目标标识 |
+| `reinstall` | ios | 真值表示先 `uninstall` 再装（清数据与登录态） |
+| `skip_profile_check` | ios | 跳过描述文件白名单/过期的**前置**校验（仍受 devicectl 判定） |
+| `destination` / `install_dir` | mac | `.app`/`.dmg` 的落盘目录，默认 `/Applications` |
+| `app_name` | mac | `.dmg` 里有多个 `.app` 时指定装哪一个 |
+| `target` | mac | `.pkg` 的安装目标卷，默认 `/` |
+| `install_args` | win | 追加给安装器的参数；`.exe` 静默失败时用它显式指定 |
+| `interactive` | win | 真值表示退回前台交互式安装（只确认进程已启动） |
+| `product_code` | win | `uninstall_app` 的产品标识 |
+
+### 包来源解析顺序
+
+1. `path` 存在 → 直接用它（目录必须是 `.app`）。
+2. 否则用 `url`：
+   - `http(s)`：下载到临时文件，装完删除；
+   - `smb://`：macOS 上用 `open -g` 挂载共享盘，等 `/Volumes/<共享名>` 出现后按剩余路径取文件。共享盘**不卸载**（下次安装复用）；挂不出来就报错，不猜路径。
+3. 两者都没有 → `FAIL` + `reason_code=package_missing`，`execution_started=no`，**不启动任何安装命令**。
+
+### 各平台实现与判据
+
+| 平台 | 实际命令 | 成败判据 | 装后回读 |
+|---|---|---|---|
+| android | `adb install -r -t [flags] <path>` 或 `adb install-multiple` | `stdout` 含 `Success` **且** `stderr` 无 `Failure/failed/Exception` | `dumpsys package <pkg>` 的 `versionName` |
+| ios | `xcrun devicectl device install app --device <udid> <path>` | devicectl 的 `info.outcome` 与 `error`（退出码不可靠，实测失败可能返回 0） | `devicectl device info apps` 的 `bundleIdentifier`/`version` |
+| mac | `.pkg` → `installer -pkg … -target …`；`.dmg` → `hdiutil attach` + `ditto` 到目标目录 + `detach`；`.app` → `ditto` | 命令退出码 | 包内 `Info.plist` 与目标目录落盘结果 |
+| win | `.msi` → `msiexec /i … /qn /norestart`；`.appx/.msix` → `Add-AppxPackage`；`.exe` → 依次尝试 `/S` `/s` `/silent` `/verysilent` `/quiet` `/qn` | 退出码（`3010` 视为成功，需重启生效） | 包内身份 + 安装器退出码 |
+
+`.ipa` **不需要事先解压**：devicectl 自己解包。`payload.path` 给的就是 `.ipa` 本身。
+
+### 前置校验（装之前就能判定的失败）
+
+- 包读不出来 / 后缀不匹配 → `reason_code=package_unreadable` / `unsupported_suffix`，`execution_started=no`。
+- iOS AD-HOC 描述文件带 UDID 白名单且目标不在其中 → 直接失败，不给 devicectl 发命令。
+- iOS 描述文件已过期 → 同上。
+- `skip_profile_check` 只跳过这两条，不跳过 devicectl 的签名/授权判定。
+
+### 回执字段（`RESULT.data`）
+
+| 字段 | 说明 |
+|---|---|
+| `file` / `size` / `sha256` | 装的那一份字节。`.app` 目录按「相对路径+大小+mtime」算树摘要 |
+| `bundle_id` / `version` / `build` / `name` | 包内身份。android 来自二进制 `AndroidManifest.xml`（不依赖 aapt），iOS 来自 `Payload/*.app/Info.plist` |
+| `signing` | iOS 描述文件：`name` / `app_id` / `team` / `devices` / `device_count` / `expires` / `kind`（`store` / `adhoc` / `enterprise`） |
+| `installed_files` / `splits` | android 实际装了几个文件、其中几个是 split |
+| `verified` | 装后回读：`{ok, bundle_id/package, version, expected_version, version_matches}` 或 `{ok:false, reason}` |
+| `uninstalled_before` | iOS 是否按要求先卸载再装 |
+| `execution` | `{execution_started, phase, reason_code, source}`，见下 |
+
+`execution.source`：`adb.native.v1` / `ios.devicectl.v1` / `desktop.install.v1`。
+
+`execution.execution_started`：
+
+- `no` —— 取包或验包阶段就失败，**安装命令没有下发**。这类失败不当成「写结果未知」。
+- `yes` —— 安装命令已下发，成败以 `status` 为准。
+
+**装包/卸载是写动作，但不按界面写动作封存资源。** 签名不对、包缺失、版本降级这类终态明确的失败只报 `fail`；
+只有 `execution_started` 缺失（说不清有没有下发）才归 `blocked/write_outcome_unknown`。
+
+### 设备发现
+
+iOS 设备的连通性**逐台**判定，只看各自的 `connectionProperties.pairingState`；
+`tunnelState` 在设备空闲时本来就是 `disconnected`，不代表不可用。
+WDA 是否监听不影响设备在线判定，只影响该设备上报的 `provides`：
+
+- 设备已连、WDA 未起 → `ios_wda.available=true`，`provides` 只含装包/卸载/读版本；
+- 设备已连、WDA 在起 → 额外含页面动作。
+
+mac / win 同理：宿主在就可用，桌面未就绪时 `provides` 收窄到装包/卸载。
+
+### Nexus 转发
+
+`POST /forward/call` 与 MCP `nexus_forward` 是通用透传，不查能力目录。
+调用方只给 `capability_id` + `sn` 时，Nexus 按设备平台补 `executor_order`（恰好一个）与
+`selected_impl.executor`；Scout 的 Router 要求这两项，缺了会回 `executor_order_must_select_one`。

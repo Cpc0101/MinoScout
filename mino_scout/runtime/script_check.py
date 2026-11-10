@@ -14,8 +14,8 @@ from mino_scout.runtime.script_exec import _BANNED, parse_yaml
 
 _NO_CONCURRENCY = {"threading", "multiprocessing", "asyncio", "signal", "concurrent"}
 _REUSE = {
-    "imaplib": "取验证码用 case.scout.otp_mail()",
-    "poplib": "取验证码用 case.scout.otp_mail()",
+    "imaplib": "取验证码用 case.scout.otp(account)",
+    "poplib": "取验证码用 case.scout.otp(account)",
     "openai": "调模型用 case.scout.llm() / app.vlm()",
     "anthropic": "调模型用 case.scout.llm() / app.vlm()",
 }

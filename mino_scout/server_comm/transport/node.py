@@ -537,14 +537,15 @@ class NodeTransport:
         if devices is not None:
             desktop = next((d for d in devices if d.platform in {"mac", "win"}), None)
             if desktop is not None:
-                from mino_scout.executors.desktop import DesktopExecutor
+                from mino_scout.executors.desktop import DesktopExecutor, INSTALL_CAPS
                 # HEARTBEAT.executors is a full snapshot. Preserve every registered
                 # executor when replacing the native readiness entry.
                 native_id = desktop.platform
+                ready = desktop.desktop_state == "ready"
                 by_id = {executor.id: executor for executor in hb.executors}
-                by_id[native_id] = P.ExecutorManifest(id=native_id, available=desktop.desktop_state == "ready",
-                    provides=DesktopExecutor.provides if desktop.desktop_state == "ready" else [],
-                    reason=desktop.blocked_reason)
+                by_id[native_id] = P.ExecutorManifest(id=native_id, available=True,
+                    provides=sorted(set(INSTALL_CAPS) | (set(DesktopExecutor.provides) if ready else set())),
+                    reason="" if ready else desktop.blocked_reason)
                 hb.executors = list(by_id.values())
         epoch = self.core.binding_guard.announce(hb.executors, hb.runtime_capabilities)
         hb.scout_process_generation = epoch["scout_process_generation"]

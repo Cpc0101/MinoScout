@@ -23,10 +23,11 @@ def account(case):
         password=str(data.get("password") or ""),
         otp=str(data.get("otp") or ""),
         ident=str(data.get("ident") or ""),
+        otp_policy=dict(data.get("login_policy") or {}),
     )
 
 
-def otp_mail(case) -> str:
+def _gmail_code(case, policy=None) -> str:
     import time
 
     from mino_scout.plugins.gmail_otp import GmailOtpError, fetch_otp_via_imap
@@ -34,15 +35,17 @@ def otp_mail(case) -> str:
     from mino_scout.runtime.script_exec import ScriptAbort
 
     case._guard()
+    policy = policy if isinstance(policy, dict) else {}
     node_id = str(getattr(case.core, "node_id", "") or "")
     inbox = plain_value("mail", "gmail", "inbox_address")
     password = secret_value(node_id, "mail", "gmail", "app_password")
     if not inbox or not password:
-        raise ScriptAbort("请在这台 Scout 节点的收信里填写 Gmail 收件箱和应用专用密码", reason_code="otp_environment_unavailable")
+        raise ScriptAbort("这个账号没有固定验证码，这台节点也没配 Gmail 收件箱：请配固定码或配收信",
+                          reason_code="otp_environment_unavailable")
     started = float(getattr(case, "_started", 0) or 0)
-    remain_ms = 30_000
+    remain_ms = int(policy.get("otp_max_wait_ms") or 30_000)
     if case.deadline:
-        remain_ms = max(0, int((case.deadline - time.monotonic()) * 1000))
+        remain_ms = max(0, min(remain_ms, int((case.deadline - time.monotonic()) * 1000)))
     if remain_ms <= 0:
         raise ScriptAbort("没有取到验证码", reason_code="otp_environment_unavailable")
 
@@ -56,7 +59,10 @@ def otp_mail(case) -> str:
             app_password=password,
             to_address=str(getattr(case, "_mail_to", "") or ""),
             since_ts=started or None,
-            max_wait_ms=min(30_000, remain_ms),
+            from_allowlist=list(policy.get("otp_from_allowlist") or []),
+            subject_contains=str(policy.get("otp_subject_contains") or ""),
+            poll_interval_ms=int(policy.get("otp_poll_interval_ms") or 200),
+            max_wait_ms=min(remain_ms, 30_000),
             should_stop=stopped,
         )
     except GmailOtpError as exc:
@@ -64,6 +70,36 @@ def otp_mail(case) -> str:
     if not str(code or "").strip():
         raise ScriptAbort("没有取到验证码", reason_code="otp_environment_unavailable")
     return str(code).strip()
+
+
+def otp(case, account=None) -> str:
+    """按这个账号生效的登录策略取验证码：账号自带码 → 固定码 → Gmail 收信。"""
+    from mino_scout.runtime.script_exec import ScriptAbort
+
+    case._guard()
+    code = str(getattr(account, "otp", "") or "").strip()
+    if code:
+        return code
+    policy = dict(getattr(account, "otp_policy", None) or {})
+    mode = str(policy.get("otp_mode") or "auto").strip().lower()
+    fixed = str(policy.get("otp_fixed") or "").strip()
+    if fixed and mode in {"fixed", "auto"}:
+        return fixed
+    if mode == "hitl":
+        raise ScriptAbort("这条用例的验证码策略是人工提供（hitl），脚本无法自动取码", reason_code="otp_requires_human")
+    if mode == "fixed":
+        raise ScriptAbort("登录策略是固定验证码，但没有配置 fixed", reason_code="otp_policy_invalid")
+    if mode in {"gmail", "auto"}:
+        email = str(getattr(account, "email", "") or "")
+        if not email and not policy:
+            raise ScriptAbort("这个账号没有验证码来源：没有固定码也没有邮箱", reason_code="otp_channel_missing")
+        return _gmail_code(case, policy)
+    raise ScriptAbort(f"不认识的验证码策略：{mode}", reason_code="otp_policy_invalid")
+
+
+def otp_mail(case) -> str:
+    """兼容旧脚本：只走 Gmail 收信。"""
+    return _gmail_code(case, {})
 
 
 def llm(case, prompt: str, text: str = "", schema: dict | None = None) -> Any:

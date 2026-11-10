@@ -3,7 +3,7 @@ from __future__ import annotations
 
 
 def locator_params(kind: str, value: str, name: str, label: str) -> dict:
-    key = {"text": "text", "content_desc": "content_desc", "resource_id": "resource_id", "role": "text"}.get(kind)
+    key = {"text": "text", "content_desc": "content_desc", "resource_id": "resource_id", "role": "text", "class": "class"}.get(kind)
     if not key:
         raise ValueError("locator_missing")
     return {"point_policy": "node", "target": {key: label if kind == "role" else value}}

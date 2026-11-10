@@ -6,6 +6,11 @@ from typing import Any
 READS = frozenset({"write_stop_status", "probe", "probe_device_state", "screenshot", "hierarchy", "get_foreground_app", "get_app_version",
                    "read_web_auth", "read_web_target_facts", "read_device_data"})
 
+# 装包/卸载的成败由 adb / devicectl 给出终态，不是「界面效果未知」。
+# 它们仍是写动作（要串行、要受 stop 检查），但不该按界面写去封存资源：
+# 签名不对、包缺失这类明确失败只应报 FAIL，不能把设备判成结果未知。
+PACKAGE_WRITES = frozenset({"install", "install_apk", "install_app", "uninstall_app"})
+
 
 def ui_write(cap: str) -> bool:
     return bool(cap) and cap not in READS and cap != "cancel_run" and not cap.startswith(("node.", "plugin."))
@@ -29,7 +34,11 @@ def normalize_ui_result(result, *, capability_id: str, run_id: str, step_idx: in
     from mino_scout.schemas import EventStatus
     detail = dict(result.raw_response or {})
     boundary = started(detail)
-    unsafe = boundary == "unknown" or (result.status is not EventStatus.PASS and boundary != "no")
+    if str(capability_id or "") in PACKAGE_WRITES:
+        # 只有「说不清有没有开始」才算未知；明确了失败的装包就是失败。
+        unsafe = boundary == "unknown"
+    else:
+        unsafe = boundary == "unknown" or (result.status is not EventStatus.PASS and boundary != "no")
     if unsafe:
         result.status = EventStatus.BLOCKED
         result.summary = "写动作结果未核验，已停止后备执行并保留资源隔离"

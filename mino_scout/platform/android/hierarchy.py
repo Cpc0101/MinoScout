@@ -302,6 +302,7 @@ _MATCH_ORDER = (
     "content_desc",
     "text_contains",
     "content_desc_contains",
+    "class",             # 内容型控件/无文字按钮：只按控件类型命中
 )
 
 
@@ -344,10 +345,12 @@ def resolve_target(
     target: dict[str, Any],
     *,
     prefer_clickable: bool = True,
+    index: Optional[int] = None,
 ) -> Optional[AnchorMatch]:
     """按优先级把语义锚点解析成节点。
 
     target 支持键：resource_id / text / content_desc（可同时给，按优先级逐个尝试）。
+    index 给了就按屏幕顺序取第 N 个命中（0 起），默认 None 走面积/可点击规则。
 
     同一优先级命中多个时的挑选规则（顺序很重要）：
       1. **先按可点击性分层** —— 只在"自身或祖先可点击"的候选里挑。
@@ -362,13 +365,30 @@ def resolve_target(
     rid = _norm(target.get("resource_id") or target.get("resource-id") or target.get("id"))
     text = _norm(target.get("text"))
     desc = _norm(target.get("content_desc") or target.get("content-desc") or target.get("desc"))
+    cls = _norm(target.get("class"))
 
     usable = [n for n in nodes if n.enabled and n.area > 0]
+    if cls:
+        # 按控件类型收窄：内容型控件（列表卡片、贴图按钮）只靠类型就能圈定。
+        same = [n for n in usable if cls == _norm(n.cls) or cls == _norm(n.cls.split(".")[-1])]
+        if same:
+            usable = same
+    def ordered(cands: list[UiNode]) -> list[UiNode]:
+        return sorted(cands, key=lambda n: (n.bounds[1], n.bounds[0]))
 
     def pick(cands: list[UiNode], how: str) -> Optional[AnchorMatch]:
         if not cands:
             return None
         total = len(cands)
+        if index is not None:
+            # 调用方要第几个就取第几个：列表卡片、同名重复项都按屏幕顺序排。
+            seq = ordered(cands)
+            pos = int(index) if int(index) >= 0 else total + int(index)
+            if pos < 0 or pos >= len(seq):
+                return None
+            chosen = _clickable_target(seq[pos]) or seq[pos]
+            return AnchorMatch(node=chosen, matched_by=f"{how}#{index}", candidates=total,
+                               clickable_candidates=total)
         if prefer_clickable:
             # 映射到"实际可点的那个节点"，只保留能点的候选
             actionable = [(c, _clickable_target(c)) for c in cands]
@@ -397,6 +417,9 @@ def resolve_target(
             got = pick([n for n in usable if text in _norm(n.text)], how)
         elif how == "content_desc_contains" and desc:
             got = pick([n for n in usable if desc in _norm(n.content_desc)], how)
+        elif how == "class" and cls:
+            # 只给控件类型时（列表卡片、无文字贴图按钮）按类型命中。
+            got = pick([n for n in usable if cls == _norm(n.cls) or cls == _norm(n.cls.split(".")[-1])], how)
         else:
             got = None
         if got is not None:
@@ -503,7 +526,7 @@ def has_target(params: dict[str, Any]) -> bool:
     if not isinstance(t, dict):
         return False
     return any(_norm(t.get(k)) for k in
-               ("resource_id", "resource-id", "id", "text", "content_desc", "content-desc", "desc"))
+               ("resource_id", "resource-id", "id", "text", "content_desc", "content-desc", "desc", "class"))
 
 
 def lift_text_anchor(params: dict[str, Any]) -> dict[str, Any]:

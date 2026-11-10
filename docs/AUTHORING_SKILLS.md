@@ -78,7 +78,7 @@ apps:
 | 对象 | 内容 |
 |---|---|
 | `app`（`case.init` 返回） | 启停、点击输入、滑动拖拽、按键、剪贴板、截图、界面树、`on_page`、`vlm`/`vlm_frame`/`sample`、`exec`，以及按渠道的专有方法 |
-| `case.scout` | `wait` `otp_mail` `llm` |
+| `case.scout` | `wait` `otp(account)` `llm` |
 | `case.nexus` | `prep` `do` `check`（文字标题）、`account` `note` `fail` |
 
 - 每条 `tool/result` 带 `app`（应用 key）；`exec` 另带 `script_sha256`、`script_length`；

@@ -30,7 +30,7 @@
 | `hierarchy` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `exec_script` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `install` | ✅ | ✅ | — | ✅ | ✅ |
-| `uninstall_app` | ✅ | ✅ | — | — | — |
+| `uninstall_app` | ✅ | ✅ | — | ✅ | ✅ |
 | `get_app_version` | ✅ | ✅ | — | — | — |
 | `read_device_data` | ✅ | — | — | — | — |
 | `set_input_method` | ✅ | — | — | — | — |
@@ -66,6 +66,16 @@ class Executor(Protocol):
 ```
 
 五态语义见 [CONVENTIONS.md](CONVENTIONS.md) §2 —— **任何状态都结束本次尝试，Scout 不换路。**
+
+### `provides` 可以是属性
+
+`provides` 允许是每次探测后计算的属性，`_probe_executor` 先跑 `probe()` 再读它。
+装包/卸载不依赖 WDA、也不需要图形桌面，所以：
+
+- `ios_wda`：设备连着就 `available=true`，WDA 没起时 `provides` 只含装包/卸载/读版本；
+- `mac` / `win`：宿主在就 `available=true`，桌面未就绪时 `provides` 收窄到装包/卸载。
+
+把整条通道判成不可用会让「WDA 没起」「桌面锁屏」连带挡掉装包。
 
 `ExecutorContext` 携带：`device`（来自 `EXECUTE.device_hint` / `sn`）、`run_id` / `step_idx`、
 `selected_impl`（Nexus 从能力目录抄来的 impl 元数据）、`shared`（同一次派发内的

@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
+import time
+from pathlib import Path
 
 from mino_scout.executors.desktop import DesktopUnavailable, get_desktop_runtime, tool_payload
 from mino_scout.schemas import CapturedScreen
@@ -129,20 +132,148 @@ def launch(runtime, sdk, driver, params, hint, run_id, obs):
     return runtime._launch_app(sdk, driver, params, hint, run_id, obs, "macos")
 
 
-def install(path: str) -> str:
+def install(path: str, *, params: dict | None = None) -> str:
+    """装 macOS 包。路径必须是本机已存在的绝对路径。
+
+    - `.pkg`：`installer -pkg … -target /`，可用 `target` 覆盖安装目标卷。
+    - `.dmg`：`hdiutil attach` 后把镜像里的 `.app` 复制到 `/Applications`（或
+      `params.destination`），最后 `hdiutil detach`；没有 `.app` 时退回打开镜像。
+    - `.app`：`ditto` 到 `/Applications`（或 `params.destination`），不是 `open`。
+    """
+    extra = dict(params or {})
     target = str(path or "").strip()
     if not target:
         raise DesktopUnavailable("install 缺 path")
-    if target.endswith(".pkg"):
-        command = ["installer", "-pkg", target, "-target", "CurrentUserHomeDirectory"]
-    elif target.endswith(".app") or target.endswith(".dmg"):
-        command = ["open", target]
-    else:
-        raise DesktopUnavailable("macOS install 需要 .app、.pkg 或 .dmg")
-    proc = subprocess.run(command, capture_output=True, text=True, timeout=180)
+    package = Path(target)
+    if not package.exists():
+        raise DesktopUnavailable(f"安装包不存在：{package}")
+    lowered = target.lower()
+    if package.suffix.lower() == ".pkg":
+        return _install_pkg(package, extra)
+    if package.suffix.lower() == ".dmg":
+        return _install_dmg(package, extra)
+    if package.suffix.lower() == ".app" or (package.is_dir() and package.name.endswith(".app")):
+        destination = _destination(extra, package.name)
+        from mino_scout.tools.app_package import copy_tree, PackageError
+
+        try:
+            copy_tree(package, destination)
+        except PackageError as exc:
+            raise DesktopUnavailable(str(exc)) from exc
+        return f"已安装到 {destination}"
+    raise DesktopUnavailable("macOS install 需要 .app、.pkg 或 .dmg")
+
+
+def _install_pkg(package: Path, extra: dict) -> str:
+    volume = str(extra.get("target") or extra.get("destination") or "/").strip() or "/"
+    try:
+        proc = subprocess.run(
+            ["installer", "-pkg", str(package), "-target", volume],
+            capture_output=True, text=True, timeout=_timeout(extra),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise DesktopUnavailable(f"installer 超过 {_timeout(extra):.0f}s 未返回；结果未知") from exc
     if proc.returncode != 0:
-        raise DesktopUnavailable((proc.stderr or proc.stdout or "安装失败")[:300])
-    return f"已安装 {target}"
+        raise DesktopUnavailable((proc.stderr or proc.stdout or "pkg 安装失败")[:300])
+    return f"已安装 {package.name} 到 {volume}"
+
+
+def _install_dmg(package: Path, extra: dict) -> str:
+    """挂载 → 找唯一 `.app` → 复制 → 卸载镜像。"""
+    from mino_scout.tools.app_package import copy_tree, PackageError
+
+    try:
+        attach = subprocess.run(
+            ["hdiutil", "attach", "-nobrowse", "-readonly", "-plist", str(package)],
+            capture_output=True, text=True, timeout=180,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise DesktopUnavailable("挂载 dmg 超时") from exc
+    if attach.returncode != 0:
+        raise DesktopUnavailable((attach.stderr or attach.stdout or "挂载 dmg 失败")[:300])
+    mounts = _mount_points(attach.stdout)
+    if not mounts:
+        raise DesktopUnavailable("dmg 没有挂载出卷")
+    mount = mounts[0]
+    try:
+        apps = sorted(path for path in mount.iterdir() if path.name.endswith(".app"))
+        if not apps:
+            raise DesktopUnavailable("镜像里没有 .app；请直接给 .app 或 .pkg 路径")
+        if len(apps) > 1 and not extra.get("app_name"):
+            names = "、".join(item.name for item in apps[:5])
+            raise DesktopUnavailable(f"镜像里有多个 .app（{names}），用 app_name 指定一个")
+        source = next(
+            (item for item in apps if extra.get("app_name") and item.name == str(extra["app_name"]).strip()),
+            apps[0],
+        )
+        destination = _destination(extra, source.name)
+        try:
+            copy_tree(source, destination)
+        except PackageError as exc:
+            raise DesktopUnavailable(str(exc)) from exc
+        return f"已安装到 {destination}"
+    finally:
+        subprocess.run(["hdiutil", "detach", str(mount), "-quiet"], capture_output=True, text=True, timeout=120)
+
+
+def _mount_points(raw: str) -> list[Path]:
+    import plistlib
+
+    try:
+        payload = plistlib.loads(str(raw or "").encode())
+    except Exception as exc:
+        raise DesktopUnavailable(f"读不到 dmg 挂载结果：{type(exc).__name__}") from exc
+    out: list[Path] = []
+    for entity in payload.get("system-entities") or []:
+        mount = entity.get("mount-point") if isinstance(entity, dict) else ""
+        if mount:
+            out.append(Path(str(mount)))
+    return out
+
+
+def _destination(extra: dict, name: str) -> Path:
+    root = str(extra.get("destination") or extra.get("install_dir") or "/Applications").strip() or "/Applications"
+    return Path(root).expanduser() / name
+
+
+def _timeout(extra: dict) -> float:
+    try:
+        value = float(extra.get("install_timeout_sec") or 1800.0)
+    except (TypeError, ValueError):
+        value = 1800.0
+    return max(60.0, min(value, 7200.0))
+
+
+def uninstall(params: dict) -> dict:
+    """macOS 卸载：把 `.app` 移进废纸篓（`~/.Trash`），不驱动 Finder。
+
+    走 Finder 需要「自动化」TCC 授权，在无人值守的节点上会静默卡住 120s。
+    直接移进废纸篓等价、可预测，也不要求图形会话。
+    """
+    extra = dict(params or {})
+    name = str(extra.get("app_name") or extra.get("path") or "").strip()
+    if not name:
+        raise DesktopUnavailable("uninstall_app 缺 params.path（.app 路径）或 app_name")
+    target = Path(name)
+    if not target.is_absolute():
+        for root in ("/Applications", str(Path.home() / "Applications")):
+            candidate = Path(root) / name
+            if candidate.exists():
+                target = candidate
+                break
+    if not target.exists():
+        raise DesktopUnavailable(f"找不到要卸载的应用：{target}")
+    trash = Path.home() / ".Trash"
+    trash.mkdir(parents=True, exist_ok=True)
+    destination = trash / target.name
+    if destination.exists():
+        destination = trash / f"{target.name}.{int(time.time())}"
+    try:
+        shutil.move(str(target), str(destination))
+    except OSError as exc:
+        raise DesktopUnavailable(f"移进废纸篓失败：{exc}") from exc
+    return {"summary": f"已移除 {target.name}", "path": str(target), "trash": str(destination),
+            "execution": {"execution_started": "yes", "phase": "completed", "source": "desktop.install.v1"}}
 
 
 def hierarchy(runtime, hint, run_id) -> dict:

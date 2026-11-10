@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import ntpath
 import subprocess
+from pathlib import Path
 
 from mino_scout.executors.desktop import DesktopUnavailable, get_desktop_runtime, tool_payload
 from mino_scout.schemas import CapturedScreen
@@ -133,21 +134,114 @@ def launch(runtime, sdk, driver, params, hint, run_id, obs):
     return runtime._launch_app(sdk, driver, params, hint, run_id, obs, "windows")
 
 
-def install(path: str) -> str:
+def install(path: str, *, params: dict | None = None) -> str:
+    """装 Windows 包。
+
+    - `.msi`：`msiexec /i … /qn`（静默），可用 `params.install_args` 追加参数。
+    - `.exe`：默认**静默尝试**（`/S`、`/silent`、`/verysilent` 逐个试），成功后返回；
+      都不认时用 `params.install_args=["/quiet"]` 这类显式参数，或 `interactive=true`
+      退回前台执行（此时 Scout 只能确认“进程已启动”，不能确认装成功）。
+    - `.appx`/`.msix`：`Add-AppxPackage`。
+    """
+    extra = dict(params or {})
     target = str(path or "").strip()
     if not target:
         raise DesktopUnavailable("install 缺 path")
+    if not Path(target).exists():
+        raise DesktopUnavailable(f"安装包不存在：{target}")
     lowered = target.lower()
     if lowered.endswith(".msi"):
-        command = ["msiexec", "/i", target, "/qn"]
-    elif lowered.endswith(".exe"):
-        command = [target]
-    else:
-        raise DesktopUnavailable("Windows install 需要 .exe 或 .msi")
-    proc = subprocess.run(command, capture_output=True, text=True, timeout=180)
+        return _install_msi(target, extra)
+    if lowered.endswith((".appx", ".msix", ".appxbundle", ".msixbundle")):
+        return _install_appx(target, extra)
+    if lowered.endswith(".exe"):
+        return _install_exe(target, extra)
+    raise DesktopUnavailable("Windows install 需要 .exe、.msi 或 .appx/.msix")
+
+
+_SILENT_FLAGS = (["/S"], ["/s"], ["/silent"], ["/verysilent"], ["/quiet"], ["/qn"])
+
+
+def _install_msi(target: str, extra: dict) -> str:
+    args = ["msiexec", "/i", target, "/qn", "/norestart", *_extra_args(extra)]
+    proc = _run_install(args, extra)
+    if proc.returncode not in (0, 3010):
+        raise DesktopUnavailable((proc.stderr or proc.stdout or f"msiexec 退出 {proc.returncode}")[:300])
+    note = "（需要重启才生效）" if proc.returncode == 3010 else ""
+    return f"已安装 {Path(target).name}{note}"
+
+
+def _install_appx(target: str, extra: dict) -> str:
+    script = f"Add-AppxPackage -Path '{target.replace(chr(39), chr(39) * 2)}'"
+    proc = _run_install(["powershell", "-NoProfile", "-Command", script], extra)
     if proc.returncode != 0:
-        raise DesktopUnavailable((proc.stderr or proc.stdout or "安装失败")[:300])
-    return f"已安装 {target}"
+        raise DesktopUnavailable((proc.stderr or proc.stdout or "Add-AppxPackage 失败")[:300])
+    return f"已安装 {Path(target).name}"
+
+
+def _install_exe(target: str, extra: dict) -> str:
+    """先试静默；全部非零时按用户是否声明静默决定回退。"""
+    explicit = _extra_args(extra)
+    interactive = bool(extra.get("interactive"))
+    attempts = [explicit] if explicit else ([] if interactive else list(_SILENT_FLAGS))
+    failures: list[str] = []
+    for flags in attempts:
+        proc = _run_install([target, *flags], extra)
+        if proc.returncode == 0:
+            return f"已安装 {Path(target).name}" + (f"（参数 {' '.join(flags)}）" if flags else "")
+        failures.append(f"{' '.join(flags) or '<无参数>'} → rc={proc.returncode}")
+    if interactive or not explicit:
+        proc = _run_install([target, *explicit], extra, wait=False)
+        return (f"{Path(target).name} 已启动交互式安装（pid={proc.pid}）；"
+                "安装结果需要看界面确认" + (f"；静默尝试失败：{'；'.join(failures[:3])}" if failures else ""))
+    raise DesktopUnavailable("exe 静默安装失败：" + "；".join(failures[:3]))
+
+
+def _extra_args(extra: dict) -> list[str]:
+    raw = extra.get("install_args")
+    if isinstance(raw, str):
+        import shlex as _shlex
+
+        return _shlex.split(raw, posix=False)
+    if isinstance(raw, list):
+        return [str(item) for item in raw if str(item)]
+    return []
+
+
+def _run_install(command: list[str], extra: dict, *, wait: bool = True):
+    timeout = 1800.0
+    try:
+        timeout = max(60.0, min(float(extra.get("install_timeout_sec") or 1800.0), 7200.0))
+    except (TypeError, ValueError):
+        pass
+    try:
+        if not wait:
+            return subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                    shell=False)
+        return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise DesktopUnavailable(f"安装器超过 {timeout:.0f}s 未返回；结果未知") from exc
+
+
+def uninstall(params: dict) -> dict:
+    """Windows 卸载：`.msi` 走 `msiexec /x`，产品标识走注册表查询后的同样命令。"""
+    extra = dict(params or {})
+    target = str(extra.get("path") or extra.get("package") or extra.get("product_code") or "").strip()
+    if not target:
+        raise DesktopUnavailable("uninstall_app 缺 params.path / product_code / package")
+    lowered = target.lower()
+    if lowered.endswith(".msi"):
+        args = ["msiexec", "/x", target, "/qn", "/norestart", *_extra_args(extra)]
+        summary = f"已卸载 {Path(target).name}"
+    else:
+        code = target if target.startswith("{") else f"{{{target}}}"
+        args = ["msiexec", "/x", code, "/qn", "/norestart", *_extra_args(extra)]
+        summary = f"已卸载 {code}"
+    proc = _run_install(args, extra)
+    if proc.returncode not in (0, 3010):
+        raise DesktopUnavailable((proc.stderr or proc.stdout or f"msiexec /x 退出 {proc.returncode}")[:300])
+    return {"summary": summary, "path": target,
+            "execution": {"execution_started": "yes", "phase": "completed", "source": "desktop.install.v1"}}
 
 
 def hierarchy(runtime, hint, run_id) -> dict:

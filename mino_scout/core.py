@@ -59,6 +59,23 @@ _NODE_COMMANDS = {
 }
 
 
+def register_node_command(capability_id: str, action: str) -> None:
+    """新增节点指令从这里登记，不必改 `_dispatch` 的判定链。
+
+    Nexus 侧不再维护指令白名单：它转发什么这里查什么，查不到就回 FAIL。
+    """
+    cap = str(capability_id or "").strip()
+    name = str(action or "").strip()
+    if not cap.startswith("node.") or not name:
+        raise ValueError("节点指令必须是 node.<name>")
+    _NODE_COMMANDS[cap] = name
+
+
+def known_node_commands() -> tuple[str, ...]:
+    return tuple(sorted(_NODE_COMMANDS))
+
+
+
 def _adb_channel_state(dev: P.DeviceManifest) -> str:
     return str(dict(dev.channels or {}).get("adb") or "").strip().lower()
 
@@ -1264,14 +1281,17 @@ def _probe_executor(ex_id: str, ex: Executor) -> tuple[bool, list[str], str]:
 
     每个 executor 自己声明 `provides` 与 `probe()`；没声明的按"可用但不报能力"处理
     并记 warn —— 静默上报空能力会让 Nexus 的菜单莫名变空。
+
+    **先 probe 再读 provides**：provides 可以是随探测结果收窄的属性（例如 iOS 通道
+    WDA 没起来时只报不依赖 WDA 的装包能力），先读常量会把收窄结果盖掉。
     """
-    provides = list(getattr(ex, "provides", []) or [])
     probe = getattr(ex, "probe", None)
     if callable(probe):
         ok, reason = probe()
     else:
         ok, reason = True, ""
         SLog.w(TAG, f"executor {ex_id} 没有 probe()，默认按可用上报")
+    provides = list(getattr(ex, "provides", []) or [])
     if not provides:
         SLog.w(TAG, f"executor {ex_id} 没有声明 provides，Nexus 侧菜单会缺这一块")
     return bool(ok), provides, reason

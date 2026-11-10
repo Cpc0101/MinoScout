@@ -23,6 +23,14 @@ from typing import Any
 from mino_scout.server_comm import protocol as P
 
 SDK_VERSION = "0.34.1"
+# 装包/卸载不依赖图形桌面：不需要 Cua 会话、截图或独占租约。
+_INSTALL_CAPS = frozenset({"install", "install_apk", "install_app", "uninstall_app"})
+INSTALL_CAPS = _INSTALL_CAPS
+
+
+def host_os(ctx) -> str:
+    """macos / windows，取自设备平台，不再重新探测宿主。"""
+    return "macos" if str(getattr(getattr(ctx, "device", None), "platform", "")) == "mac" else "windows"
 def host_caps() -> tuple[str, ...]:
     if platform.system() == "Windows":
         from mino_scout.platform.win.actions import CAPS
@@ -598,17 +606,8 @@ class DesktopRuntime:
         obs = self._observations.pop(run_id, None)
         if capability != "input_text":
             self._clear_focus(run_id)
-        if capability not in {"launch_app", "install", "install_apk", "install_app", "hierarchy"} and (not obs or obs["session_generation"] != hint["session_generation"]):
+        if capability not in {"launch_app", "hierarchy"} and (not obs or obs["session_generation"] != hint["session_generation"]):
             raise DesktopUnavailable("桌面动作需要重新截图，旧捕获引用已消费或失效")
-        if capability in {"install", "install_apk", "install_app"}:
-            path = str(params.get("path") or "")
-            if os_name == "macos":
-                from mino_scout.platform.mac.actions import install as install_app
-            else:
-                from mino_scout.platform.win.actions import install as install_app
-            summary = install_app(path)
-            return {"execution": {"execution_started": "yes", "phase": "completed", "source": "desktop.cua.v1"},
-                    "summary": summary, "session_generation": hint.get("session_generation")}
         if capability == "launch_app":
             if os_name == "macos":
                 from mino_scout.platform.mac.actions import launch
@@ -768,56 +767,114 @@ class DesktopExecutor:
     """macOS / Windows 原生执行器。会话在本模块，动作在各自的 platform 里。
 
     `id` 就是宿主平台（`mac` / `win`），不再是历史名 `desktop`。
-    """
 
-    provides = list(host_caps())
+    装包不需要图形桌面——不需要 Cua 会话、截图或独占租约。所以桌面未就绪时
+    这条通道仍然可用，只是 `provides` 收窄到装包/卸载/读版本。
+    """
 
     def __init__(self):
         import platform as _system
         from mino_scout.runtime.platform_contract import host_os_from_system
         self.id = host_os_from_system(_system.system())
+        self._desktop_ready = False
+
+    @property
+    def provides(self) -> list[str]:
+        caps = set(_INSTALL_CAPS)
+        if self._desktop_ready:
+            caps |= set(host_caps())
+        return sorted(caps)
 
     def probe(self):
+        """宿主在就等于可用；桌面健康只收窄 provides，不否决装包。"""
         state = get_desktop_runtime().state()
-        return state["state"] == "ready", state["blocked_reason"]
+        self._desktop_ready = state["state"] == "ready"
+        if self._desktop_ready:
+            return True, ""
+        return True, f"桌面未就绪（{state.get('blocked_reason') or state['state']}）；只能装包/卸载"
 
     def supports(self, capability_id, low_level=None):
         del low_level
-        return capability_id in self.provides
+        cap = str(capability_id or "")
+        if cap in _INSTALL_CAPS:
+            return True
+        return self._desktop_ready and cap in host_caps()
 
     def execute(self, event, ctx):
         import time
 
         from mino_scout.executors.base import make_event_result, now_iso
         from mino_scout.schemas import EventStatus
+        from mino_scout.tools.app_package import PackageError
         from mino_scout.tools.keep_alive.log import SLog
 
         started, tick = now_iso(), time.monotonic()
         status, error, data = EventStatus.PASS, "", {}
+        cap = str(event.capability_id or "")
         try:
             if ctx.device.platform not in {"mac", "win"}:
                 raise DesktopUnavailable("不是 macOS / Windows 原生设备")
-            data = get_desktop_runtime().action(event.capability_id, dict(event.params or {}), ctx.device.extra, ctx.run_id)
-            effect = (data.get("cua_action") or {}).get("effect")
-            if effect == "refused":
-                status, error = EventStatus.BLOCKED, "桌面驱动拒绝操作，请查看 Session Log 中的动作证据"
-            elif effect in ("suspected_noop", "partial"):
-                status, error = EventStatus.FAIL, f"桌面动作效果：{effect}，需要重新观察"
-            data["verification_required"] = effect in ("unverifiable", "partial", "suspected_noop")
+            if cap in _INSTALL_CAPS:
+                data = self._package(event, ctx)
+            else:
+                data = get_desktop_runtime().action(cap, dict(event.params or {}), ctx.device.extra, ctx.run_id)
+                effect = (data.get("cua_action") or {}).get("effect")
+                if effect == "refused":
+                    status, error = EventStatus.BLOCKED, "桌面驱动拒绝操作，请查看 Session Log 中的动作证据"
+                elif effect in ("suspected_noop", "partial"):
+                    status, error = EventStatus.FAIL, f"桌面动作效果：{effect}，需要重新观察"
+                data["verification_required"] = effect in ("unverifiable", "partial", "suspected_noop")
         except DesktopUnavailable as exc:
             status, error = EventStatus.BLOCKED, str(exc)
             data = exc.data
+        except PackageError as exc:
+            status, error = EventStatus.FAIL, str(exc)
+            data = {"execution": {"execution_started": "no", "phase": "validate",
+                                  "reason_code": exc.code, "source": "desktop.install.v1"}}
         except Exception as exc:
-            SLog.e("DesktopExecutor", f"run={ctx.run_id} cap={event.capability_id} error={type(exc).__name__}")
+            SLog.e("DesktopExecutor", f"run={ctx.run_id} cap={cap} error={type(exc).__name__}")
             status, error = EventStatus.FAIL, "Cua 桌面执行失败，请查看节点日志并重新观察"
-        if event.capability_id == "get_foreground_app":
+        if cap == "get_foreground_app":
             summary = "前台应用匹配被测应用" if data.get("target_active") is True else "前台应用未匹配被测应用"
-        elif event.capability_id == "input_text":
+        elif cap == "input_text":
             summary = "已写入当前焦点；输入效果待下一张截图确认"
-        elif event.capability_id == "set_clipboard":
+        elif cap == "set_clipboard":
             summary = str(data.get("summary") or "已写入剪贴板")
         else:
             summary = str(data.get("summary") or "") or "桌面动作已投递；业务结果待下一张截图确认"
         return make_event_result(event, status=status, executor_used=self.id, started_at=started,
                                  elapsed_ms=int((time.monotonic() - tick) * 1000),
-                                 summary=error or summary, error=error, raw_response=data)
+                                 summary=summary if status is EventStatus.PASS else (error or summary),
+                                 error=error, raw_response=data)
+
+    # ------------------------------------------------------------ 装包 / 卸载
+
+    def _package(self, event, ctx) -> dict[str, Any]:
+        from mino_scout.tools import app_package
+
+        cap = str(event.capability_id or "")
+        params = dict(event.params or {})
+        if cap == "uninstall_app":
+            if host_os(ctx) == "macos":
+                from mino_scout.platform.mac.actions import uninstall as uninstall_app
+            else:
+                from mino_scout.platform.win.actions import uninstall as uninstall_app
+            return uninstall_app(params)
+        source, temp = app_package.resolve_source(params, platform="desktop")
+        try:
+            package = app_package.inspect_package(source)
+            if not package.get("sha256"):
+                raise app_package.PackageError(package.get("reason") or "读不到安装包",
+                                               code="package_unreadable")
+            if host_os(ctx) == "macos":
+                from mino_scout.platform.mac.actions import install as install_app
+            else:
+                from mino_scout.platform.win.actions import install as install_app
+            summary = install_app(str(source), params=params)
+            return {
+                **package,
+                "summary": summary,
+                "execution": {"execution_started": "yes", "phase": "completed", "source": "desktop.install.v1"},
+            }
+        finally:
+            app_package.release(temp)
