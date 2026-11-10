@@ -224,4 +224,4 @@ echo "→ 安装到 ${PREFIX}"
 
 SCOUT_BIN="${PREFIX}/bin/mino-scout"
 echo "→ 执行 ${SCOUT_BIN} status 查看服务状态"
-echo "Mino Scout ${APP_VER} 安装完成。账号绑定结果请在 Workbench 查看；拒绝原因见 Scout 日志。Chromium / ADB Keyboard 将在首次接入后自动下载。"
+echo "Mino Scout ${APP_VER} 安装完成。"
