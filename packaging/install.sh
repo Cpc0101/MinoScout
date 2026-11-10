@@ -342,6 +342,10 @@ write_launchd() {
     <string>${PREFIX}</string>
     <key>PLAYWRIGHT_BROWSERS_PATH</key>
     <string>${PREFIX}/bin/ms-playwright</string>
+    <key>SSL_CERT_FILE</key>
+    <string>${PREFIX}/bin/_internal/certifi/cacert.pem</string>
+    <key>REQUESTS_CA_BUNDLE</key>
+    <string>${PREFIX}/bin/_internal/certifi/cacert.pem</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

@@ -268,12 +268,19 @@ class NodeTransport:
             pass
 
     async def _connect_once(self) -> None:
+        import ssl
+
+        import certifi
         import websockets
         from websockets.exceptions import ConnectionClosed
 
         self._connection("connecting")
         SLog.i(TAG, f"dial {self.nexus_url}")
-        async with websockets.connect(self.nexus_url, max_size=_MAX_FRAME_BYTES) as ws:
+        # Frozen macOS builds often lack a usable system CA store; pin certifi.
+        connect_kw: dict[str, Any] = {"max_size": _MAX_FRAME_BYTES}
+        if str(self.nexus_url or "").startswith("wss://"):
+            connect_kw["ssl"] = ssl.create_default_context(cafile=certifi.where())
+        async with websockets.connect(self.nexus_url, **connect_kw) as ws:
             self._ws = ws
             self._connection("registering", connected=True)
             # 顺序要紧：**先起接收循环，再 REGISTER**。
