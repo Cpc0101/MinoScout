@@ -83,7 +83,7 @@ def submit(node_id: str, task_id: str, tool_id: str, action: str):
     from mino_scout.plugins.install import acquire_plugin
     from mino_scout.plugins.components import install
     _validate_id(task_id)
-    if tool_id not in ('cli.feishu', 'cli.meego', 'langbot', 'chromium', 'adb.keyboard', 'appium') or action not in ('install', 'update'):
+    if tool_id not in ('cli.feishu', 'cli.meego', 'chromium', 'adb.keyboard', 'appium') or action not in ('install', 'update'):
         raise ValueError('unsupported_tool_action')
     profile = profile_id()
     if not profile:
@@ -97,7 +97,7 @@ def submit(node_id: str, task_id: str, tool_id: str, action: str):
             return old
         for (old_id,) in db.execute('SELECT task_id FROM tool_tasks WHERE active_tool IS NOT NULL').fetchall():
             _read(db, old_id)
-        kind, plugin_id = ('tool', tool_id) if tool_id in ('chromium', 'adb.keyboard', 'appium') else ('im', 'langbot') if tool_id == 'langbot' else ('cli', tool_id.split('.')[1])
+        kind, plugin_id = ('tool', tool_id) if tool_id in ('chromium', 'adb.keyboard', 'appium') else ('cli', tool_id.split('.')[1])
         lock = acquire_plugin(kind, plugin_id)
         body = dict(task_id=task_id, tool_id=tool_id, action=action, state='pending', active=True,
                     stage='pending', label='已排队，等待前一项安装结束', error='', created_at=time.time(), updated_at=time.time())

@@ -174,15 +174,6 @@ class NodeTransport:
             asyncio.run_coroutine_threadsafe(self._emit_plugin_progress(payload), loop)
 
         plugin_progress.set_progress_hook(_plugin_progress_hook)
-        from mino_scout.plugins import im_bridge
-        from mino_scout.plugins import wechat as wechat_plugin
-
-        def _im_hook(im: dict) -> None:
-            asyncio.run_coroutine_threadsafe(self._emit_im_message(im), loop)
-
-        im_bridge.set_hook(_im_hook)
-        wechat_plugin.bind_node(self.core.node_id)
-        # 社交插件只在 REGISTERED 的服务端归属校验完成后恢复。
         local_stopper = asyncio.create_task(self._local_stop_loop())
         try:
             backoff = _BACKOFF_START
@@ -426,21 +417,16 @@ class NodeTransport:
             note_plugin_access(self.core._plugins_ready, plugin_warning)
         except OSError as exc:
             SLog.w(TAG, f"插件状态写入失败: {type(exc).__name__}")
-        from mino_scout.plugins import wechat as wechat_plugin, langbot_host, feishu_messages
-        wechat_plugin.bind_node(self.core.node_id)
+        from mino_scout.plugins import feishu_messages
         if self.core._plugins_ready:
             from mino_scout.plugins.state import release_installed_import_blocks
 
             released = release_installed_import_blocks()
             if released:
                 SLog.i(TAG, f"已安装插件解除导入停用: {', '.join(released)}")
-            wechat_plugin.ensure_listener()
-            langbot_host.reconcile(self.core.node_id)
             feishu_messages.set_connection(True)
         else:
-            wechat_plugin.stop_listener()
             feishu_messages.set_connection(False)
-            langbot_host.shutdown()
         await self._send(P.MsgType.HEARTBEAT, await asyncio.to_thread(self.core.heartbeat))
         try:
             from mino_scout.tools.keep_alive.runtime_sidecar import write_runtime_sidecar

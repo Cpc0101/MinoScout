@@ -48,17 +48,27 @@ class WdaExecutor:
         return sorted(caps)
 
     def probe(self):
-        """设备连上就算可用。WDA 只影响页面动作，不影响装包/卸载/读版本。"""
-        from mino_scout.platform.ios.wda_session import WdaClient
+        """设备连上就算可用。WDA 只影响页面动作，不影响装包/卸载/读版本。
 
-        devices = list_attached_devices()
+        WDA 按设备探测：局域网走 CoreDevice 隧道，USB 走 iproxy，不再只认
+        全局 ``127.0.0.1:8100``。
+        """
+        from mino_scout.platform.ios.wda_reach import candidate_urls, probe_url
+        from mino_scout.platform.ios.wda_session import device_wda_ready
+
+        devices = [d for d in list_attached_devices() if str(d.get("state") or "") == "connected"]
         self._attached = bool(devices)
-        self._wda_ready = WdaClient("").reachable()
+        ready_names: list[str] = []
+        for row in devices:
+            # Cheap path first (tunnel / configured URL); fall back to iproxy bring-up.
+            if any(probe_url(url) for url in candidate_urls(row)) or device_wda_ready(row):
+                ready_names.append(str(row.get("name") or row.get("udid") or ""))
+        self._wda_ready = bool(ready_names)
         if self._attached:
-            return True, "" if self._wda_ready else "iOS 设备已连接，但 WDA 未监听；只能装包/卸载/读版本"
-        if self._wda_ready:
-            return True, "WDA 在监听，但 devicectl 没列出已连接设备"
-        return False, "没有连接的 iOS 设备，或本机 WDA 未监听"
+            if self._wda_ready:
+                return True, f"WDA 就绪：{', '.join(ready_names[:3])}"
+            return True, "iOS 设备已连接，但各设备 WDA 均未监听；只能装包/卸载/读版本"
+        return False, "没有可控的 iOS 设备（需 USB/局域网通路）"
 
     def supports(self, capability_id: str, low_level: dict[str, Any] | None = None) -> bool:
         del low_level

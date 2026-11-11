@@ -9,7 +9,7 @@
 | 通道 | 必需外部依赖 | 探测方式 | 探不到的后果 |
 |---|---|---|---|
 | `adb` | `adb` 在 PATH；设备开 USB 调试并已授权 | `adb -s <sn> shell echo ok` 含 `ok` | 该 Android 设备不可用（没有备用通道） |
-| `ios_wda` | usbmuxd；WDA 已装并可拉起；真机需签名 | 能建 WDA session | iOS 设备不可控 |
+| `ios_wda` | 设备已配对且有 USB/`localNetwork` 通路；WDA 已装并在手机上监听；真机需签名 | 该设备候选 WDA URL（隧道 / iproxy / 配置）能建 session | 该 iOS 设备不可做 UI；装包仍可用 |
 | `playwright` | `playwright install chromium` 已执行 | `playwright_hub` 能拉起 Chromium | Web 用例不可跑 |
 | `mac` / `win` | macOS/Windows 交互桌面 + Cua Driver 0.34.1 + 屏幕录制/辅助功能权限 | 原生 runtime `state=ready` | 该宿主不能跑 PC 用例 |
 
@@ -31,10 +31,14 @@ adb devices -l        # 应看到设备且状态为 device，不是 unauthorized
 
 | 项 | 要求 |
 |---|---|
-| 真机 | usbmuxd 可用；WDA 已用有效签名安装；设备已信任本机 |
+| 真机 | 设备已信任本机；WDA 已用有效签名安装并在手机上运行 |
+| USB | `iproxy`（libimobiledevice）可用；Scout 按设备分配本机端口转发到手机 `8100` |
+| 局域网 | CoreDevice `localNetwork` + 隧道 IPv6；Scout 直连 `http://[tunnelIP]:8100`，**不依赖 usbmux** |
+| 地址覆盖 | 环境变量 `MINO_WDA_URL_<hardware_udid>`，或 `config.json` 的 `wda_urls` 映射；全局 `MINO_WDA_URL` / `MINO_WDA_PORT` 仍可用 |
 | 模拟器 | `simctl` 可用；UDID 形态与真机不同，由 `ios_ids` 区分 |
 | Appium | 当前不走。WDA 直连是唯一实现；新增后端必须新加 executor，不在 `WdaExecutor` 里分叉（见 [ENGINES.md](ENGINES.md) §3） |
 | WDA 挂了 | Scout 发 `EXECUTE {capability_id: node.engine_crashed}`，下次 `get()` 重建 |
+| 自动拉起 | Scout **不**负责编译/签名/长期托管 XCTest；请用已签名 Runner 在 Xcode 或既有流程拉起后，由 Scout 经 USB 或局域网隧道接入 |
 
 `../WebDriverAgent` 是本地的 WDA 工程副本，可用于重新签名与安装。
 

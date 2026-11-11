@@ -104,9 +104,11 @@ def install(node_id, tool_id, action, lock):
     if tool_id == 'appium':
         from mino_scout.tools.update.channel_packages import install_appium
         return install_appium(action)
+    if tool_id == 'langbot':
+        raise ValueError('LangBot / IM 组件已移除')
     from mino_scout.plugins.install import install as install_plugin
     from mino_scout.plugins.state import installed
-    kind, plugin_id = ('im', 'langbot') if tool_id == 'langbot' else ('cli', tool_id.split('.')[1])
+    kind, plugin_id = 'cli', tool_id.split('.')[1]
     if action == 'install' and installed(kind, plugin_id):
         from mino_scout.plugins.state import release_import_block
 

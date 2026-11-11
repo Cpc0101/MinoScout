@@ -1162,12 +1162,17 @@ Nexus 侧不需要为不同平台选不同 id。
 
 ### 设备发现
 
-iOS 设备的连通性**逐台**判定，只看各自的 `connectionProperties.pairingState`；
-`tunnelState` 在设备空闲时本来就是 `disconnected`，不代表不可用。
-WDA 是否监听不影响设备在线判定，只影响该设备上报的 `provides`：
+iOS 设备的连通性**逐台**判定：`pairingState` 已配对，且当前有
+`connectionProperties.transportType`（`wired` / `localNetwork` 等）。
+仅配对、无 transport，或 `tunnelState=unavailable`，是 Xcode 历史名单，
+**不可控，不上报为在线**，避免假在线被派单。空闲时 `tunnelState=disconnected`
+很常见（命令下发时才建隧道），单独出现不代表离线。
+WDA HTTP **按设备**解析，不再只认全局 `127.0.0.1:8100`：配置覆盖 →
+CoreDevice `tunnelIPAddress`（局域网）→ USB `iproxy` 本机端口 → 全局默认。
+WDA 是否监听不影响设备在线判定，只影响该节点 `provides`：
 
-- 设备已连、WDA 未起 → `ios_wda.available=true`，`provides` 只含装包/卸载/读版本；
-- 设备已连、WDA 在起 → 额外含页面动作。
+- 设备已连、各设备 WDA 均未起 → `ios_wda.available=true`，`provides` 只含装包/卸载/读版本；
+- 至少一台已连设备的 WDA 可达 → 额外含页面动作；UI 下发时再按该 `sn` 选对应 URL。
 
 mac / win 同理：宿主在就可用，桌面未就绪时 `provides` 收窄到装包/卸载。
 

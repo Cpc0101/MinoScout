@@ -1,4 +1,4 @@
-"""用例脚本的文本模型。密钥、地址和模型名都在本节点，不向 Nexus 读取。"""
+"""用例脚本的文本 / 视觉模型。配置来自 ``~/.mino/config.toml``。"""
 from __future__ import annotations
 
 import json
@@ -6,16 +6,21 @@ from typing import Any
 from urllib import error, request
 
 
+def _provider():
+    from mino_scout.runtime.script_exec import ScriptAbort
+    from mino_scout.runtime.user_model_config import load_provider
+
+    try:
+        return load_provider()
+    except ValueError as exc:
+        raise ScriptAbort(str(exc) or "这台机器还没有配置模型（~/.mino/config.toml）", reason_code="model_unconfigured") from exc
+
+
 def complete(case, prompt: str, text: str = "", schema: dict | None = None) -> Any:
-    from mino_scout.plugins.state import plain_value, secret_value
     from mino_scout.runtime.script_exec import ScriptAbort
 
-    node_id = str(getattr(case.core, "node_id", "") or "")
-    base = plain_value("model", "llm", "base_url").rstrip("/")
-    model = plain_value("model", "llm", "model")
-    key = secret_value(node_id, "model", "llm", "api_key")
-    if not base or not model or not key:
-        raise ScriptAbort("这台节点还没有配置模型地址、模型名或密钥", reason_code="model_unconfigured")
+    cfg = _provider()
+    base, model, key = cfg["base_url"], cfg["model"], cfg["api_key"]
     url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
     user = str(prompt or "")
     extra = str(text or "")
@@ -59,18 +64,13 @@ def complete(case, prompt: str, text: str = "", schema: dict | None = None) -> A
 
 
 def see(case, prompt: str, *, verdict: str = "", index: int | None = None) -> str:
-    from mino_scout.plugins.state import plain_value, secret_value
     from mino_scout.runtime.script_exec import ScriptAbort
 
     shot = getattr(case, "_shot", None)
     if shot is None or not getattr(shot, "has_image", lambda: False)():
         raise ScriptAbort("没有可用截图，不能做视觉判断", reason_code="observation_missing")
-    node_id = str(getattr(case.core, "node_id", "") or "")
-    base = plain_value("model", "llm", "base_url").rstrip("/")
-    model = plain_value("model", "llm", "model")
-    key = secret_value(node_id, "model", "llm", "api_key")
-    if not base or not model or not key:
-        raise ScriptAbort("这台节点还没有配置模型地址、模型名或密钥", reason_code="model_unconfigured")
+    cfg = _provider()
+    base, model, key = cfg["base_url"], cfg["model"], cfg["api_key"]
     url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
     ask = str(prompt or "")[:4000]
     if index is not None:

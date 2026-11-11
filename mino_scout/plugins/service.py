@@ -41,25 +41,17 @@ def handle_node_plugin(core: Any, req: P.Execute, cmd: str, event: Any, started:
     SLog.i(TAG, f"{cmd} {kind}/{plugin_id} node={core.node_id}")
     try:
         if cmd == "plugin_config":
+            if kind in ("im", "model") or plugin_id in ("wechat", "langbot", "llm"):
+                raise ValueError("模型配置请写 ~/.mino/config.toml")
             values = params.get("values") if isinstance(params.get("values"), dict) else {}
             clear = [str(x) for x in (params.get("clear") or []) if str(x).strip()]
-            hold = params.get("im_hold", values.get("im_hold"))
-            platform = str(params.get("platform") or values.get("platform") or "")
             values = {k: v for k, v in values.items() if k not in ("im_hold", "platform")}
             apply_config(core.node_id, kind, plugin_id, values, clear)
-            if hold is not None:
-                _apply_hold(kind, plugin_id, hold, platform)
-            elif kind == "im" and plugin_id == "langbot":
-                from mino_scout.plugins import langbot_host
-
-                langbot_host.reconcile(core.node_id)
             summary = "已保存" if configured(core.node_id, kind, plugin_id) else "已保存，还有必填项空着"
         elif cmd == "plugin_install":
+            if kind in ("im", "model") or plugin_id in ("wechat", "langbot", "llm"):
+                raise ValueError("微信 / IM / LangBot 安装已移除")
             summary = install(core.node_id, kind, plugin_id)
-            if kind == "im" and plugin_id == "langbot":
-                from mino_scout.plugins import langbot_host
-
-                langbot_host.reconcile(core.node_id)
         elif cmd == "plugin_remove":
             summary = remove(core.node_id, kind, plugin_id)
         else:
@@ -98,11 +90,10 @@ def handle_plugin_cap(core: Any, req: P.Execute, cap: str) -> EventResult:
         return _fail(_event(req), now_iso(), "这个入口不能提交 script_run", cap)
     if not getattr(core, "_plugins_ready", False):
         return _blocked_plugin(core, _event(req), now_iso())
-    from mino_scout.plugins import wechat as wechat_plugin
-
-    wechat_plugin.bind_node(core.node_id)
     event = _event(req)
     started = now_iso()
+    if cap.startswith("plugin.im.") or cap in ("plugin.bot.wechat",):
+        return _fail(event, started, "微信与 IM 对话能力已移除", cap)
     if cap == "plugin.gmail.fetch_otp":
         try:
             result = _gmail(core, req, event, started)
@@ -131,21 +122,10 @@ def handle_plugin_cap(core: Any, req: P.Execute, cap: str) -> EventResult:
             from mino_scout.plugins.calls import bot_send
 
             params = dict(req.params or {})
-            data = bot_send(core.node_id, str(params.get("kind") or ""), str(params.get("text") or ""))
-        elif cap == "plugin.bot.wechat":
-            data = _wechat(core, req)
-        elif cap == "plugin.im.send":
-            return _im_result(event, started, cap, _im_send(req, core.node_id))
-        elif cap == "plugin.im.stream":
-            data = _im_stream(req, core.node_id)
-        elif cap == "plugin.im.attachment":
-            return _im_result(event, started, cap, _im_attachment(req))
-        elif cap == "plugin.im.ack":
-            return _im_result(event, started, cap, _im_ack(req))
-        elif cap == "plugin.im.history":
-            return _im_result(event, started, cap, _im_history(req))
-        elif cap == "plugin.im.upload_image":
-            return _im_result(event, started, cap, _im_upload_image(req))
+            kind = str(params.get("kind") or "")
+            if kind == "wechat":
+                raise ValueError("微信能力已移除")
+            data = bot_send(core.node_id, kind, str(params.get("text") or ""))
         else:
             return _fail(event, started, f"这台节点还没有能力 {cap}", cap)
     except Exception as exc:

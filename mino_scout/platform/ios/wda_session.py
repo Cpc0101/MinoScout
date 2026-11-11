@@ -1,6 +1,7 @@
 """WDA HTTP 会话。iOS 不走 adb，也不使用 Appium 客户端库。
 
-本机 WDA 地址、签名团队和 Runner bundle 来自环境，不写死某台设备。
+每台设备单独解析 WDA 地址：配置覆盖 → CoreDevice 隧道（局域网）→ USB iproxy。
+签名团队和 Runner bundle 仍来自环境，不写死某台设备。
 """
 from __future__ import annotations
 
@@ -8,10 +9,17 @@ import base64
 import json
 import os
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from typing import Any
 
+from mino_scout.platform.ios.wda_reach import (
+    candidate_urls,
+    default_wda_url,
+    probe_url,
+    resolve_wda_url,
+)
 from mino_scout.tools.keep_alive.log import SLog
 
 TAG = "Wda"
@@ -22,7 +30,7 @@ class WdaError(RuntimeError):
 
 
 def wda_base_url() -> str:
-    return str(os.environ.get("MINO_WDA_URL") or "http://127.0.0.1:8100").rstrip("/")
+    return default_wda_url()
 
 
 def _signing_capabilities() -> dict[str, Any]:
@@ -191,56 +199,182 @@ class WdaClient:
 
 
 _CLIENTS: dict[str, WdaClient] = {}
+_LINKS: dict[str, dict[str, Any]] = {}
+_TUNNEL_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_TUNNEL_TTL_SEC = 20.0
 
 
 def client_for(udid: str) -> WdaClient:
+    """Return a WDA client bound to a **reachable** per-device URL."""
     key = str(udid or "").strip()
+    if not key:
+        raise WdaError("iOS 设备缺少 udid")
+    link = describe_device(key) or _LINKS.get(key) or {"udid": key, "hardware_udid": key}
+    try:
+        base = resolve_wda_url(link, start_forward=True)
+    except Exception as exc:
+        raise WdaError(str(exc)) from exc
     client = _CLIENTS.get(key)
-    if client is None:
-        client = WdaClient(key)
+    if client is None or client.base != base:
+        client = WdaClient(key, base_url=base)
         _CLIENTS[key] = client
+    _LINKS[key] = dict(link)
     return client
 
 
+def device_wda_ready(link: dict[str, Any]) -> bool:
+    """True if any candidate URL for this device answers /status."""
+    try:
+        if resolve_wda_url(link, start_forward=True):
+            return True
+    except Exception:
+        pass
+    return any(probe_url(url) for url in candidate_urls(link))
+
+
 _ATTACHED = frozenset({"connected", "available", "paired"})
+# 有实际通路才可控。仅配对、无 transport 的是 Xcode 历史名单，装包/驱动都会失败。
+_LIVE_TRANSPORT = frozenset({"wired", "localnetwork", "usb"})
 
 
-def list_attached_devices() -> list[dict[str, str]]:
-    """用 devicectl 列出 iOS 设备，**逐台**判定连通性。
+def list_attached_devices() -> list[dict[str, Any]]:
+    """用 devicectl 列出 iOS 设备，**逐台**判定能不能被本机驱动。
 
-    上游版本把「本机 WDA 是否监听」当成所有设备的共同状态，于是 WDA 没起来时
-    所有设备一起变 disconnected；装包/卸载根本不经过 WDA，不该被它连坐。
-    这里只看每台设备自己的 `connectionProperties`。
+    装包/卸载不经过 WDA，所以不把「本机 WDA 是否监听」当成所有设备的共同状态。
+    但「已配对」也不等于可控：没有 `transportType`、或 `tunnelState=unavailable`
+    的条目只是历史配对残留，会上报成假在线、下发必挂。
     """
     rows = _devicectl_devices()
-    out: list[dict[str, str]] = []
+    out: list[dict[str, Any]] = []
     for row in rows:
-        udid = str(row.get("identifier") or "").strip()
-        if not udid:
+        item = _row_to_link(row)
+        if not item:
             continue
-        props = row.get("deviceProperties") if isinstance(row.get("deviceProperties"), dict) else {}
-        hardware = row.get("hardwareProperties") if isinstance(row.get("hardwareProperties"), dict) else {}
-        conn = row.get("connectionProperties") if isinstance(row.get("connectionProperties"), dict) else {}
-        out.append({
-            "udid": udid,
-            "name": str(props.get("name") or hardware.get("marketingName") or ""),
-            "state": _device_state(conn),
-            "os_version": str(props.get("osVersionNumber") or ""),
-            "developer_mode": str(props.get("developerModeStatus") or ""),
-            "transport": str(conn.get("transportType") or ""),
-            "pairing": str(conn.get("pairingState") or ""),
-        })
+        if item.get("state") == "connected":
+            item = _enrich_tunnel(item)
+        out.append(item)
+        _LINKS[str(item["udid"])] = item
+        hw = str(item.get("hardware_udid") or "").strip()
+        if hw:
+            _LINKS[hw] = item
     return out
 
 
-def _device_state(conn: dict[str, Any]) -> str:
-    """能不能被 devicectl 驱动，只看配对状态。
+def _enrich_tunnel(link: dict[str, Any]) -> dict[str, Any]:
+    """``list devices`` often omits tunnelIP until the CoreDevice tunnel is up.
 
-    `tunnelState` 在设备空闲时本来就是 disconnected —— devicectl 执行命令时才建立
-    隧道。把它当成连通性会得到「刚看一眼是断开、用之前又变连上」的假象。
+    Pull ``device info details`` for connected phones so LAN WDA can use
+    ``http://[tunnelIP]:8100`` without usbmux.
+    """
+    if str(link.get("tunnel_ip") or "").strip():
+        return link
+    udid = str(link.get("udid") or "").strip()
+    if not udid:
+        return link
+    cached = _TUNNEL_CACHE.get(udid)
+    now = time.monotonic()
+    if cached and now - cached[0] < _TUNNEL_TTL_SEC:
+        merged = dict(link)
+        merged.update(cached[1])
+        return merged
+    try:
+        proc = subprocess.run(
+            ["xcrun", "devicectl", "device", "info", "details", "--device", udid, "--json-output", "-"],
+            capture_output=True, text=True, timeout=12,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        SLog.w(TAG, f"details {udid} 失败: {exc}")
+        return link
+    if proc.returncode != 0:
+        return link
+    try:
+        payload = json.loads(proc.stdout[proc.stdout.find("{"):] if proc.stdout else "{}")
+    except json.JSONDecodeError:
+        return link
+    result = payload.get("result") if isinstance(payload, dict) else {}
+    if not isinstance(result, dict):
+        return link
+    # details result *is* the device object
+    enriched = _row_to_link(result)
+    if not enriched:
+        return link
+    patch = {
+        key: enriched[key]
+        for key in ("tunnel_ip", "tunnel_state", "transport", "hardware_udid", "hostnames", "os_version")
+        if enriched.get(key)
+    }
+    _TUNNEL_CACHE[udid] = (now, patch)
+    merged = dict(link)
+    merged.update(patch)
+    return merged
+
+
+def describe_device(udid: str) -> dict[str, Any] | None:
+    """Fresh link info for one udid (core id or hardware udid)."""
+    wanted = str(udid or "").strip().lower()
+    if not wanted:
+        return None
+    for row in list_attached_devices():
+        if str(row.get("udid") or "").lower() == wanted:
+            return row
+        if str(row.get("hardware_udid") or "").lower() == wanted:
+            return row
+    cached = _LINKS.get(str(udid or "").strip())
+    return dict(cached) if cached else None
+
+
+def _row_to_link(row: dict[str, Any]) -> dict[str, Any] | None:
+    udid = str(row.get("identifier") or "").strip()
+    if not udid:
+        return None
+    props = row.get("deviceProperties") if isinstance(row.get("deviceProperties"), dict) else {}
+    hardware = row.get("hardwareProperties") if isinstance(row.get("hardwareProperties"), dict) else {}
+    conn = row.get("connectionProperties") if isinstance(row.get("connectionProperties"), dict) else {}
+    hostnames: list[str] = []
+    for key in ("localHostnames", "potentialHostnames"):
+        raw = conn.get(key)
+        if isinstance(raw, list):
+            hostnames.extend(str(item).strip() for item in raw if str(item).strip())
+    seen: set[str] = set()
+    hosts: list[str] = []
+    for host in hostnames:
+        if host not in seen:
+            seen.add(host)
+            hosts.append(host)
+    return {
+        "udid": udid,
+        "core_id": udid,
+        "hardware_udid": str(hardware.get("udid") or "").strip(),
+        "name": str(props.get("name") or hardware.get("marketingName") or ""),
+        "state": _device_state(conn),
+        "os_version": str(props.get("osVersionNumber") or ""),
+        "developer_mode": str(props.get("developerModeStatus") or ""),
+        "transport": str(conn.get("transportType") or ""),
+        "pairing": str(conn.get("pairingState") or ""),
+        "tunnel_ip": str(conn.get("tunnelIPAddress") or "").strip(),
+        "tunnel_state": str(conn.get("tunnelState") or "").strip(),
+        "hostnames": hosts,
+    }
+
+
+def _device_state(conn: dict[str, Any]) -> str:
+    """能不能被 devicectl 驱动。
+
+    - 必须已配对；
+    - 必须有当前通路（`transportType`：wired / localNetwork / …）；
+    - `tunnelState=unavailable` 表示 CoreDevice 已找不到这台机，不可控；
+    - 空闲时 `tunnelState=disconnected` 很常见（命令下发时才建隧道），不算离线。
     """
     paired = str(conn.get("pairingState") or "").strip().lower()
-    return "connected" if paired in _ATTACHED or paired == "paired" else "disconnected"
+    if paired not in _ATTACHED:
+        return "disconnected"
+    transport = str(conn.get("transportType") or "").strip().lower()
+    if transport not in _LIVE_TRANSPORT:
+        return "disconnected"
+    tunnel = str(conn.get("tunnelState") or "").strip().lower()
+    if tunnel == "unavailable":
+        return "disconnected"
+    return "connected"
 
 
 def _devicectl_devices() -> list[dict[str, Any]]:

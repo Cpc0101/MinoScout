@@ -1308,9 +1308,12 @@ def _discover_devices(executors: dict[str, Executor], *, scout_id: str) -> list[
         from mino_scout.platform.ios.wda_session import list_attached_devices
 
         for row in list_attached_devices():
+            # 只上报当前可控的 iOS；历史配对残留不进设备表，避免假在线被派单。
+            if str(row.get("state") or "") != "connected":
+                continue
             out.append(P.DeviceManifest(
                 sn=row["udid"], platform="ios", model=row.get("name") or "",
-                channels={"ios": row.get("state") or "disconnected"},
+                channels={"ios": "connected"},
             ))
     if "playwright" in executors:
         from mino_scout.platform.web.playwright_hub import PROBE_OK_STATE, probe_playwright, web_slot_sn

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import shutil
 import sys
 from pathlib import Path
@@ -16,7 +15,6 @@ def snapshot(core):
     from mino_scout.tools.update.app_version import runtime_version_facts
     from mino_scout.platform.android.adb_ime import resolve_local_apk
     from mino_scout.tools.update.install_plan import runtime_chromium_revision
-    from mino_scout.plugins import langbot_host
     ready = bool(getattr(core, '_plugins_ready', False))
     versions = runtime_version_facts()
     source = versions['runtime_environment'] == 'development'
@@ -59,29 +57,13 @@ def snapshot(core):
         items.append(dict(tool_id=f'cli.{plugin_id}', label=label, purpose='飞书工作项与消息接入' if plugin_id == 'feishu' else '工作项接入', state='installed' if present else 'missing' if ready else 'unknown',
                           version=version, configured=config, installable=ready and not present, updatable=ready and bool(present), config_key=f'cli:{plugin_id}',
                           detail='安装与升级保留配置和授权；消息接入及工作项功能在配置页管理。'))
-    present = langbot_host.is_installed() if ready else None
-    langbot_version = None
-    if present:
-        try:
-            langbot_version = (langbot_host.root() / '.installed').read_text().strip().removeprefix('langbot=') or None
-        except OSError:
-            pass
-    python_ok = False
-    if ready:
-        try:
-            python_ok = subprocess.run([langbot_host._base_python(), '-c', 'import sys; sys.exit(0 if (3,11)<=sys.version_info[:2]<(4,0) else 1)'], capture_output=True, timeout=3).returncode == 0
-        except (OSError, RuntimeError, subprocess.TimeoutExpired):
-            pass
     from mino_scout.tools.update.channel_packages import appium_item
     items.append(appium_item(ready))
-    items.append(dict(tool_id='langbot', label='LangBot', purpose='飞书、钉钉、企业微信共用对话宿主', state='installed' if present else 'unknown' if not ready else 'missing' if python_ok else 'missing_python',
-                      installable=ready and python_ok and not present, updatable=ready and python_ok and bool(present), version=langbot_version, config_key='im:langbot:lark',
-                      detail='安装一个共享宿主，飞书、钉钉、企业微信渠道分别配置。使用独立环境，不升级系统 Python。' if python_ok or not ready else '缺少可用的系统 Python 3.11+；请手动准备 Python。'))
     from mino_scout.plugins.state import _item
     for tool in items:
         key = tool['tool_id']
-        if key in ('cli.feishu', 'cli.meego', 'langbot'):
-            kind, pid = ('im', 'langbot') if key == 'langbot' else ('cli', key.split('.')[1])
+        if key in ('cli.feishu', 'cli.meego'):
+            kind, pid = 'cli', key.split('.')[1]
             tool.update(plugin_class=kind, plugin_id=pid, removable=ready and installed(kind, pid), configured=configured(core.node_id, kind, pid) if ready else None)
             tool['required_by_config'] = bool(_item(kind, pid).get('import_blocked'))
     return dict(version=2, items=items)
