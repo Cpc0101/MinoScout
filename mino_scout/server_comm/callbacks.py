@@ -73,28 +73,27 @@ def _gmail_code(case, policy=None) -> str:
 
 
 def otp(case, account=None) -> str:
-    """按这个账号生效的登录策略取验证码：账号自带码 → 固定码 → Gmail 收信。"""
+    """取验证码：账号自带码 → 脚本仓 config.yaml 的 otp.code → 否则停下来问人。
+
+    固定码写在脚本仓（按 app / env 的 otp.code）；不写就表示没有固定码，需要人工提供。
+    取码策略不再依赖 Nexus 账号上的 login_policy。
+    """
     from mino_scout.runtime.script_exec import ScriptAbort
 
     case._guard()
     code = str(getattr(account, "otp", "") or "").strip()
     if code:
         return code
-    policy = dict(getattr(account, "otp_policy", None) or {})
-    mode = str(policy.get("otp_mode") or "auto").strip().lower()
-    fixed = str(policy.get("otp_fixed") or "").strip()
-    if fixed and mode in {"fixed", "auto"}:
+    fixed = ""
+    getter = getattr(case, "repo_otp_code", None)
+    if callable(getter):
+        fixed = str(getter() or "").strip()
+    if fixed:
         return fixed
-    if mode == "hitl":
-        raise ScriptAbort("这条用例的验证码策略是人工提供（hitl），脚本无法自动取码", reason_code="otp_requires_human")
-    if mode == "fixed":
-        raise ScriptAbort("登录策略是固定验证码，但没有配置 fixed", reason_code="otp_policy_invalid")
-    if mode in {"gmail", "auto"}:
-        email = str(getattr(account, "email", "") or "")
-        if not email and not policy:
-            raise ScriptAbort("这个账号没有验证码来源：没有固定码也没有邮箱", reason_code="otp_channel_missing")
-        return _gmail_code(case, policy)
-    raise ScriptAbort(f"不认识的验证码策略：{mode}", reason_code="otp_policy_invalid")
+    raise ScriptAbort(
+        "config.yaml 没有 otp.code，也没有账号自带验证码：请向人要本次验证码，或把测试用固定码写进对应应用/环境的 otp.code",
+        reason_code="otp_requires_human",
+    )
 
 
 def otp_mail(case) -> str:

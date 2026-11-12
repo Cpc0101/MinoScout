@@ -178,9 +178,8 @@ Scout 重装保留 `scout_id` 和已有长期 token，先以 `pending_install_to
 
 `host` 可省略。旧 Scout 不带时，列表功耗格显示「—」。`mode` 为 `running` 或 `asleep`。`power_source` 为 `ac` / `battery`。`charging` 为 `charging` / `not charging` / `charged` / `discharging`。`inhibit` 表示睡眠抑制还在（macOS 上即 `caffeinate` 还活着）。`children` 只数本进程的子进程。
 
-`plugins` 可省略。省略表示这台 Scout 还不认识插件状态，网页显示「需更新后才能配置插件」。每项必有 `class` / `id` / `installed` / `configured`。非密钥明文放在 `values`（如 Gmail `inbox_address`），已写入保险库的字段名放在 `saved_secrets`。密钥值不上报。`class` 为 `cli` / `mcp` / `bot` / `mail` / `im`。`REGISTER` 使用同一份列表。
+`plugins` 可省略。省略表示这台 Scout 还不认识插件状态，网页显示「需更新后才能配置插件」。每项必有 `class` / `id` / `installed` / `configured`。非密钥明文放在 `values`（如 Gmail `inbox_address`），已写入保险库的字段名放在 `saved_secrets`。密钥值不上报。`class` 为 `cli` / `mcp` / `bot` / `mail`。`REGISTER` 使用同一份列表。
 
-LangBot（`class=im,id=langbot`）的 `status` 描述进程，`platforms[平台]` 描述渠道，各含 `enabled/holding/connected/error/last_message_at`。新增可选的 `connection_verified: bool` 和 `connection_source: recent_message|unconfirmed`：`connected` 保留旧客户端的进程与配置判定，只有 `connection_verified=true` 才能展示真实连接；字段缺失或 false 时显示「待确认」，不能仅凭配置、安装或进程推断在线。当前确认来源为本次进程启动后 120 秒内收到的真实渠道消息，超期重新待确认；不能提供适配器持续连接保证。Nexus 原样保留这些字段，再统一输出规范化 `im_channels`。微信与普通通知机器人不混算。此为可选字段扩展，不新增消息类型。
 
 `runtime_capabilities` 可省略。省略表示这台正在运行的进程没有上报输入契约，Nexus 不凭版本号猜测它是否支持当前焦点输入。列表只含执行器实际实现的组合：`id`、`executor`、`platform`、`contract_version`、`supported_combinations`（`target_mode` + `write_modes`）。`REGISTER` 与 `HEARTBEAT` 使用同一份列表；心跳带上它，重启后的新进程才会被当成支持新契约。
 
@@ -255,11 +254,6 @@ LangBot（`class=im,id=langbot`）的 `status` 描述进程，`platforms[平台]
 | `plugin.cli.feishu` | N→S | 用这台节点的飞书应用凭证读文档。参数是 `action=read_doc` 和 `url`，没有 `app_secret`。另支持 auth_start/auth_status/auth_cancel：由节点运行官方 CLI config init --new 及 auth login --recommend，返回 state/summary/authorization_url（仅官方 HTTPS 授权页）；凭据不出节点。start 复用进行中的授权，status 不创建应用，cancel 仅停止当前授权子进程。重启返回 interrupted；继续时复用已保存应用。扫码授权和手动应用凭据均可读取文档 |
 | `plugin.cli.meego` | N→S | 用这台节点的 Meego 插件凭证换票或查工作项。参数没有 `plugin_secret` |
 | `plugin.bot.send` | N→S | 飞书机器人或企业微信 webhook 发文本。`kind` 为 `feishu_bot` / `wecom`，没有 webhook |
-| `plugin.bot.wechat` | N→S | 这台机器上的微信扫码、状态、发送。回执没有 `bot_token` |
-| `node.plugin_wechat_message` | S→N | **旧事件，仅为兼容旧版 Scout 保留**，新版 Scout 发 `node.plugin_im_message`。微信收到一条文本。Nexus 生成回复后再发 `plugin.bot.wechat`。不在日志里写正文 |
-| `node.plugin_im_message` | S→N | IM 收到一条消息（微信 iLink、LangBot 渠道）。`params.im` 为统一形状：`channel` / `instance_id`（实际机器人实例，必须与节点快照一致） / `tenant` / `chat_id` / `chat_type`(`private`\|`group`) / `sender_id` / `msg_id` / `text`(≤2000) / `mentioned` / `reply_ctx`(不透明的字符串字典，原样回传) / `recent_turns`(本会话最近至多 8 轮 `{role,text,ts,instance_id,tenant,sender_id}`，每条 ≤500 字，由 Scout 本地库取出)。Nexus 不落正文，不在日志里写正文。身份按 channel + instance_id + tenant + sender_id 精确绑定，并校验节点 owner 与持有权；绑定码只属于该 owner，一次性消费。缺实例或消息 ID 的旧回调不执行；收到消息先原子去重，群聊不能借用其他发送者身份。历史按 owner + 实例 + 租户 + 实际发送者隔离；Nexus 只接受当前绑定确认之后的历史，不把旧绑定或群内其他成员的正文作为上下文。每次模型调用、工具执行及回复前复核绑定代次，解绑或重新绑定使旧请求失效 |
-| `plugin.im.send` | N→S | 经该节点向某个会话发一条消息。`channel` / `chat_id` / `sender_id` / `reply_ctx` / `text`。Scout 把发出的正文写入本地库。回执 `data.ok` |
-| `plugin.im.history` | N→S | 读这台节点本地库里某个会话的正文。`channel` / `chat_id` / `sender_id` / `reply_ctx`（instance_id、tenant） / `after_ts`（当前绑定时间） / `limit`(≤100)。回执 `data.messages=[{role,text,ts,instance_id,tenant,sender_id}]`。正文只经这个能力现取，Nexus 不缓存 |
 | `tap_element` 等 | N→S | 仍走 executor；Nexus 给该 sn 的 `executor_order`，Scout 按 sn 执行 |
 
 `node.stop` / `node.restart`：Scout core 在 RESULT 的内部 extra 里打标记，transport 回完 RESULT 后再 shutdown。**不能靠 `node.stop` 或 `node.wake` 启动一台已经离线的专机。** `node.sleep` 不打退出标记。
@@ -592,26 +586,6 @@ OBSERVE 的 screenshot 与 RESULT 的执行诊断通过 capture_id、session_gen
 - 前台状态读取使用 Cua list_apps.active，仅作为真实全局前台诊断；窗口准备只确认进程与窗口绑定，不消费 bring_to_front 的激活回执，不以全局前台归属作为截图准入条件。Nexus 的全局前台自动恢复不用于 Desktop。launch 成功元数据为 stage=window_ready、window_verified=true、foreground_source=not_required、activated=false、foreground_verified=false；这些前台字段表示未请求或验证持续激活。截图必须取得 SDK 的有效窗口捕获；点击与输入仍由 Cua foreground 模式在动作时处理投递准入，不能由 launch 成功推定动作成功。健康、权限和会话诊断使用 health_report，不读取项目自研平台探针。generation 跟随 Scout 生命周期及 Cua readiness 状态变化；窗口与捕获是否仍可动作由 SDK 最终校验。
 - tool/call 在窗口准备派发前写入；tool/result.desktop 保留窗口 target/capture_scope、捕获身份和安全动作证据，observe/screen 保留 pid/window_id、图像尺寸及缩放信息，便于核对是否确实为指定窗口。
 
-### IM 消息信封与投递增量
-
-`EXECUTE.params` 保持可扩展对象。`node.plugin_im_message` 的 `params.im` 采用两仓相同的 `ImEnvelope`：channel、instance_id、tenant、chat_id、chat_type、sender_id、msg_id，加上可选 text、mentioned、event_type、reply_to、thread_id、target_message_id、revision、delivery_key、received_at、reply_ctx、recent_turns、capabilities、attachments、callback。未上报能力的旧发送端按纯文本处理。
-
-- `reply_to` 是平台实际引用的消息标识，需经本地映射定位业务对象；`target_message_id` 明确编辑/撤回的来源。不可取消另一个最新请求，也不能从引用文本猜 request_id。
-- `reply_ctx.source_message_id` 保存已验证原消息。飞书线程回复接口使用 `om_` 消息编号，不把 `omt_` 线程号当消息编号。历史正文还需匹配 instance/tenant/sender/thread 和本次绑定起点。
-- 附件在 Scout 下载并限流、限大小、校验 MIME/签名，入站只带本地 ref、种类、大小与 MIME。`plugin.im.attachment` 按已验证账号、实例与发送者取回；Nexus 不从正文下载任意 URL。飞书私有媒体使用当前节点机器人权限，凭据不传 Nexus。微信加密 CDN/Silk 仍未完整接入，明确提示重发文字，不声明正向语音验收通过。
-- `plugin.im.ack` 是业务处理完成或已经确定未知状态后的确认。WebSocket RESULT 只是传输受理，不能清除持久 Inbox；节点重连补发同 delivery_key，Nexus 依原收件回执去重。
-- `plugin.im.send` 接受稳定 delivery_id 和渠道无关 card。Scout 先记 sending，成功后 done；sending/uncertain 不自动换投递键重发。正文与完整卡片保留在 Scout 本地 outbox，Nexus 持久化引用和结构化业务状态。按渠道限制完整分段，当前单段最多 1800 字符。
-- `plugin.im.stream` 接受 stream_id、sequence、complete、text 与可选 card。同一 stream_id 首次创建一条消息，后续 PATCH 原消息；旧序号不覆盖新内容。首次创建结果未知时禁止换序号重复创建，恢复优先使用原 outbox 回执。草稿标注“尚未执行”，工具参数不发送，最后更新为三类型正式卡片。
-- 已验证当前飞书机器人身份后，内置适配器有原生卡片、线程与消息更新代码；真实平台显示/回执尚待部署联调。配置更新或停用使能力验证缓存失效。原生按钮回调适配尚未接入，buttons=false，使用编号/名称续接；其他入口保守声明文本降级。
-
-新增/更新 golden：`execute_node_plugin_im_lark.json`、`execute_node_plugin_im_message.json`、`execute_node_plugin_im_stream.json`。两仓 30 份 fixture 原始字节一致，编码后的默认可选字段允许补齐；全部标准化 round-trip 一致，三份 IM fixture 严格 round-trip 通过。
-
-| IM fixture | SHA-256 |
-| --- | --- |
-| `execute_node_plugin_im_lark.json` | `15f6eece7836c168ff60c72e2c0bbc4aae7881744b82adb2614a41ad994eb78e` |
-| `execute_node_plugin_im_message.json` | `d6623b7c559ae2680a02a3dcf87133cb32a044bf8ade02da8464c4a04edd6aed` |
-| `execute_node_plugin_im_stream.json` | `cd7494afcd545220478c2d1a667fe09cd9e325a460d99f254af5d1f59beea131` |
-
 
 ## 10. Web 写安全与证据
 
@@ -652,7 +626,7 @@ Nexus 将 Evidence、verification/verdict、session_meta、计数在一个 SQLit
 
 Nexus 的 `NodeConnection.request` 在序列化 EXECUTE 前统一补齐未编号辅助请求；插件调用在建立载荷时使用同一 helper，RouterProxy 取证、插件和结束通知使用同一负编号分配器。重复发送同一载荷不重新编号；传入的正编号、任务归属、focus_ref 与动作证据引用不变。严格 Web 缺 run_id 必须拒绝，不能补伪造任务。
 
-辅助取证的新请求使用独立编号，不靠复用 `-1` 绕过完整内容比对。Scout 现有 `read_web_target_facts/screenshot/probe` 在同内容完成后的只读刷新规则不变；新增观察的身份与重取的身份必须分清。微信/其他 IM 的发送、确认、流更新、历史查询和持有权配置也经过相同发送闸门；保留业务 delivery_id 和入站 receipt 去重，不能为消除冲突关闭 Scout RequestGuard。
+辅助取证的新请求使用独立编号，不靠复用 `-1` 绕过完整内容比对。Scout 现有 `read_web_target_facts/screenshot/probe` 在同内容完成后的只读刷新规则不变；新增观察的身份与重取的身份必须分清。不能为消除冲突关闭 Scout RequestGuard。
 
 
 ## DOM 优先观察
@@ -974,8 +948,8 @@ REGISTER / HEARTBEAT 可选 `tool_tasks_version: 1` 声明下载中心合同；�
 
 框架 EXECUTE 新增三个短命令（run_id 空、step_idx<0）：
 
-- `node.tools`：只读，RESULT.extra.tools = {version:1, items:[...]}。六项固定为 scout.core、chromium、adb.keyboard、cli.feishu、cli.meego、langbot。state 可为 installed/matched/missing/cached/missing_python/unknown；配置取既有插件状态，不表示连通。缺事实用 unknown。
-- `node.tool_task_submit`：params={task_id,tool_id,action:"install"}。支持 cli.feishu/cli.meego/langbot（映射 class=im,id=langbot）；RESULT.extra.task 为已落盘任务。相同 task_id 与参数返回原任务，不重复执行；不同参数拒绝。受理不表示安装完成。
+- `node.tools`：只读，RESULT.extra.tools = {version:1, items:[...]}。五项固定为 scout.core、chromium、adb.keyboard、cli.feishu、cli.meego。state 可为 installed/matched/missing/cached/missing_python/unknown；配置取既有插件状态，不表示连通。缺事实用 unknown。
+- `node.tool_task_submit`：params={task_id,tool_id,action:"install"}。支持 cli.feishu/cli.meego；RESULT.extra.task 为已落盘任务。相同 task_id 与参数返回原任务，不重复执行；不同参数拒绝。受理不表示安装完成。
 - `node.tool_task_get`：params={task_id}。RESULT.extra.task 为原任务或 null（明确不存在）。断线/超时不是 null。只查询当前 Nexus origin + owner 命名空间。
 
 任务含 task_id、tool_id、action、state、active、created_at、updated_at 及可选 stage/label/error/percent/bytes_received/bytes_total。state 为 pending/running/succeeded/failed/interrupted（Nexus 可投影 unknown）。进程重启后的非终态标 interrupted，不自动重装。进度事件 `node.plugin_progress.params.progress` 可选 task_id；旧事件缺失时仍展示旧安装进度，不映射为新任务。100% 或 active=false 不是成功证明，最终状态来自任务回执。字节总量未知时不显示百分比。
@@ -984,55 +958,35 @@ Nexus HTTP：GET /runtime/nodes/{node_id}/tools；POST .../tool-tasks（operatio
 
 Nexus 先提交 pending 再发送；丢失应答保持 unknown，仅查询原 task_id。只有显式重复提交同一 operation_id、Scout 明确返回任务不存在且认证 owner、节点及 Scout 进程身份仍匹配才重发同一 task_id。前端不自动重试 POST。活动任务按约2秒查询，闲时约15秒；离线返回本账号已落盘且标过期的快照。node_tool_tasks 为任务投影，不是安装结果真源。nodes.extra.tool_snapshot 保存 owner、reported_at 与只读组件事实，禁止携带密钥。
 
-核心自动升级/回退保持拒绝；Chromium 启动准备、ADB Keyboard 保持只读。LangBot 复用既有独立 venv 安装器，进入相同异步任务与插件互斥；缺少 Python 3.11+ 时不可安装。管理员没有其他账号节点的执行权。账号绑定不继承其他 origin/owner 的插件和任务，当前绑定函数继续拒绝跨身份重绑。
+核心自动升级/回退保持拒绝；Chromium 启动准备、ADB Keyboard 保持只读。管理员没有其他账号节点的执行权。账号绑定不继承其他 origin/owner 的插件和任务，当前绑定函数继续拒绝跨身份重绑。
 
 
-### 扫码本人关联
+### 飞书 CLI
 
-微信 iLink 使用扫码确认响应中的 ilink_user_id，经 Scout status.account_id 上报；飞书 CLI 使用验证过的授权用户身份。Nexus 仅在私聊、当前节点归属与实例/持有权有效、实际发送者与登录身份一致时关联节点主人，不覆盖既有其他归属。微信断开连接时不自动关联；其他发送者仍走绑定码。Meego 是工作项工具，凭据验证后直接调用，不增加聊天接收或助手绑定步骤。应用密钥/Webhook 不代表消息发送者身份，不适用本人免绑定。
+飞书 CLI 仅保留文档读取与官方授权（`check` / `read_doc` / `auth_*`）。私聊接收、`messages_*` 与对话附件上传已移除；Meego 仍是工作项工具，不增加聊天接收步骤。
 
-### 飞书 CLI 私聊
-
-- CLI 登录本人免二次绑定：Scout 在验证用户授权后，以同一应用 `whoami --as user` 的 `onBehalfOf.openId` 上报 status.authorized_sender_id。Nexus 仅在私聊发送者与该已验证身份一致、节点归属及实例校验通过时关联当前节点主人；不从消息自报字段推断身份，不覆盖其他账号的既有绑定。其他发送者保留绑定流程。
-
-- `plugin.cli.feishu` 增加 `messages_start/messages_status/messages_stop`；返回 `data.messages`（enabled、holding、instance_id、connected、connection_verified、last_message_at、error），不返回凭据或消息正文。
-- CLI 插件快照的 status 承载上述字段。`channel=feishu_cli` 与 LangBot 飞书分开绑定；instance_id 为 `cli:<appId>`，reply_ctx.transport 为 `feishu_cli`。接受机器人身份接收的用户私聊文本、图文、图片、文件和语音；不声明群聊、卡片或流式能力。附件扩展以本文末尾 2026-10-22 子合同为准。
-- 入站复用 `node.plugin_im_message` 和持久 inbox；先上报插件快照。Nexus 校验节点归属、启用状态、实例与持有权；发送和 ACK 路由到 class=cli,id=feishu，仍使用 `plugin.im.send/ack`，发送携带稳定幂等键。
-- 同一节点同一应用已启用 LangBot 接收时，CLI 启动失败并提示，不能并行抢收。断线与账号切换停止监听；重连按当前账号已验证授权自动恢复，不再依赖 messages_enabled。授权成功立即启动监听，未授权、导入隔离、卸载或节点断线时不启动；im_hold 仲裁仍有效。messages_start/messages_stop 仅保留兼容调用，页面不提供单独开关。
-
-
-## 私聊图文与附件上传
-
-- CLI 出站 IM 命令统一使用应用机器人身份（`--as bot`）；用户身份仅用于文档/表格等用户态命令。入站私聊仍按用户身份校验，入站和出站身份不混用。
-- `im.send` 的 `feishu_cli` 在活跃入站监听存在时走原回复路由；没有监听但调用方提供 `chat_id` 时，回退到 bot CLI 发送，主动推送不再被“回复型”路由卡死。入站私聊仍只接收用户私聊。`text/post/image/file/audio` 保留文字并提取资源；兼容 CLI 已渲染的 `[Image: img_…]`、`![Image](img_…)`、`<file …/>` 与 `<audio …/>`，也接受原始 JSON 内容。不支持的消息、缺失资源、超过 4 个附件或下载失败必须带 `media_error` 或附件 `error` 交给 Nexus 回复，不能静默丢弃整条图文。
-- Scout 通过当前应用的官方 CLI `im +messages-resources-download --as bot` 下载同一消息的资源，仅写私有临时目录并在读取后清理。每份附件最多 8 MB；原始字节在账号/实例/发送者隔离的附件表内保存，Nexus 只持久化 `kind/ref/name/mime/size`。图片识别是可选参考，失败不阻止上传原图；文件不自动解压、执行或当作授权。
-- `plugin.cli.meego` 的 `action=command,mode=write` 扩展可选 `attachment_ref` 和 `attachments`，二者互斥。来源 `attachment_origin` 由 Nexus 依据已绑定会话注入，目标必须是保有原件的同一节点，模型不能提供或覆盖来源。`attachment_ref` 仅用于 `attachment +upload`；`attachments=[{ref,field_key,resource_type,filename?}]` 仅用于 `workitem create`，最多 4 份，resource_type 仅 15（附件字段）或 16（富文本图片）。字段 key 必须先查询实际空间字段。
-- 节点 Meego 插件快照声明 `attachment_upload_version=1`。Nexus 只保留已知版本并在派发前校验；旧节点或未上报版本时拒绝带附件操作，不能降级成创建无附件工作项。顶层协议类不变，两仓文档同步。
-- 受控上传在 Scout 内解析当前会话的 `media-…` 引用，将字节写入新建临时文件，再调用官方 `meegle attachment +upload`；不开放任意路径、URL、Shell、登录或配置修改。已有工作项用 `work-item-id`；待创建工作项用 `work-item-type`。官方 CLI 用户授权与插件换票是两套条件，不能把 Plugin ID/Secret 或 User Key 冒充用户访问令牌。
-- 带附件创建先完成全部本地校验、再上传、最后携带文件 token/富文本地址发一次创建请求。附件上传失败时不创建空工作项。附件字段按官方格式使用 JSON 字符串数组及 `fileToken`、字符串 `size`；富文本图片使用带 file_token 注释的 Markdown。单独上传仅确认上传，不声称已关联。原写收据继续去重，保留 file_token/file_url；超时、缺少上传回执或创建回执时标记结果未知，不自动重放。多附件增加节点等待预算，不缩短单次 CLI 的安全超时。
-- 本次实现未修改共享业务数据库，不自动创建真实 Bug。运行验收需受管加载新版 Nexus/Scout，确认新快照，再用获授权的真实图文和文件核对 Meego 实际字段；离线校验不能替代授权、下载、上传和关联验收。
 
 ## Scout 配置迁移
 
 
 新增 owner-only 节点指令 `node.config_export`、`node.config_import`，复用 EXECUTE/RESULT，不改顶层字段。导出返回 `extra.archive`（UTF-8 JSON 的 base64 传输编码，不是加密）；导入参数为 `archive`，返回 `missing_tools/warnings/count`。仅用于用户显式配置迁移，不进入心跳、插件快照或持久业务日志。文件包含凭据，UI 必须提示妥善保管，响应 Cache-Control: no-store。
 
-文件 `{format:"mino-scout-config",version:1,items:[{class,id,values,extras,application_config?}]}`。values 限 Scout catalog 字段，extras 限微信账号标识/baseurl 和飞书 messages_enabled；application_config 仅限飞书 CLI 应用配置。设备绑定 OAuth 登录不迁移，目标需重新扫码。完整校验先于写入；未知/重复插件及未知字段拒绝，覆盖只作用于文件列出的项目。凭据写入失败尝试恢复原凭据和配置，回滚失败明确报告且不启动服务。
+文件 `{format:"mino-scout-config",version:1,items:[{class,id,values,extras,application_config?}]}`。values 限 Scout catalog 字段，extras 默认为空；application_config 仅限飞书 CLI 应用配置。设备绑定 OAuth 登录不迁移，目标需重新扫码。完整校验先于写入；未知/重复插件及未知字段拒绝，覆盖只作用于文件列出的项目。凭据写入失败尝试恢复原凭据和配置，回滚失败明确报告且不启动服务。
 
-插件状态增加 `import_blocked`，下载中心项目增加 `required_by_config`。插件尚未安装时，导入的非空配置停用；调用、消息监听、LangBot 启动均守卫。安装成功，或节点再次上线时发现该插件已经安装，即解除 `import_blocked`，已导入的凭据可以继续使用。导入时关掉的对话渠道保持关闭，需在配置页单独开启。只有非空导入配置对应的缺失插件进入补装清单。Scout 下载中心使用单 worker FIFO，旧同步安装也共享串行锁；重启中的未完成任务保持 interrupted，不自动重放。
+插件状态增加 `import_blocked`，下载中心项目增加 `required_by_config`。插件尚未安装时，导入的非空配置停用；调用均守卫。安装成功，或节点再次上线时发现该插件已经安装，即解除 `import_blocked`，已导入的凭据可以继续使用。只有非空导入配置对应的缺失插件进入补装清单。Scout 下载中心使用单 worker FIFO，旧同步安装也共享串行锁；重启中的未完成任务保持 interrupted，不自动重放。
 
-HTTP POST `/runtime/nodes/{node_id}/configuration/export` 与 `/configuration/import`（`archive,overwrite:true`），仅节点所属账号可调用；覆盖前由 UI 确认目标节点及影响。LangBot 移除入口归下载中心。
+HTTP POST `/runtime/nodes/{node_id}/configuration/export` 与 `/configuration/import`（`archive,overwrite:true`），仅节点所属账号可调用；覆盖前由 UI 确认目标节点及影响。
 
 
 ## Scout 在线升级与下载中心
 
-本节替代此前“升级与回退功能移除”和下载中心核心只读的规定。Workbench、Nexus 和 Scout 支持由用户主动触发的 Scout 固定版本升级，以及 cli.feishu、cli.meego、langbot、chromium、adb.keyboard 的 install/update。普通业务请求不隐式安装或更新。
+本节替代此前“升级与回退功能移除”和下载中心核心只读的规定。Workbench、Nexus 和 Scout 支持由用户主动触发的 Scout 固定版本升级，以及 cli.feishu、cli.meego、chromium、adb.keyboard 的 install/update。普通业务请求不隐式安装或更新。
 
 REGISTER/HEARTBEAT 的 tool_tasks_version=2 仍使用现有字段；Nexus 保留识别 v1 首次插件安装，v1 不接收新增组件或 update。node.tools 返回 version=2、installable、updatable 与真实已安装版本；HTTP 工具状态返回 contract_version。node.tool_task_submit 参数 action=install|update，RESULT 回执必须匹配 task_id/tool_id/action。同一操作编号不得换参数，未知应答只查询或显式重试同一编号。组件任务与 Scout 更新互斥，刷新和切换账号不能重放安装。
 
 node.update 恢复合同 v1：固定 release_tag/build_id，等待节点空闲，独立助手校验安装包、保留旧层、重启后核验实际运行 build，再返回成功。Nexus 启动与停止更新 worker。无迁移且协议兼容的固定版本允许前向更新；是否自动回退独立取决于发布的实测兼容声明，不能因没有自动回退证据而禁止正常前向升级。未声明自动回退时，新版核验失败保留原层与原操作，明确需要核对，不伪造成功。旧版明确拒绝 node.update 的节点须先安装支持此合同的基线，不能伪称远程升级成功。
 
-CLI 新包在独立暂存目录校验后替换，原目录和授权保留；失败时原版本仍可用。LangBot 在独立的新 venv 中安装 Scout 声明的兼容版本，核验后切换环境引用，保留旧 venv、data、配置与密钥。Chromium 只安装当前 Playwright 运行时匹配的版本，不清理其他版本。ADB Keyboard 下载到电脑缓存，固定 Git 对象与摘要校验后替换，保留旧缓存；设备安装状态独立展示。
+CLI 新包在独立暂存目录校验后替换，原目录和授权保留；失败时原版本仍可用。Chromium 只安装当前 Playwright 运行时匹配的版本，不清理其他版本。ADB Keyboard 下载到电脑缓存，固定 Git 对象与摘要校验后替换，保留旧缓存；设备安装状态独立展示。
 
 源码节点的 scout.core 条目同时上报 runtime_environment、running_version、source_version、source_changed、restart_required；旧节点未报的源码版本保持未知，不能以发布版本补填。运行版本固定于进程启动，本地源码版本只读该进程模块所在目录的 VERSION，不读取其他安装或配置目录中的 bin。源码模式不展示安装包升级比较，代码或 VERSION 变更提示重启生效；正式节点仍使用固定安装包升级。
 

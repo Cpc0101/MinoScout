@@ -19,7 +19,7 @@ _REUSE = {
     "openai": "调模型用 case.scout.llm() / app.vlm()",
     "anthropic": "调模型用 case.scout.llm() / app.vlm()",
 }
-_CASE_ATTRS = {"config", "env", "app_id", "init", "scout", "nexus"}
+_CASE_ATTRS = {"config", "env", "app_id", "app_key", "init", "scout", "nexus"}
 _STEP_CALLS = {"prep", "do", "check"}
 _EMPTY_PREP = {"无", "无前置", "无需前置", "不需要", "不需要前置", "无操作", "none", "n/a", "na"}
 _SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules"}
@@ -179,11 +179,34 @@ def _config_keys(root: Path, hints: list[Hint]) -> set[str] | None:
     for key, row in apps.items():
         if not isinstance(row, dict) or not str(row.get("platform") or ""):
             hints.append(Hint("config.yaml", 0, "config_invalid", f"{key} 缺 platform"))
-        elif not str(row.get("app_id") or ""):
-            hints.append(Hint("config.yaml", 0, "config_invalid", f"{key} 缺 app_id（Nexus 里这个应用的 id，见 project_list）"))
         if not re.match(r"^[A-Za-z][A-Za-z0-9_]{0,31}$", str(key)):
             hints.append(Hint("config.yaml", 0, "config_invalid", f"应用 key {key} 要以英文字母开头，只含英文、数字、下划线"))
+        if isinstance(row, dict):
+            hints.extend(_otp_hints(str(key), row))
+            envs = row.get("envs")
+            if isinstance(envs, dict):
+                for env, block in envs.items():
+                    if isinstance(block, dict):
+                        hints.extend(_otp_hints(f"{key}.envs.{env}", block))
     return {str(key) for key in apps}
+
+
+def _otp_hints(label: str, row: dict) -> list[Hint]:
+    if "otp" not in row:
+        return []
+    otp = row.get("otp")
+    if otp is None:
+        return []
+    if not isinstance(otp, dict):
+        return [Hint("config.yaml", 0, "config_invalid", f"{label}.otp 必须是对象，可选字段只有 code")]
+    unknown = [str(k) for k in otp if str(k) != "code"]
+    out: list[Hint] = []
+    if unknown:
+        out.append(Hint("config.yaml", 0, "config_invalid",
+                        f"{label}.otp 只允许 code，不认识：{', '.join(unknown)}"))
+    if "code" in otp and otp.get("code") is not None and not isinstance(otp.get("code"), str):
+        out.append(Hint("config.yaml", 0, "config_invalid", f"{label}.otp.code 必须是字符串"))
+    return out
 
 
 def _page_layout(root: Path, keys: set[str] | None) -> list[Hint]:

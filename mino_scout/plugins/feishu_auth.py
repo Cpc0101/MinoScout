@@ -162,9 +162,6 @@ def _worker(home: Path, job: dict, lock) -> None:
                    str(exc) if isinstance(exc, RuntimeError) else "授权流程未完成，请检查 CLI 安装与网络后重试"))
     finally:
         lock.release()
-        if job["public"].get("state") == "authorized" and root() == home:
-            from mino_scout.plugins import feishu_messages
-            feishu_messages.reconcile()
 
 def _store_authorized(home: Path) -> dict:
     """CLI 已验证时把授权写入状态文件。只放在返回值里的话，下一次查询会读到旧的 idle。"""
@@ -180,7 +177,6 @@ def action(name: str) -> dict:
     home = root()
     key = str(home.resolve())
     result: dict | None = None
-    reconcile = False
     with _guard:
         job = _jobs.get(key)
         active = bool(job and job["public"]["state"] in _ACTIVE)
@@ -190,7 +186,6 @@ def action(name: str) -> dict:
                 result.update(state="interrupted", authorization_url="", summary="节点重启中断了授权；继续时将复用已保存的应用")
             elif not active and result.get("state") in (None, "", "idle") and ready():
                 result = _store_authorized(home)
-                reconcile = True
         elif name == "auth_cancel":
             if active:
                 job["cancel"].set()
@@ -208,7 +203,6 @@ def action(name: str) -> dict:
                 result = dict(stored)
             else:
                 result = _store_authorized(home)
-                reconcile = True
         else:
             _safe_entry(home.parent, "invoke")
             lock = acquire_plugin("cli", "feishu")
@@ -222,9 +216,6 @@ def action(name: str) -> dict:
                 lock.release()
                 raise
             result = dict(job["public"])
-    if reconcile:
-        from mino_scout.plugins import feishu_messages
-        feishu_messages.reconcile()
     return result or {}
 
 

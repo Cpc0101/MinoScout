@@ -253,8 +253,8 @@ def install(node_id: str, kind: str, plugin_id: str, *, _held_lock=None, update=
         raise PluginInstallError(f"未知插件 {kind}/{plugin_id}")
     if not row.get("needs_install"):
         raise PluginInstallError("这个插件不需要单独安装")
-    if kind not in ("cli", "mcp", "im"):
-        raise PluginInstallError("只有 CLI、MCP 和对话渠道层按需安装")
+    if kind not in ("cli", "mcp"):
+        raise PluginInstallError("只有 CLI、MCP 按需安装")
     from mino_scout.tools.update import update_progress as UP
 
     if UP.snapshot().get("active"):
@@ -263,21 +263,6 @@ def install(node_id: str, kind: str, plugin_id: str, *, _held_lock=None, update=
     dest = plugin_dir(kind, plugin_id)
     staging = dest.with_name(dest.name + ".staging-" + uuid.uuid4().hex)
     archive = staging.with_name(staging.name + ".pkg")
-    if kind == "im" and plugin_id == "langbot":
-        # LangBot 走 pip + 独立 venv，不是下载压缩包；进度仍走同一套 plugin_progress
-        try:
-            from mino_scout.plugins import langbot_host
-
-            summary = langbot_host.install(node_id, update=update)
-            from mino_scout.plugins.state import release_import_block
-
-            release_import_block(kind, plugin_id)
-            return summary
-        except Exception as exc:
-            raise PluginInstallError(str(exc).strip() or "LangBot 安装失败") from exc
-        finally:
-            if _held_lock is None:
-                lock.release()
     try:
         PP.emit("plan", kind=kind, plugin_id=plugin_id, label="查找安装包", percent=5)
         release = _resolve(kind, plugin_id)
@@ -353,11 +338,7 @@ def remove(node_id: str, kind: str, plugin_id: str) -> str:
         if row is None or not row.get("needs_install"):
             raise PluginInstallError("仅支持卸载额外安装的插件")
         if kind == "cli" and plugin_id == "feishu":
-            from mino_scout.plugins import feishu_messages, feishu_auth
-            feishu_messages.action("messages_stop")
-        if kind == "im" and plugin_id == "langbot":
-            from mino_scout.plugins import langbot_host
-            langbot_host.shutdown()
+            from mino_scout.plugins import feishu_auth
         summary = _remove(node_id, kind, plugin_id)
         if kind == "cli" and plugin_id == "feishu":
             feishu_auth.forget_uninstalled()

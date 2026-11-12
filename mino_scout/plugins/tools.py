@@ -54,7 +54,7 @@ def snapshot(core):
                 version = marker.get('version') if isinstance(marker, dict) else None
             except (OSError, ValueError):
                 pass  # Legacy "ok" marker does not prove a version.
-        items.append(dict(tool_id=f'cli.{plugin_id}', label=label, purpose='飞书工作项与消息接入' if plugin_id == 'feishu' else '工作项接入', state='installed' if present else 'missing' if ready else 'unknown',
+        items.append(dict(tool_id=f'cli.{plugin_id}', label=label, purpose='飞书工作项接入' if plugin_id == 'feishu' else '工作项接入', state='installed' if present else 'missing' if ready else 'unknown',
                           version=version, configured=config, installable=ready and not present, updatable=ready and bool(present), config_key=f'cli:{plugin_id}',
                           detail='安装与升级保留配置和授权；消息接入及工作项功能在配置页管理。'))
     from mino_scout.tools.update.channel_packages import appium_item

@@ -240,14 +240,24 @@ def _execute_hooks(root: Path, script_path: str, case: "Case") -> None:
 class AppRef:
     """case.config.<KEY> 的值。只表示 config.yaml 里的一个应用，不能自己构造。"""
 
-    __slots__ = ("key", "app_id", "platform", "package", "url")
+    __slots__ = ("key", "app_id", "platform", "package", "url", "otp_code")
 
-    def __init__(self, key: str, platform: str, package: str, url: str, app_id: str = ""):
+    def __init__(self, key: str, platform: str, package: str, url: str, app_id: str = "",
+                 otp_code: str = ""):
         self.key = key
         self.app_id = app_id
         self.platform = platform
         self.package = package
         self.url = url
+        self.otp_code = otp_code
+
+
+def _otp_code_of(row: dict) -> str:
+    """config 里可选 otp.code：有则当固定验证码，没有则取码时要人工提供。"""
+    otp = row.get("otp")
+    if not isinstance(otp, dict):
+        return ""
+    return str(otp.get("code") or "").strip()
 
 
 def _load_apps(root: Path) -> tuple[dict | None, str]:
@@ -285,7 +295,14 @@ class _Config:
                     continue
                 row = {**{k: v for k, v in row.items() if k != "envs"}, **picked}
             package = str(row.get("package") or row.get("bundle_id") or row.get("bundle") or "")
-            self._apps[str(key)] = AppRef(str(key), str(row.get("platform") or ""), package, str(row.get("url") or ""), str(row.get("app_id") or ""))
+            self._apps[str(key)] = AppRef(
+                str(key),
+                str(row.get("platform") or ""),
+                package,
+                str(row.get("url") or ""),
+                str(row.get("app_id") or ""),
+                _otp_code_of(row),
+            )
 
     def __getattr__(self, name: str) -> AppRef:
         if name.startswith("_"):
@@ -312,7 +329,7 @@ class _Scout:
         return wait(self._case, ms)
 
     def otp(self, account) -> str:
-        """按这个账号的登录策略取验证码；Gmail 只是其中一条渠道。"""
+        """取验证码：账号自带码 → 脚本仓 otp.code → 否则要求人工提供。"""
         from mino_scout.server_comm.callbacks import otp
 
         return otp(self._case, account)
@@ -378,6 +395,7 @@ class Case:
         self._all_pages = _load_pages(root)
         self.env = str(self._hint.get("env") or "")
         self.app_id = str(self._hint.get("app_id") or "")
+        self.app_key = str(self._hint.get("app_key") or "")
         apps, problem = _load_apps(root)
         self.config = _Config(apps, self.env, problem)
         self.scout = _Scout(self)
@@ -392,10 +410,21 @@ class Case:
         self._mail_to = ""
         self._apps: dict[str, App] = {}
 
+    def repo_otp_code(self) -> str:
+        """本次运行应用在 config.yaml 里的固定验证码；没有则空串。"""
+        key = self.app_key
+        if key and key in self.config._apps:
+            return str(self.config._apps[key].otp_code or "")
+        if self.app_id:
+            for ref in self.config._apps.values():
+                if ref.app_id and ref.app_id == self.app_id:
+                    return str(ref.otp_code or "")
+        return ""
+
     def __getattr__(self, name: str):
         if name.startswith("_"):
             raise AttributeError(name)
-        raise _unknown("case", name, ["config", "env", "app_id", "init", "scout", "nexus"],
+        raise _unknown("case", name, ["config", "env", "app_id", "app_key", "init", "scout", "nexus"],
                        "。设备动作写在 app = case.init(case.config.<KEY>) 返回的 app 上")
 
     def init(self, ref: AppRef) -> "App":

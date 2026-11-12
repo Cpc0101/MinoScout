@@ -16,8 +16,7 @@ from mino_scout.plugins import state
 FORMAT = 'mino-scout-config'
 MAX_BYTES = 2 * 1024 * 1024
 EXTRA_FIELDS = {
-    ('bot', 'wechat'): ('baseurl', 'ilink_user_id', 'ilink_bot_id'),
-    ('cli', 'feishu'): ('messages_enabled',),
+    ('cli', 'feishu'): (),
 }
 
 
@@ -87,7 +86,7 @@ def import_config(node_id, raw):
     entries = validate(raw)  # Entire archive validated before any write.
     from mino_scout.plugins.install import acquire_plugin
     from mino_scout.plugins.secret_store import account_name, put_secret, delete_secret
-    from mino_scout.plugins import langbot_host, feishu_messages, wechat, feishu_auth
+    from mino_scout.plugins import feishu_auth
     with ExitStack() as stack:
         for entry in sorted(entries, key=lambda e: (e['class'], e['id'])):
             lock = acquire_plugin(entry['class'], entry['id'])
@@ -99,12 +98,6 @@ def import_config(node_id, raw):
         auth_before = auth_path.read_bytes() if auth_path.is_file() else None
         status_before = auth_status.read_bytes() if auth_status.is_file() else None
         keys = {(e['class'], e['id']) for e in entries}
-        if ('im', 'langbot') in keys:
-            langbot_host.shutdown()
-        if ('cli', 'feishu') in keys:
-            feishu_messages.stop()
-        if ('bot', 'wechat') in keys:
-            wechat.stop_listener()
         missing = []
         warnings = []
         try:
@@ -118,14 +111,11 @@ def import_config(node_id, raw):
                 state.remember_plain(kind, pid, extras)
                 root = state.load_state()
                 item = root['items'][f'{kind}:{pid}']
-                # Empty exported catalog entries do not require downloads.
                 needed = bool(any(value not in ('', '0') for value in values.values()) or any(value not in ('', '0') for value in extras.values()) or entry.get('application_config'))
                 blocked = bool(needed and spec.get('needs_install') and not state.installed(kind, pid))
                 if blocked:
                     item['import_blocked'] = True
-                    if (kind, pid) == ('cli', 'feishu'):
-                        item['messages_enabled'] = '0'
-                    missing.append('langbot' if pid == 'langbot' else f'{kind}.{pid}')
+                    missing.append(f'{kind}.{pid}')
                 else:
                     item.pop('import_blocked', None)
                 state.save_state(root)
@@ -138,9 +128,7 @@ def import_config(node_id, raw):
                     else:
                         auth_path.unlink(missing_ok=True)
                     feishu_auth._save(auth_path.parent, {'state': 'idle'})
-                    state.remember_plain(kind, pid, {'messages_enabled': '0'})
         except Exception:
-            # Restore credentials as well as flags; do not report a partial import as success.
             try:
                 for entry in previous['items']:
                     key = (entry['class'], entry['id'])
@@ -188,19 +176,9 @@ def handle(core, req, cmd, event, started):
                 except (ValueError, binascii.Error, UnicodeError):
                     raise ValueError('配置文件不是有效的 JSON') from None
                 data = import_config(core.node_id, raw)
-        if cmd == 'config_import':
-            try:
-                from mino_scout.plugins import langbot_host, wechat
-                langbot_host.reconcile(core.node_id)
-                wechat.bind_node(core.node_id)
-                wechat.ensure_listener()
-            except Exception:
-                data['warnings'].append('配置已保存，服务连接尚未恢复，请在配置页核对。')
         result = make_event_result(event, status=EventStatus.PASS, executor_used='core',
                                    started_at=started, elapsed_ms=0, summary='配置已导出' if cmd == 'config_export' else '配置已导入',
                                    raw_response={} if cmd == 'config_export' else data)
-        # Intentional credential export is only available on this explicit owner-only
-        # command. Never run archive bytes through substring redaction (corrupts files).
         if cmd == 'config_export':
             result.raw_response = data
         return result

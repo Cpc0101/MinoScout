@@ -39,4 +39,4 @@ include = ["mino_scout*"]
 version = {file = "mino_scout/VERSION"}
 
 [tool.setuptools.package-data]
-mino_scout = ["VERSION", "dom_collect.js", "plugins/langbot_bridge/*.yaml", "plugins/langbot_bridge/*.py", "plugins/langbot_bridge/components/*.py", "plugins/langbot_bridge/components/event_listener/*"]
+mino_scout = ["VERSION", "dom_collect.js"]

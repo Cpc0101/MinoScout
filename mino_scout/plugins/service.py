@@ -1,9 +1,7 @@
 """节点指令和具名插件能力。密钥只在本进程里读，不写进回执。"""
 from __future__ import annotations
 
-import hashlib
 import time
-import uuid
 from typing import Any
 
 from mino_scout.server_comm import protocol as P
@@ -50,7 +48,7 @@ def handle_node_plugin(core: Any, req: P.Execute, cmd: str, event: Any, started:
             summary = "已保存" if configured(core.node_id, kind, plugin_id) else "已保存，还有必填项空着"
         elif cmd == "plugin_install":
             if kind in ("im", "model") or plugin_id in ("wechat", "langbot", "llm"):
-                raise ValueError("微信 / IM / LangBot 安装已移除")
+                raise ValueError("该插件安装已移除")
             summary = install(core.node_id, kind, plugin_id)
         elif cmd == "plugin_remove":
             summary = remove(core.node_id, kind, plugin_id)
@@ -93,7 +91,7 @@ def handle_plugin_cap(core: Any, req: P.Execute, cap: str) -> EventResult:
     event = _event(req)
     started = now_iso()
     if cap.startswith("plugin.im.") or cap in ("plugin.bot.wechat",):
-        return _fail(event, started, "微信与 IM 对话能力已移除", cap)
+        return _fail(event, started, "对话渠道能力已移除", cap)
     if cap == "plugin.gmail.fetch_otp":
         try:
             result = _gmail(core, req, event, started)
@@ -154,8 +152,7 @@ def _feishu(core: Any, req: P.Execute) -> dict[str, Any]:
     params = dict(req.params or {})
     action = str(params.get("action") or "read_doc")
     if action in {"messages_start", "messages_status", "messages_stop"}:
-        from mino_scout.plugins import feishu_messages
-        return feishu_messages.action(action)
+        raise ValueError("飞书私聊接收已移除")
     if action in {"auth_start", "auth_status", "auth_cancel"}:
         from mino_scout.plugins.feishu_auth import action as auth_action
         return auth_action(action)
@@ -168,223 +165,6 @@ def _feishu(core: Any, req: P.Execute) -> dict[str, Any]:
     data = feishu_read_doc(core.node_id, str(params.get("url") or ""))
     data["summary"] = "已读取飞书文档"
     return data
-
-
-def _wechat(core: Any, req: P.Execute) -> dict[str, Any]:
-    from mino_scout.plugins import wechat as wx
-
-    wx.bind_node(core.node_id)
-    params = dict(req.params or {})
-    action = str(params.get("action") or "status")
-    if action == "qr":
-        data = wx.start_qr()
-    elif action == "status":
-        data = wx.poll()
-    elif action == "verify":
-        data = wx.poll(str(params.get("verify_code") or ""))
-    elif action == "logout":
-        data = wx.logout()
-    elif action == "send":
-        wx.send_text(
-            to_user_id=str(params.get("to_user_id") or ""),
-            context_token=str(params.get("context_token") or ""),
-            text=str(params.get("text") or ""),
-        )
-        data = {"ok": True, "summary": "已发送"}
-    else:
-        raise RuntimeError(f"不支持的微信动作 {action}")
-    data.setdefault("summary", "微信状态已更新" if action != "send" else "已发送")
-    data.pop("bot_token", None)
-    return data
-
-
-def _im_senders() -> None:
-    """渠道模块 import 时各自注册发送函数。这里确保都已加载。"""
-    from mino_scout.plugins import langbot_host, wechat  # noqa: F401
-
-
-def _im_target(params: dict[str, Any]) -> tuple[str, str, str, dict[str, str]]:
-    channel = str(params.get("channel") or "").strip()
-    chat_id = str(params.get("chat_id") or "").strip()
-    sender_id = str(params.get("sender_id") or "").strip()
-    raw = params.get("reply_ctx") if isinstance(params.get("reply_ctx"), dict) else {}
-    return channel, chat_id, sender_id, {str(k): str(v) for k, v in raw.items()}
-
-
-def _feishu_cli_bot_send(node_id: str, chat_id: str, text: str, delivery_id: str) -> dict[str, Any]:
-    """No active inbound listener: send with the app bot through the official CLI."""
-    from mino_scout.plugins.cli_bridge import call
-
-    data = call(node_id, "feishu", {
-        "action": "command",
-        "mode": "write",
-        "command": ["im", "+messages-send"],
-        "options": {
-            "chat-id": chat_id,
-            "msg-type": "text",
-            "content": {"text": text},
-            "idempotency-key": hashlib.sha256(delivery_id.encode()).hexdigest()[:48],
-        },
-    })
-    inner = data.get("data") if isinstance(data.get("data"), dict) else {}
-    return {"ok": True, "provider_message_id": str(data.get("id") or inner.get("message_id") or "")}
-
-
-def _im_send(req: P.Execute, node_id: str = "") -> dict[str, Any]:
-    from mino_scout.plugins import im_bridge, im_store
-
-    _im_senders()
-    params = dict(req.params or {})
-    channel, chat_id, sender_id, ctx = _im_target(params)
-    send = im_bridge.text_sender(channel)
-    if send is None and channel != "feishu_cli":
-        raise ValueError(f"不支持的渠道 {channel or '(空)'}")
-    text = str(params.get("text") or "")
-    delivery_id = str(params.get("delivery_id") or f"out-{uuid.uuid4().hex}")
-    card = params.get('card') or {}
-    if channel == "feishu_cli":
-        from mino_scout.plugins import feishu_messages
-
-        def operation():
-            try:
-                return feishu_messages.send(chat_id, ctx, text, delivery_id)
-            except ValueError as exc:
-                # Reply path needs the inbound listener. For an explicit chat_id,
-                # fall back to the bot CLI so proactive push is not reply-only.
-                if not chat_id or str(exc) not in (
-                    "CLI 消息路由已失效，请重新确认连接",
-                    "CLI 应用已变化，拒绝向旧会话发送",
-                ):
-                    raise
-                return _feishu_cli_bot_send(node_id, chat_id, text, delivery_id)
-    elif channel == 'feishu' and im_bridge.sender_capabilities(channel).get('cards') and card:
-        from mino_scout.plugins import im_feishu
-        operation = lambda: im_feishu.send(node_id, chat_id, sender_id, ctx, text, card, delivery_id)
-    else:
-        operation = lambda: send(chat_id, sender_id, ctx, text)
-    sent = im_store.send_once(channel, str(ctx.get("instance_id") or ""), str(ctx.get("tenant") or ""), sender_id,
-                             delivery_id, text, card, operation)
-    try:
-        im_store.record(
-            channel, chat_id or sender_id, sender_id, delivery_id, "assistant", text.strip(),
-            int(time.time()), instance_id=str(ctx.get("instance_id") or ""),
-            tenant=str(ctx.get("tenant") or ""), thread_id=str(ctx.get("thread_id") or ""),
-        )
-    except Exception as exc:  # 已发出去了，落库失败不回报失败
-        SLog.w(TAG, f"im.send 已发送但落库失败: {type(exc).__name__}")
-    SLog.i(TAG, f"plugin.im.send channel={channel} len={len(text)}")
-    return sent
-
-
-def _im_attachment(req: P.Execute) -> dict[str, Any]:
-    from mino_scout.plugins import im_store
-    params = dict(req.params or {})
-    channel, _, sender, ctx = _im_target(params)
-    return im_store.read_attachment({"channel": channel, "instance_id": ctx.get("instance_id", ""),
-                                    "tenant": ctx.get("tenant", ""), "sender_id": sender}, str(params.get("ref") or ""))
-
-
-def _im_ack(req: P.Execute) -> dict[str, Any]:
-    from mino_scout.plugins import im_store
-    params = dict(req.params or {})
-    channel, _, sender, ctx = _im_target(params)
-    im_store.acknowledge(channel, str(ctx.get("instance_id") or ""), str(ctx.get("tenant") or ""), sender, str(params.get("delivery_key") or ""))
-    return {"ok": True, "summary": "已确认受理"}
-
-
-_IMAGE_MAX = 10 * 1024 * 1024
-
-
-def _im_upload_image(req: P.Execute) -> dict[str, Any]:
-    """发图片。渠道没有图片能力就明确失败，不伪造成功。"""
-    import base64
-    import mimetypes
-    from pathlib import Path
-
-    from mino_scout.plugins import im_bridge
-
-    _im_senders()
-    params = dict(req.params or {})
-    channel, chat_id, sender_id, ctx = _im_target(params)
-    send = im_bridge.image_sender(channel)
-    if send is None:
-        if im_bridge.text_sender(channel) is None:
-            raise ValueError(f"不支持的渠道 {channel or '(空)'}")
-        raise ValueError(f"渠道 {channel} 暂不支持发送图片")
-    path = str(params.get("path") or "").strip()
-    b64 = str(params.get("image_base64") or "").strip()
-    mime = "image/png"
-    if b64:
-        if b64.startswith("data:") and "," in b64:
-            head, b64 = b64.split(",", 1)
-            mime = head[5:].split(";", 1)[0] or mime
-        data = base64.b64decode(b64, validate=False)
-    elif path:
-        fp = Path(path).expanduser()
-        if not fp.is_file():
-            raise ValueError("图片文件不存在")
-        if fp.stat().st_size > _IMAGE_MAX:
-            raise ValueError("图片超过 10MB")
-        data = fp.read_bytes()
-        mime = mimetypes.guess_type(fp.name)[0] or mime
-    else:
-        raise ValueError("缺少 image_base64 或 path")
-    if not data or len(data) > _IMAGE_MAX:
-        raise ValueError("图片为空或超过 10MB")
-    send(chat_id, sender_id, ctx, data, mime)
-    SLog.i(TAG, f"plugin.im.upload_image channel={channel} bytes={len(data)}")
-    return {"ok": True, "summary": "图片已发送"}
-
-
-def _apply_hold(kind: str, plugin_id: str, hold: Any, platform: str) -> None:
-    """Nexus 持有仲裁：im_hold=false 停该渠道（不登出 / 不删配置），true 恢复。"""
-    want = hold if isinstance(hold, bool) else str(hold).strip().lower() in ("1", "true", "yes", "on")
-    if kind in ("bot", "im") and plugin_id == "wechat":
-        from mino_scout.plugins import wechat
-
-        wechat.set_hold(want)
-    elif kind == "cli" and plugin_id == "feishu":
-        from mino_scout.plugins import feishu_messages
-        from mino_scout.plugins.state import remember_plain
-        remember_plain("cli", "feishu", {"im_hold": "" if want else "0"})
-        feishu_messages.reconcile()
-    elif kind == "im" and plugin_id == "langbot":
-        from mino_scout.plugins import langbot_host
-
-        langbot_host.set_hold(platform or None, want)
-    else:
-        raise ValueError(f"{kind}/{plugin_id} 不支持 im_hold")
-
-
-def _im_history(req: P.Execute) -> dict[str, Any]:
-    from mino_scout.plugins import im_store
-
-    params = dict(req.params or {})
-    channel = str(params.get("channel") or "").strip()
-    chat_id = str(params.get("chat_id") or "").strip()
-    if not channel or not chat_id:
-        raise ValueError("缺少 channel 或 chat_id")
-    try:
-        limit = int(params.get("limit") or 20)
-    except (TypeError, ValueError):
-        limit = 20
-    _, _, sender_id, ctx = _im_target(params)
-    msgs = im_store.history(channel, chat_id, limit, sender_id=sender_id,
-        instance_id=str(ctx.get("instance_id") or ""), tenant=str(ctx.get("tenant") or ""),
-        after_ts=int(params.get("after_ts") or 0))
-    return {"messages": msgs, "summary": f"{len(msgs)} 条"}
-
-
-def _im_result(event: Any, started: str, cap: str, data: dict[str, Any]) -> EventResult:
-    return make_event_result(
-        event,
-        status=EventStatus.PASS,
-        executor_used="core",
-        started_at=started,
-        elapsed_ms=0,
-        summary=str(data.get("summary") or "完成"),
-        raw_response=_public_payload(data),
-    )
 
 
 def _public_payload(data: dict[str, Any]) -> dict[str, Any]:
@@ -486,24 +266,3 @@ def _fail(event: Any, started: str, summary: str, command: str, *, t0: float | N
         error=summary,
         raw_response={"command": command},
     )
-
-
-def _im_stream(req: P.Execute, node_id: str) -> dict:
-    from mino_scout.plugins import im_bridge, im_store, im_feishu
-    params = dict(req.params or {})
-    channel, chat_id, sender_id, ctx = _im_target(params)
-    if channel != 'feishu' or not im_bridge.sender_capabilities(channel).get('streaming'):
-        raise ValueError('当前适配器不支持流式消息')
-    key = str(params.get('stream_id') or '')
-    sequence = int(params.get('sequence') or 0)
-    if not key or sequence < 1:
-        raise ValueError('流式消息缺少稳定编号或版本')
-    complete = params.get('complete') is True
-    text = str(params.get('text') or '')[:10000]
-    card = params.get('card') if complete else {'card_type': 'dialogue', 'header': {'title': '回复草稿 · 尚未执行'}}
-    origin = {'channel': channel, 'sender_id': sender_id, **ctx}
-    result = im_store.stream_once(origin, key, sequence, text, card or {}, complete,
-        lambda mid: im_feishu.update(node_id, mid, text, card, draft=not complete) if mid else im_feishu.send(node_id, chat_id, sender_id, ctx, text, card or {}, key))
-    if complete:
-        im_store.record(channel, chat_id, sender_id, key, 'assistant', text, instance_id=ctx.get('instance_id', ''), tenant=ctx.get('tenant', ''), thread_id=ctx.get('thread_id', ''))
-    return result

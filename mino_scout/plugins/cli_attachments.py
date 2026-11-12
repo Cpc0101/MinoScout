@@ -35,33 +35,7 @@ def _auto_field(node_id: str, options: dict) -> str:
 
 
 def prepare(ref: str, options: dict, origin: dict) -> tuple[bytes, str, str]:
-    from mino_scout.plugins import im_store
-    from mino_scout.plugins.im_attachments import MAX_BYTES
-
-    if not re.fullmatch(r'media-[0-9a-f]{32}', str(ref or '')) or not isinstance(origin, dict):
-        raise ValueError('上传需要当前已绑定会话的附件引用，不能传本地路径或 URL')
-    if not all(origin.get(key) for key in ('channel', 'instance_id', 'sender_id')):
-        raise ValueError('附件上传缺少已确认的会话来源')
-    allowed = {'project-key', 'work-item-id', 'work-item-type', 'resource-type', 'field-key', 'filename', 'dry-run'}
-    if set(options) - allowed:
-        raise ValueError('附件上传包含不支持的参数')
-    if not options.get('project-key') or not (options.get('work-item-id') or options.get('work-item-type')):
-        raise ValueError('请指定目标空间，以及已有工作项 ID 或待创建的工作项类型')
-    resource_type = str(options.get('resource-type') or '')
-    if resource_type not in {'13', '14', '15', '16'}:
-        raise ValueError('附件 resource-type 必须是 13、14、15 或 16')
-    if resource_type in {'15', '16'} and not options.get('field-key'):
-        raise ValueError('上传到工作项字段时必须指定查询得到的 field-key')
-    media = im_store.read_attachment(origin, ref)
-    data = base64.b64decode(str(media.get('base64') or ''), validate=True)
-    if not 0 < len(data) <= MAX_BYTES:
-        raise ValueError('附件为空或超过 8 MB')
-    mime = str(media.get('mime') or 'application/octet-stream')
-    if resource_type in {'14', '16'} and not mime.startswith('image/'):
-        raise ValueError('图片字段只能上传图片，请将文件上传到附件字段')
-    name = str(options.get('filename') or 'attachment' + (mimetypes.guess_extension(mime) or '.bin'))
-    name = re.sub(r'[^\w.() -]', '_', name.replace('\\', '/').rsplit('/', 1)[-1])[:180].strip(' .')
-    return data, name or 'attachment.bin', mime
+    raise ValueError('对话附件能力已移除')
 
 
 def upload(node_id: str, prepared: tuple[bytes, str, str], options: dict) -> dict:

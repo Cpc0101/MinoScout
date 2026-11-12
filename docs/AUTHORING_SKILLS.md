@@ -56,18 +56,18 @@ CLAUDE.md 边界：Scout 不碰数据库、不调 Nexus 内部、不读能力目
 ```yaml
 apps:
   camera:
-    app_id: app_8f3a21          # Nexus 里这个应用的 id
     platform: android
     envs:
-      test: {package: com.example.a.test}
+      test:
+        package: com.example.a.test
+        otp: {code: "123456"}   # 可选；不写则取码时要问人
       prod: {package: com.example.a}
   camera_ios:
-    app_id: app_8f3a21
     platform: ios
     bundle_id: com.example.a
 ```
 
-环境名与 Nexus 项目环境一致。Scout 在拉下来的仓库根读它；`device_hint["env"]` 决定 `case.config` 取 `envs` 里哪一份，`device_hint["app_id"]` 是本次运行的 Nexus 应用 id，脚本里是 `case.app_id`，与 `config.yaml` 各应用的 `app_id` 对应。缺文件、缺应用或缺环境 → `config_missing`。账号不在这里，仍是 Nexus 号池经 `case.nexus.account()` 租用。
+脚本仓认 **key**（`camera`），不要求也不依赖 `app_id` / `project_id`。环境名与 Nexus 项目环境一致。Scout 在拉下来的仓库根读它；`device_hint["env"]` 决定取哪份 `envs`，`device_hint["app_key"]`（由 Nexus 按清单回填）对应当前应用 key；`app_id` 仍可能下发，仅作兼容。缺文件、缺应用或缺环境 → `config_missing`。账号仍由 Nexus 号池经 `case.nexus.account()` 租用；固定验证码用 `otp.code`，取码见 `case.scout.otp`。
 
 ---
 
@@ -133,7 +133,7 @@ Scout 对 `do("标题")` 回调传 `title`（传整数时仍传 `number`）。Ne
 
 Nexus 不读脚本仓库（可能是私有的），所以“这个项目的仓库能跑哪些应用”由 agent 告知：
 
-- `repo_apps_sync(project_id, revision, branch, apps)`：差异更新：`apps` 只带本次新增或修改的应用（按 key 整项替换），`remove` 带删除的 key，其余保留；校验 key 格式、每项必须有 `app_id`、platform、只允许 `package` / `bundle_id` / `url` 与 `envs`，含 password / token / otp / secret / key 等键名一律拒绝；
+- `repo_apps_sync(project_id, revision, branch, apps)`：差异更新：`apps` 只带本次新增或修改的应用（按 key 整项替换），`remove` 带删除的 key，其余保留；校验 key 格式、platform、只允许 `package` / `bundle_id` / `url` 与 `envs`；**不要传 `otp` / 密码**；`app_id` 可省略，Nexus 按 key 对齐或自动创建应用并回填；
 - `repo_apps_get(project_id)`；
 - Nexus 存 `project_repo_apps`（revision、branch、apps、同步人、时间），Workbench 的“脚本仓库应用”只读展示；
 - 约定写在技能里：改了 `config.yaml` → push → 同步 → `repo_apps_get` 核对 revision；
@@ -141,7 +141,7 @@ Nexus 不读脚本仓库（可能是私有的），所以“这个项目的仓�
 
 ## 6. 未做 / 待定
 
-- **清单 key 与 Nexus 应用的对应（已定：方案 B）**：`config.yaml` 每个应用带 `app_id`（Nexus 里该应用的 id），`case_run` 用它匹配清单；key 自由命名（英文字母开头，含英文、数字、下划线）。应用先用 MCP `app_create` 在 Nexus 创建拿到 id；
+- **清单 key 与 Nexus 应用的对应（已定：脚本仓优先）**：`config.yaml` 只写 key + 身份；`repo_apps_sync` 负责 key↔`app_id`；`case_run` 仍用 Nexus `app_id`，下发时附带 `app_key`；
 - `device_list` 的兼容判断仍按 Nexus 原有的应用和渠道环境，与清单无关；
 
 - 视觉返回坐标（`app.vlm_point`）；

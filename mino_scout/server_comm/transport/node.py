@@ -123,7 +123,6 @@ class NodeTransport:
         self._waiters: dict[str, asyncio.Future] = {}
         # 在途的请求处理任务。必须持强引用，否则会被 GC（见 _on_frame）
         self._inflight: set[asyncio.Task] = set()
-        self._im_lock: Optional[asyncio.Lock] = None
         # Long synchronous execution wrappers must not consume heartbeat,
         # source-identity and stop-watch workers in asyncio's default pool.
         self._execution_pool = ThreadPoolExecutor(
@@ -209,19 +208,6 @@ class NodeTransport:
             from mino_scout.plugins import progress as plugin_progress
 
             plugin_progress.set_progress_hook(None)
-            from mino_scout.plugins import im_bridge
-            from mino_scout.plugins import wechat as wechat_plugin
-
-            im_bridge.set_hook(None)
-            wechat_plugin.stop_listener()
-            try:
-                from mino_scout.plugins import langbot_host, feishu_messages
-
-                feishu_messages.set_connection(False)
-                langbot_host.shutdown()
-                im_bridge.stop_loopback()
-            except Exception as exc:
-                SLog.w(TAG, f"LangBot 退出清理: {type(exc).__name__}")
             try:
                 self.core.shutdown()
             except Exception as exc:
@@ -417,16 +403,12 @@ class NodeTransport:
             note_plugin_access(self.core._plugins_ready, plugin_warning)
         except OSError as exc:
             SLog.w(TAG, f"插件状态写入失败: {type(exc).__name__}")
-        from mino_scout.plugins import feishu_messages
         if self.core._plugins_ready:
             from mino_scout.plugins.state import release_installed_import_blocks
 
             released = release_installed_import_blocks()
             if released:
                 SLog.i(TAG, f"已安装插件解除导入停用: {', '.join(released)}")
-            feishu_messages.set_connection(True)
-        else:
-            feishu_messages.set_connection(False)
         await self._send(P.MsgType.HEARTBEAT, await asyncio.to_thread(self.core.heartbeat))
         try:
             from mino_scout.tools.keep_alive.runtime_sidecar import write_runtime_sidecar
@@ -442,11 +424,6 @@ class NodeTransport:
             await self._emit_device_delta(self._last_devices, devices)
         self._seen_register = True
         self._last_devices = {d.sn: d for d in devices}
-        # 重连成功：补发 Nexus 不可达期间暂存的入站事件（不阻塞注册流程）
-        if self.core._plugins_ready:
-            task = asyncio.create_task(self._emit_im_message(None))
-            self._inflight.add(task)
-            task.add_done_callback(self._inflight.discard)
 
     async def _emit_device_delta(
         self, prev: dict[str, P.DeviceManifest], now: list[P.DeviceManifest],
@@ -492,7 +469,6 @@ class NodeTransport:
                 pass
             try:
                 await self._tick_heartbeat()
-                await self._emit_im_message(None)
             except Exception as exc:
                 SLog.w(TAG, f"心跳发送失败: {exc}")
                 return
@@ -740,37 +716,6 @@ class NodeTransport:
             self._waiters.pop(msg_id, None)
             if not fut.done():
                 fut.cancel()
-
-    async def _emit_im_message(self, im: Optional[dict]) -> None:
-        """发 node.plugin_im_message。ws 不可用 / 没拿到 RESULT 就进 im_pending；
-        任何一次调用（含重连后的 im=None）都会先按时间顺序补发积压。
-        """
-        if not self.core._plugins_ready:
-            return
-        from mino_scout.plugins import im_store
-
-        if self._im_lock is None:
-            self._im_lock = asyncio.Lock()
-        async with self._im_lock:
-            if self._ws is None:
-                return
-            if im and im.get("channel") == "feishu_cli":
-                await self._send(P.MsgType.HEARTBEAT, await asyncio.to_thread(self.core.heartbeat))
-            # 旧版暂存迁入持久收件箱，平台 ACK 不能清除尚未处理的业务事件。
-            await asyncio.to_thread(im_store.migrate_pending)
-            queue = await asyncio.to_thread(im_store.pending_events)
-            if not queue:
-                return
-            try:
-                await self._send(P.MsgType.HEARTBEAT, await asyncio.to_thread(self.core.heartbeat))
-            except Exception:
-                return
-            for row in queue:
-                ok = self._ws is not None and await self._send_framework(
-                    "node.plugin_im_message", detail="im message", extra={"im": row})
-                if not ok:
-                    return
-                await asyncio.to_thread(im_store.sent_event, row["delivery_key"])
 
     async def _emit_plugin_progress(self, payload: dict) -> None:
         if self._ws is None or not self.core._plugins_ready:

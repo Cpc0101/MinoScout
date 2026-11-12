@@ -20,7 +20,7 @@ def config_locked(fn):
             return fn(*args, **kwargs)
     return wrapped
 
-# 插件类别。MCP 还没有具体项。bot = Webhook 只发通知（不含微信 / IM 对话）。
+# 插件类别。MCP 还没有具体项。bot = Webhook 只发通知。
 PLUGIN_CLASSES = ("cli", "bot", "mail", "mcp")
 
 
@@ -144,8 +144,6 @@ def _item(kind: str, plugin_id: str) -> dict[str, Any]:
     root = load_state()
     items = root.get("items") if isinstance(root.get("items"), dict) else {}
     row = items.get(_key(kind, plugin_id))
-    if not isinstance(row, dict) and kind == "im" and plugin_id == "wechat":
-        row = items.get(_key("bot", "wechat"))
     return dict(row) if isinstance(row, dict) else {}
 
 
@@ -154,10 +152,7 @@ def plain_value(kind: str, plugin_id: str, field: str) -> str:
 
 
 def secret_value(node_id: str, kind: str, plugin_id: str, field: str) -> str:
-    value = get_secret(account_name(node_id, kind, plugin_id, field))
-    if not value and kind == "im" and plugin_id == "wechat":
-        value = get_secret(account_name(node_id, "bot", plugin_id, field))
-    return value
+    return get_secret(account_name(node_id, kind, plugin_id, field))
 
 
 def installed(kind: str, plugin_id: str) -> bool:
@@ -271,9 +266,6 @@ def status_list(node_id: str) -> list[dict[str, Any]]:
         }
         if row.get("label"):
             entry["label"] = str(row["label"])
-        if kind == "cli" and pid == "feishu":
-            from mino_scout.plugins import feishu_messages
-            entry["status"] = feishu_messages.status()
         if kind == 'cli' and pid == 'meego':
             entry['attachment_upload_version'] = 1
         out.append(entry)
