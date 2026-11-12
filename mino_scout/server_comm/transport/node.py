@@ -41,6 +41,23 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat()
 
 
+def _announce_host(
+    node_id: str,
+    devices: Optional[list[P.DeviceManifest]] = None,
+    *,
+    mode: str = "running",
+) -> dict[str, Any]:
+    """HEARTBEAT/REGISTER.host：本机功耗采样 + 桌面就绪状态。"""
+    from mino_scout.executors.desktop import get_desktop_runtime
+    from mino_scout.tools.keep_alive.host_sample import sample_host
+
+    host = sample_host(mode=mode)
+    desktop = next((d for d in devices or [] if d.platform in {"mac", "win"}), None)
+    host.update(get_desktop_runtime().host(node_id, desktop))
+    # 空采样字段不要编码出去，免得 Hub 用 null 覆盖掉上一次有效的 CPU/内存数字。
+    return {key: value for key, value in host.items() if value is not None}
+
+
 _seq = 0
 
 
@@ -326,8 +343,6 @@ class NodeTransport:
 
         from mino_scout.runtime.input_contract import runtime_input_capabilities
 
-        from mino_scout.executors.desktop import get_desktop_runtime
-
         runtime_caps = runtime_input_capabilities()
         epoch = self.core.binding_guard.announce(execs, runtime_caps)
         payload = P.Register(
@@ -347,7 +362,9 @@ class NodeTransport:
             plugin_warning="正在核验插件账号归属",
             runtime_capabilities=runtime_caps,
             **epoch,
-            host=await asyncio.to_thread(get_desktop_runtime().host, self.core.node_id, next((d for d in devices or [] if d.platform in {"mac", "win"}), None)),
+            host=await asyncio.to_thread(
+                _announce_host, self.core.node_id, devices, mode=self.core.host_mode(),
+            ),
         )
         from mino_scout.runtime.platform_contract import validate_platform_announcement
         validate_platform_announcement(payload)
@@ -409,7 +426,7 @@ class NodeTransport:
             released = release_installed_import_blocks()
             if released:
                 SLog.i(TAG, f"已安装插件解除导入停用: {', '.join(released)}")
-        await self._send(P.MsgType.HEARTBEAT, await asyncio.to_thread(self.core.heartbeat))
+        await self._send(P.MsgType.HEARTBEAT, await asyncio.to_thread(self._heartbeat_payload, devices))
         try:
             from mino_scout.tools.keep_alive.runtime_sidecar import write_runtime_sidecar
 
@@ -449,11 +466,48 @@ class NodeTransport:
                     detail=f"{prev[sn].channels} → {dev.channels}",
                 )
 
+    def _heartbeat_payload(
+        self,
+        devices: Optional[list[P.DeviceManifest]] = None,
+        *,
+        device_delta: Optional[list[P.DeviceManifest]] = None,
+    ) -> P.Heartbeat:
+        """统一附带 host 采样与桌面状态，避免 REGISTER 后的瘦心跳把 Hub 上的指标冲掉。"""
+        hb = self.core.heartbeat()
+        hb.host = _announce_host(self.core.node_id, devices, mode=self.core.host_mode())
+        if device_delta is not None:
+            hb.device_delta = device_delta
+        if devices is not None:
+            desktop = next((d for d in devices if d.platform in {"mac", "win"}), None)
+            if desktop is not None:
+                from mino_scout.executors.desktop import DesktopExecutor, INSTALL_CAPS
+                native_id = desktop.platform
+                ready = desktop.desktop_state == "ready"
+                by_id = {executor.id: executor for executor in (hb.executors or [])}
+                by_id[native_id] = P.ExecutorManifest(
+                    id=native_id,
+                    available=True,
+                    provides=sorted(set(INSTALL_CAPS) | (set(DesktopExecutor.provides) if ready else set())),
+                    reason="" if ready else desktop.blocked_reason,
+                )
+                hb.executors = list(by_id.values())
+        epoch = self.core.binding_guard.announce(hb.executors, hb.runtime_capabilities)
+        hb.scout_process_generation = epoch["scout_process_generation"]
+        hb.capability_revision = epoch["capability_revision"]
+        hb.execution_binding_version = epoch["execution_binding_version"]
+        hb.node_connection_generation = self.core.binding_guard.connection_generation
+        from mino_scout.runtime.platform_contract import validate_platform_announcement
+        validate_platform_announcement(hb)
+        return hb
+
     async def _announce_shutdown(self) -> None:
         if not self._intentional_stop:
             return
         try:
-            await self._send(P.MsgType.HEARTBEAT, await asyncio.to_thread(self.core.heartbeat))
+            await self._send(
+                P.MsgType.HEARTBEAT,
+                await asyncio.to_thread(self._heartbeat_payload, list(self._last_devices.values()) or None),
+            )
         except Exception:
             pass
         hb = await asyncio.to_thread(self.core.heartbeat)
@@ -470,8 +524,9 @@ class NodeTransport:
             try:
                 await self._tick_heartbeat()
             except Exception as exc:
+                # 单次失败不能停掉整轮心跳，否则只会剩 REGISTER 后的瘦心跳，
+                # Hub 上的 CPU/内存采样永远写不进去。
                 SLog.w(TAG, f"心跳发送失败: {exc}")
-                return
 
     async def _tick_heartbeat(self) -> None:
         """心跳时重探 adb / 本机设备，把热插拔放进 device_delta。"""
@@ -495,34 +550,7 @@ class NodeTransport:
         delta: list[P.DeviceManifest] = []
         if devices is not None:
             delta = changed_devices(self._last_devices, devices)
-        from mino_scout.tools.keep_alive.host_sample import sample_host
-
-        host = await asyncio.to_thread(sample_host, mode=self.core.host_mode())
-        hb = await asyncio.to_thread(self.core.heartbeat)
-        from mino_scout.executors.desktop import get_desktop_runtime
-        host.update(await asyncio.to_thread(get_desktop_runtime().host, self.core.node_id, next((d for d in devices or [] if d.platform in {"mac", "win"}), None)))
-        hb.host = host
-        hb.device_delta = delta
-        if devices is not None:
-            desktop = next((d for d in devices if d.platform in {"mac", "win"}), None)
-            if desktop is not None:
-                from mino_scout.executors.desktop import DesktopExecutor, INSTALL_CAPS
-                # HEARTBEAT.executors is a full snapshot. Preserve every registered
-                # executor when replacing the native readiness entry.
-                native_id = desktop.platform
-                ready = desktop.desktop_state == "ready"
-                by_id = {executor.id: executor for executor in hb.executors}
-                by_id[native_id] = P.ExecutorManifest(id=native_id, available=True,
-                    provides=sorted(set(INSTALL_CAPS) | (set(DesktopExecutor.provides) if ready else set())),
-                    reason="" if ready else desktop.blocked_reason)
-                hb.executors = list(by_id.values())
-        epoch = self.core.binding_guard.announce(hb.executors, hb.runtime_capabilities)
-        hb.scout_process_generation = epoch["scout_process_generation"]
-        hb.capability_revision = epoch["capability_revision"]
-        hb.execution_binding_version = epoch["execution_binding_version"]
-        hb.node_connection_generation = self.core.binding_guard.connection_generation
-        from mino_scout.runtime.platform_contract import validate_platform_announcement
-        validate_platform_announcement(hb)
+        hb = await asyncio.to_thread(self._heartbeat_payload, devices, device_delta=delta)
         await self._send(P.MsgType.HEARTBEAT, hb)
         # _connection already persists the sidecar, including build diagnostics.
         await asyncio.to_thread(self._connection, "heartbeat", connected=True, registered=True)
