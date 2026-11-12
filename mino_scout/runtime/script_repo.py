@@ -73,6 +73,31 @@ def locate_script(root: Path, case_id: str, script_path: str = "") -> str:
     return found[0].relative_to(base).as_posix()
 
 
+_SCRIPT_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+
+
+def list_requirement(root: Path, requirement_id: str) -> list[dict[str, str]]:
+    """tests/<需求ID> 目录下直接放置的用例脚本。渠道后缀和不合法文件名跳过。"""
+    rid = str(requirement_id or "").strip()
+    if not _SCRIPT_ID.fullmatch(rid):
+        raise RepoError("script_path_invalid", "需求 ID 不合法")
+    base = Path(root).resolve()
+    folder = (base / "tests" / rid).resolve()
+    if base not in folder.parents:
+        raise RepoError("script_path_invalid", "需求目录超出仓库")
+    if not folder.is_dir():
+        return []
+    rows: list[dict[str, str]] = []
+    for path in sorted(folder.iterdir()):
+        if not path.is_file() or path.suffix != ".py" or not _SCRIPT_ID.fullmatch(path.stem):
+            continue
+        resolved = path.resolve()
+        if base not in resolved.parents:
+            continue
+        rows.append({"case_id": path.stem, "script_path": resolved.relative_to(base).as_posix()})
+    return rows
+
+
 def _cache_dir(url: str) -> Path:
     from mino_scout.config import config_dir
 

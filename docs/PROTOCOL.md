@@ -1020,7 +1020,18 @@ ADB Keyboard 的电脑 APK 缓存与手机已安装事实独立：缓存缺失�
 - Scout 看不到 Nexus 的 `case_workspaces` 绝对路径。禁止把本机路径当作节点上的路径。
 - 令牌无效、设备与 `sn` 不符、节点未登记该渠道：整次 `declined`，不执行脚本。
 
+## 脚本目录列举
 
+`capability_id` 为 `script.list`。Scout 克隆仓库后，只列出 `tests/<requirement_id>/` 目录下一层的 `.py`，不执行脚本。Nexus 不读仓库。
+
+| 参数 | 含义 |
+|---|---|
+| `repo_url` | 与 `script.run` 相同 |
+| `branch` | 可空 |
+| `revision` | 可空 |
+| `requirement_id` | 需求目录名 |
+
+成功时 `data.script_list` 为 `{requirement_id, revision, cases: [{case_id, script_path}]}`。渠道后缀文件和不合法文件名不列入。目录不存在时 `cases` 为空列表。
 
 ## 仓库应用清单同步
 

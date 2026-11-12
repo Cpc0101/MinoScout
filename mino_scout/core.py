@@ -167,6 +167,8 @@ class ScoutCore:
                         "reason_code": "execution_mode_unsupported"}})
         if _canonical_cap(req.capability_id) == "script_run":
             return self._run_script(req)
+        if req.capability_id == "script.list":
+            return self._list_scripts(req)
         if req.capability_id == "node.source_read":
             from mino_scout.case_sources import dispatch
             return dispatch(self, req)
@@ -479,6 +481,44 @@ class ScoutCore:
                 stop.set()
                 return script_dispatch.timeout_result(req)
         return script_dispatch.accept(self, req, stop)
+
+    def _list_scripts(self, req: P.Execute):
+        import shutil
+        from mino_scout.executors.base import make_event_result, now_iso
+        from mino_scout.runtime import script_repo
+        from mino_scout.schemas import EventStatus, PlanEvent
+
+        params = dict(req.params or {})
+        root = None
+        try:
+            rid = str(params.get("requirement_id") or "").strip()
+            root, sha = script_repo.checkout(
+                str(params.get("repo_url") or ""),
+                str(params.get("branch") or ""),
+                str(params.get("revision") or ""),
+            )
+            cases = script_repo.list_requirement(root, rid)
+            event = PlanEvent(seq=0, capability_id="script.list", params={})
+            return make_event_result(
+                event, status=EventStatus.PASS, executor_used="script", started_at=now_iso(), elapsed_ms=0,
+                summary=f"{len(cases)} 个脚本",
+                raw_response={"script_list": {"requirement_id": rid, "revision": sha, "cases": cases}},
+            )
+        except ValueError as exc:
+            event = PlanEvent(seq=0, capability_id="script.list", params={})
+            return make_event_result(
+                event, status=EventStatus.DECLINED, executor_used="script", started_at=now_iso(), elapsed_ms=0,
+                summary=str(exc)[:300], error=str(exc)[:300],
+            )
+        except Exception as exc:
+            event = PlanEvent(seq=0, capability_id="script.list", params={})
+            return make_event_result(
+                event, status=EventStatus.FAIL, executor_used="script", started_at=now_iso(), elapsed_ms=0,
+                summary=f"列出脚本失败：{type(exc).__name__}", error=f"{type(exc).__name__}: {exc}"[:400],
+            )
+        finally:
+            if root is not None:
+                shutil.rmtree(root, ignore_errors=True)
 
     def _dispatch(self, req: P.Execute) -> EventResult:
         # Recheck after the executor queue, immediately before native dispatch.
