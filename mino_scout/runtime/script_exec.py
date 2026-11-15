@@ -6,10 +6,13 @@ from __future__ import annotations
 
 import ast
 import difflib
+import hashlib
 import importlib.util
+import json
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
@@ -32,8 +35,10 @@ class ScriptHalt(BaseException):
 
 
 class ScriptAbort(Exception):
-    def __init__(self, message: str, *, reason_code: str):
+    def __init__(self, message: str, *, reason_code: str, status: str = "fail", details: dict | None = None):
         self.reason_code = reason_code
+        self.status = status
+        self.details = dict(details or {})
         super().__init__(message)
 
 
@@ -75,32 +80,55 @@ class ActionResult:
 
 
 class _Scope:
-    def __init__(self, case: "Case", number: "int | str", role: str):
+    def __init__(self, case: "Case", number: "int | str", role: str, source_ref: str = ""):
         self._case = case
         self._number = number
         self._role = role
+        self._source_ref = str(source_ref or "")
 
     def _body(self, **extra: Any) -> dict[str, Any]:
         key = "title" if isinstance(self._number, str) else "number"
-        return {"op": "step", "role": self._role, key: self._number, **extra}
+        return {"op": "step", "role": self._role, key: self._number,
+                "source_ref": self._source_ref, "step_id": self._step_id, **extra}
 
     def __enter__(self) -> "Case":
         self._case._guard()
-        self._case._callback("script.callback", self._body(action="enter"), 15)
+        if self._source_ref and self._case._source_clauses and self._source_ref not in self._case._source_clauses:
+            raise ScriptAbort("source_ref 不在用例原文中", reason_code="source_ref_unknown", status="blocked")
+        if self._source_ref in self._case._source_roles and self._case._source_roles[self._source_ref] != self._role:
+            raise ScriptAbort("source_ref 的原文类型与步骤不符", reason_code="source_ref_role_mismatch", status="blocked")
+        self._previous = (self._case._step, self._case._role, self._case._source_ref, self._case._step_id)
+        self._start_assertions = len(self._case._assertions)
+        self._step_id = "step_" + uuid.uuid4().hex
         self._case._step = self._number
         self._case._role = self._role
+        self._case._source_ref = self._source_ref
+        self._case._step_id = self._step_id
+        self._case._callback("script.callback", self._body(action="enter"), 15)
         return self._case
 
     def __exit__(self, exc_type, exc, tb) -> bool:
-        failed = exc_type is not None
+        empty = exc_type is None and self._role == "check" and len(self._case._assertions) == self._start_assertions
+        failed = exc_type is not None or empty
+        if failed:
+            self._case._failure_role = self._case._failure_role or self._role
+        if exc_type is not None and isinstance(exc, Exception):
+            self._case._latched_error = self._case._latched_error or (
+                exc if isinstance(exc, ScriptAbort) else ScriptAbort(str(exc), reason_code="script_failed"))
         try:
-            self._case._callback("script.callback", self._body(action="leave", failed=failed), 15)
+            self._case._callback("script.callback", self._body(action="leave", failed=failed,
+                reason_code="check_empty" if empty else str(getattr(exc, "reason_code", "") or "")), 15)
+            if not failed and self._source_ref:
+                self._case._covered.add(self._source_ref)
+            if empty:
+                error = ScriptAbort("check 中没有执行有效断言", reason_code="check_empty", status="blocked")
+                self._case._latched_error = self._case._latched_error or error
+                raise error
         except Exception:
             if exc_type is None:
                 raise
         finally:
-            self._case._step = None
-            self._case._role = ""
+            self._case._step, self._case._role, self._case._source_ref, self._case._step_id = self._previous
         return False
 
 
@@ -167,7 +195,16 @@ def _run_locked(core, payload, root: Path, *, deadline: float, stop) -> dict[str
         if getattr(payload, "revision", ""):
             case._report("checkout", ActionResult(ok=True, summary=f"脚本仓库提交 {payload.revision}", status="pass"), "scout", 0)
         _execute_hooks(root, payload.script_path, case)
-        return {"status": "pass", "summary": "脚本执行完成", "error": "", "reason_code": "", "touched": bool(case.touched)}
+        case._guard()
+        if case._latched_error is not None:
+            raise case._latched_error
+        if not case._assertions:
+            raise ScriptAbort("脚本没有有效断言；观察记录已保留", reason_code="assertion_missing", status="blocked")
+        missing = sorted(set(case._source_clauses) - case._covered)
+        if missing:
+            raise ScriptAbort("原文条目未覆盖：" + ", ".join(missing), reason_code="source_coverage_missing", status="blocked")
+        return {"status": "pass", "summary": "脚本执行完成且断言通过", "error": "", "reason_code": "", "touched": bool(case.touched),
+                "execution_started": "yes" if case.touched else "no", "source_coverage": case._coverage()}
     except ScriptHalt as exc:
         return _failure(exc, case)
     except ScriptAbort as exc:
@@ -178,11 +215,15 @@ def _run_locked(core, payload, root: Path, *, deadline: float, stop) -> dict[str
 
 def _failure(exc: BaseException, case: Case | None) -> dict[str, Any]:
     return {
-        "status": "fail",
+        "status": str(getattr(exc, "status", "") or ("cancelled" if getattr(exc, "reason_code", "") == "cancelled" else "fail")),
         "summary": str(exc)[:300],
         "error": str(exc)[:400],
         "reason_code": str(getattr(exc, "reason_code", "") or "script_failed"),
         "touched": bool(case and case.touched),
+        "execution_started": "yes" if case and case.touched else "no",
+        "failure_stage": str((case._failure_role or case._role) if case else "admission"),
+        "resource_isolated": bool(getattr(exc, "details", {}).get("resource_isolated")),
+        "source_coverage": case._coverage() if case else {},
     }
 
 
@@ -253,7 +294,7 @@ class AppRef:
 
 
 def _otp_code_of(row: dict) -> str:
-    """config 里可选 otp.code：有则当固定验证码，没有则取码时要人工提供。"""
+    """兼容旧脚本仓的 otp.code；新项目验证码策略由 Nexus 项目环境下发。"""
     otp = row.get("otp")
     if not isinstance(otp, dict):
         return ""
@@ -329,7 +370,7 @@ class _Scout:
         return wait(self._case, ms)
 
     def otp(self, account) -> str:
-        """取验证码：账号自带码 → 脚本仓 otp.code → 否则要求人工提供。"""
+        """取验证码：账号自带码 → Nexus 登录策略 → 旧脚本仓固定码 → 人工。"""
         from mino_scout.server_comm.callbacks import otp
 
         return otp(self._case, account)
@@ -351,25 +392,32 @@ class _Nexus:
     def __init__(self, case: "Case"):
         self._case = case
 
-    def prep(self, number: int) -> _Scope:
+    def prep(self, number: int | str, source_ref: str = "") -> _Scope:
         from mino_scout.platform.scout.run import prep
 
-        return prep(self._case, number)
+        return prep(self._case, number, source_ref=source_ref)
 
-    def do(self, number: int) -> _Scope:
+    def do(self, number: int | str, source_ref: str = "") -> _Scope:
         from mino_scout.platform.scout.run import do
 
-        return do(self._case, number)
+        return do(self._case, number, source_ref=source_ref)
 
-    def check(self, number: int) -> _Scope:
+    def check(self, number: int | str, source_ref: str = "") -> _Scope:
         from mino_scout.platform.scout.run import check
 
-        return check(self._case, number)
+        return check(self._case, number, source_ref=source_ref)
 
-    def account(self) -> SimpleNamespace:
+    def account(self, requirements: dict | None = None, prefer: list | None = None) -> SimpleNamespace:
         from mino_scout.server_comm.callbacks import account
 
-        return account(self._case)
+        return account(self._case, requirements=requirements, prefer=prefer)
+
+    def assert_equal(self, actual: Any, expected: Any, message: str = "") -> None:
+        self._case._guard()
+        passed = actual == expected
+        self._case._assert("equal", "pass" if passed else "fail", expected=expected, actual=actual, message=message)
+        if not passed:
+            raise self._case._latched_error
 
     def note(self, text: str, **fields: Any) -> None:
         from mino_scout.server_comm.callbacks import note
@@ -409,6 +457,66 @@ class Case:
         self._started = time.time()
         self._mail_to = ""
         self._apps: dict[str, App] = {}
+        self._recorder = getattr(core, "_recording", None)
+        self._source_ref = ""
+        self._step_id = ""
+        self._assertions: list[dict] = []
+        self._latched_error: ScriptAbort | None = None
+        self._failure_role = ""
+        self._covered: set[str] = set()
+        sidecar = (root / payload.script_path).with_suffix(".yaml")
+        self._source_snapshot = parse_yaml(sidecar.read_text(encoding="utf-8")) if sidecar.is_file() else {}
+        if not isinstance(self._source_snapshot, dict):
+            raise ScriptAbort("用例 sidecar 不是对象", reason_code="source_invalid", status="blocked")
+        if sidecar.is_file():
+            source = self._source_snapshot.get("source")
+            if str(self._source_snapshot.get("case_id") or "") != (root / payload.script_path).stem:
+                raise ScriptAbort("sidecar case_id 与脚本不一致", reason_code="source_case_mismatch", status="blocked")
+            if not isinstance(source, dict) or not str(source.get("revision") or "").strip():
+                raise ScriptAbort("sidecar 缺固定原文版本", reason_code="source_revision_missing", status="blocked")
+            seen_ids = set()
+            for group in ("preconditions", "steps", "expectations"):
+                rows = self._source_snapshot.get(group, [])
+                if not isinstance(rows, list) or group == "expectations" and not rows:
+                    raise ScriptAbort(f"sidecar {group} 无效", reason_code="source_invalid", status="blocked")
+                for row in rows:
+                    if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"].strip() or not str(row.get("text") or "").strip():
+                        raise ScriptAbort("sidecar 条目缺 id/text", reason_code="source_invalid", status="blocked")
+                    if row["id"] in seen_ids:
+                        raise ScriptAbort("sidecar 条目编号重复", reason_code="source_duplicate", status="blocked")
+                    seen_ids.add(row["id"])
+        self._source_clauses = {str(row["id"]): row for key in ("preconditions", "steps", "expectations")
+            for row in (self._source_snapshot.get(key) or []) if isinstance(row, dict) and row.get("id")}
+        self._source_roles = {str(row["id"]): role for key, role in (("preconditions", "prep"), ("steps", "do"), ("expectations", "check"))
+            for row in (self._source_snapshot.get(key) or []) if isinstance(row, dict) and row.get("id")}
+        immutable = {key: self._source_snapshot.get(key, {} if key == "source" else [])
+            for key in ("source", "preconditions", "steps", "expectations")}
+        self._source_hash = hashlib.sha256(json.dumps(immutable, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest() if self._source_snapshot else ""
+        if self._recorder:
+            from mino_scout.runtime.records import scrub
+            config_doc = parse_yaml((root / "config.yaml").read_text(encoding="utf-8")) if (root / "config.yaml").is_file() else {}
+            # Register OTP/password values before any free text is persisted.
+            config_snapshot = scrub(config_doc)
+            paths = [p for p in root.rglob("*") if p.is_file() and not p.is_symlink() and p.suffix in {".py", ".yaml", ".yml"}]
+            files = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
+            self._recorder.store.update_metadata(self._recorder.task_id, self._recorder.attempt_id,
+                {"source_snapshot": self._source_snapshot, "source_hash": self._source_hash, "config_snapshot": config_snapshot,
+                 "file_hashes": files, "revision": str(getattr(payload, "revision", "")), "script_path": payload.script_path})
+
+    def _coverage(self):
+        return {"expected": len(self._source_clauses), "covered": sorted(self._covered),
+                "missing": sorted(set(self._source_clauses) - self._covered)}
+
+    def _assert(self, checker: str, status: str, **evidence):
+        row = {"assertion_id": "assert_" + uuid.uuid4().hex, "checker": checker, "status": status,
+               "source_ref": self._source_ref, "source_hash": self._source_hash, "step_id": self._step_id, **evidence}
+        self._assertions.append(row)
+        if self._recorder:
+            self._recorder.append("assertion/result", row)
+        if status != "pass":
+            self._latched_error = self._latched_error or ScriptAbort(str(evidence.get("message") or "断言未通过"),
+                reason_code=str(evidence.get("reason_code") or "assertion_failed"), status="blocked" if status == "unknown" else "fail")
+        return row
 
     def repo_otp_code(self) -> str:
         """本次运行应用在 config.yaml 里的固定验证码；没有则空串。"""
@@ -447,7 +555,11 @@ class Case:
             "error": "" if result.ok else result.summary[:300],
             "executor_used": executor,
             "elapsed_ms": int(elapsed),
+            "action_seq": self._seq, "source_ref": self._source_ref, "source_hash": self._source_hash,
+            "step_id": self._step_id, "data": result.data,
         }
+        execution = result.data.get("execution") if isinstance(result.data.get("execution"), dict) else {}
+        body["reason_code"] = str(execution.get("reason_code") or result.data.get("reason_code") or "")
         if app:
             body["app"] = app
         if extra:
@@ -456,18 +568,32 @@ class Case:
             body["case_step"] = self._step
             body["role"] = self._role
         if image is not None:
-            body["image_base64"] = str(getattr(image, "image_base64", "") or "")
-            body["image_mime"] = str(getattr(image, "image_mime", "") or "")
+            if self._recorder:
+                body.update(self._recorder.image(str(getattr(image, "image_base64", "") or ""), str(getattr(image, "image_mime", "") or "image/png")))
+            else:
+                body["image_base64"] = str(getattr(image, "image_base64", "") or "")
+                body["image_mime"] = str(getattr(image, "image_mime", "") or "")
             body["width"] = int(getattr(image, "width", 0) or 0)
             body["height"] = int(getattr(image, "height", 0) or 0)
-        self._callback("script.session", {"op": "tool_result", "event_type": "tool/result", "event": body}, 20)
+        if self._recorder:
+            self._recorder.append("tool/result", body)
+        else:
+            self._callback("script.session", {"op": "tool_result", "event_type": "tool/result", "event": body}, 20)
+        return body
 
     def _callback(self, capability: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
+        if self._recorder and capability == "script.callback" and params.get("op") in {"step", "note", "fail"}:
+            op = params["op"]
+            event_type = ("node/enter" if params.get("action") == "enter" else "node/leave") if op == "step" else "script/note"
+            self._recorder.append(event_type, {**params, "source_ref": self._source_ref, "source_hash": self._source_hash, "step_id": self._step_id})
+            return {}
         from mino_scout.server_comm.nexus_link import call
 
         return call(self, capability, params, timeout)
 
     def _guard(self) -> None:
+        if self._recorder and self._recorder.cancelled():
+            raise ScriptHalt("运行已取消", reason_code="cancelled")
         if self.stop is not None and self.stop.is_set():
             raise ScriptHalt("脚本运行超时", reason_code="script_timeout")
         if self.deadline and time.monotonic() >= self.deadline:
@@ -506,6 +632,9 @@ class App:
         self._page_key = ""
         self._shot = None
         self._frames: list[Any] = []
+        self._frame_refs: list[dict] = []
+        self._observation_id = ""
+        self._artifact_id = ""
 
     @property
     def case(self) -> "Case":
@@ -626,13 +755,17 @@ class App:
         self._guard()
         self._require_channel()
         from mino_scout import screen as SCREEN
+        self._begin_action("screenshot", {})
         self.touched = True
         shot = SCREEN.capture(self._device_ref(), timeout_sec=15, compress_ratio=2.0)
         self._shot = shot
+        self._observation_id = "obs_" + uuid.uuid4().hex
         ok = bool(shot.has_image())
         result = ActionResult(ok=ok, summary="已截图" if ok else (shot.error or "没有截到图"), status="pass" if ok else "fail",
                                data={"width": int(shot.width or 0), "height": int(shot.height or 0)})
-        self._report("screenshot", result, str(shot.source or _EXECUTOR.get(self._platform) or "screen"), int(shot.elapsed_ms or 0), image=shot if ok else None)
+        body = self._report("screenshot", result, str(shot.source or _EXECUTOR.get(self._platform) or "screen"), int(shot.elapsed_ms or 0), image=shot if ok else None,
+                            extra={"observation_id": self._observation_id})
+        self._artifact_id = str(body.get("artifact_id") or "")
         if not ok:
             raise ScriptAbort(result.summary or "没有截到图", reason_code="script_failed")
         return result
@@ -645,6 +778,7 @@ class App:
     def hierarchy(self) -> ActionResult:
         self._guard()
         self._require_channel()
+        self._begin_action("hierarchy", {})
         self.touched = True
         status, fields = self.core._hierarchy_fields(self._device_ref(), run_id=self.run_id)
         text = _visible_text(fields)
@@ -656,6 +790,8 @@ class App:
         result = ActionResult(ok=ok, summary="已读取界面结构" if ok else str(fields.get("error") or "没有读到界面结构"),
                                status="pass" if ok else "fail", data=data)
         extra = _hierarchy_evidence(fields, nodes)
+        self._observation_id = "obs_" + uuid.uuid4().hex
+        extra["observation_id"] = self._observation_id
         self._report("hierarchy", result, str(fields.get("source") or "core"), int(fields.get("elapsed_ms") or 0), extra=extra or None)
         if not ok:
             raise ScriptAbort(result.summary or "没有读到界面结构", reason_code="script_failed")
@@ -667,11 +803,9 @@ class App:
         return on_page(self, page_key)
 
     def expect(self, page: str = "", prompt: str = "", verdict: str = "pass") -> str:
-        """断言一条预期，按 on_page → llm → vlm 的顺序取。
+        """分别验证页面身份和业务预期；文字证据不确定时取新截图判断。
 
-        - 有 page 且页面锚点对得上，直接算过，不调模型；
-        - 锚点对不上或没给 page 时，先用文本模型读界面文字（省一次看图）；
-        - 文本读不出结论，才让视觉模型看截图。
+        页面成立不能代替业务预期成立；明确失败直接终止本次断言。
         """
         from mino_scout.platform.scout.run import expect as _expect
 
@@ -702,16 +836,54 @@ class App:
         if not executor.supports(capability):
             raise ScriptAbort(f"{self._platform} 渠道不支持 {capability}", reason_code="declined")
         self.touched = True
-        self._seq += 1
+        self._begin_action(capability, params)
         event = PlanEvent(seq=self._seq, capability_id=capability, event_kind=capability, params=dict(params),
                            executor_order=[_EXECUTOR[self._platform]], selected_impl={"executor": _EXECUTOR[self._platform]})
         started = time.perf_counter()
-        result = executor.execute(event, ExecutorContext(device=self._device_ref(), run_id=self.run_id, step_idx=self._seq))
+        router = getattr(self.core, "router", None)
+        if router is not None:
+            result = router.dispatch(event, self._device_ref(), run_id=self.run_id, step_idx=self._seq,
+                                     shared={"write_stopped": lambda: bool(self._case._latched_error)})
+        else:
+            result = executor.execute(event, ExecutorContext(device=self._device_ref(), run_id=self.run_id, step_idx=self._seq))
         elapsed = int((time.perf_counter() - started) * 1000)
         status = str(getattr(result.status, "value", result.status) or "fail")
         action = ActionResult(ok=status == "pass", summary=str(result.summary or ""), status=status, data=_public(result.raw_response))
         self._report(capability, action, str(result.executor_used or _EXECUTOR[self._platform]), elapsed, extra=extra)
+        if not action.ok:
+            raw = action.data
+            execution = raw.get("execution") if isinstance(raw.get("execution"), dict) else {}
+            control = raw.get("execution_control") if isinstance(raw.get("execution_control"), dict) else {}
+            reason = str(execution.get("reason_code") or raw.get("reason_code") or raw.get("error_kind") or "action_failed")
+            error = ScriptAbort(action.summary or "设备动作失败", reason_code=reason,
+                                status=status if status in {"fail", "blocked", "declined", "skipped"} else "fail", details=control)
+            self._case._latched_error = self._case._latched_error or error
+            raise error
         return action
+
+    def _begin_action(self, capability: str, params: dict):
+        from mino_scout.runtime.execution_boundary import READS
+        self._seq += 1
+        writing = capability not in READS
+        if writing:
+            connection = getattr(self.core, "_record_connection", None)
+            if connection is not None and not connection.is_set():
+                raise ScriptAbort("节点已断线，暂停新增设备写操作", reason_code="node_disconnected", status="blocked")
+            if self._case._latched_error:
+                raise self._case._latched_error
+            self._shot = None
+            self._observation_id = ""
+            self._artifact_id = ""
+        safe_params = {key: value for key, value in params.items() if key not in {"text", "script"}}
+        if "text" in params:
+            safe_params["text_length"] = len(str(params["text"]))
+        if "script" in params:
+            safe_params["script_sha256"] = hashlib.sha256(str(params["script"]).encode()).hexdigest()
+        if self._case._recorder:
+            self._case._recorder.append("tool/call", {"capability_id": capability, "params": safe_params,
+                "action_seq": self._seq, "effect_class": "write" if writing else "read", "app": self.key,
+                "source_ref": self._case._source_ref, "source_hash": self._case._source_hash,
+                "step_id": self._case._step_id, "role": self._case._role})
 
     def _web(self, kind: str, params: dict[str, Any], text: str = "") -> ActionResult:
         from mino_scout.platform.web.script import act
@@ -825,7 +997,7 @@ class App:
 
     def _report(self, capability: str, result: ActionResult, executor: str, elapsed: int, image=None,
                 extra: dict[str, Any] | None = None) -> None:
-        self._case._report(capability, result, executor, elapsed, image=image, app=self.key, extra=extra)
+        return self._case._report(capability, result, executor, elapsed, image=image, app=self.key, extra=extra)
 
     def _callback(self, capability: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
         return self._case._callback(capability, params, timeout)
@@ -901,6 +1073,7 @@ def _anchors_match(page: dict, text: str) -> bool:
         if nodes:
             checked = True
             visible = _visible_nodes(page)
+            required = []
             for row in nodes:
                 if not isinstance(row, dict):
                     continue
@@ -911,8 +1084,9 @@ def _anchors_match(page: dict, text: str) -> bool:
                 key = {"resource_id": "resource_id", "text": "text", "content_desc": "content_desc", "class": "class"}.get(kind)
                 if not key:
                     continue
-                if any(value in str(node.get(key) or "") for node in visible):
-                    return True
+                required.append((key, value))
+            if required and all(any(value == str(node.get(key) or "") for node in visible) for key, value in required):
+                return True
             if visible:
                 continue
         anchors_any = [str(item) for item in (state.get("any") or []) if str(item).strip()]

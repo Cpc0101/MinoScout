@@ -91,13 +91,17 @@ def schedule_heavy_deps(*, manifest_url: str = "", adb_hook=None) -> None:
 
     def _worker() -> None:
         global _last_result, _running
+        from mino_scout.tools.update import update_progress as UP
+
         try:
             SLog.i(TAG, "开始后台安装 Chromium / ADB 依赖…")
             _last_result = install_heavy_deps(manifest_url=manifest_url, adb_hook=adb_hook)
             SLog.i(TAG, "后台依赖安装完成")
+            UP.emit("done", label="后台依赖安装完成", percent=100, done=True)
         except Exception as exc:
             SLog.e(TAG, f"后台依赖安装失败: {exc}")
             _last_result = {"ok": False, "error": str(exc)}
+            UP.emit("error", label="后台依赖安装失败", percent=100, error=str(exc), done=True)
         finally:
             with _lock:
                 _running = False

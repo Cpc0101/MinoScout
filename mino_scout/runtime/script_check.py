@@ -31,24 +31,32 @@ class Hint:
     line: int
     code: str
     text: str
+    severity: str = "error"
 
     def __str__(self) -> str:
-        return f"{self.path}:{self.line}: [{self.code}] {self.text}"
+        label = self.code if self.severity == "error" else f"{self.code}/warning"
+        return f"{self.path}:{self.line}: [{label}] {self.text}"
 
 
-def check_repo(root: Path) -> list[Hint]:
+def check_repo(root: Path, *, require_cases: bool = False) -> list[Hint]:
     root = Path(root).resolve()
     hints: list[Hint] = []
     keys = _config_keys(root, hints)
     used: dict[str, tuple[str, int]] = {}
+    trees: dict[Path, ast.Module] = {}
     for path in sorted(root.rglob("*.py")):
         rel = path.relative_to(root)
         if _SKIP_DIRS.intersection(rel.parts):
             continue
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))
-        except SyntaxError:
-            continue  # 语法错误 agent 自己看得到，这里不重复
+        except SyntaxError as exc:
+            hints.append(Hint(str(rel), int(exc.lineno or 1), "syntax", exc.msg))
+            continue
+        except (OSError, UnicodeError) as exc:
+            hints.append(Hint(str(rel), 0, "source_unreadable", str(exc)))
+            continue
+        trees[path] = tree
         for line, code, text in _scan(tree):
             hints.append(Hint(str(rel), line, code, text))
         if "tests" in rel.parts:
@@ -60,6 +68,8 @@ def check_repo(root: Path) -> list[Hint]:
             if key not in keys:
                 hints.append(Hint(rel, line, "config_missing", f"config.yaml 的 apps 里没有 {key}"))
     hints.extend(_page_layout(root, keys))
+    from mino_scout.runtime.script_validation import validate_sources
+    hints.extend(Hint(*row) for row in validate_sources(root, trees, require_cases=require_cases))
     return hints
 
 

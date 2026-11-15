@@ -246,23 +246,25 @@ def _os_getpid() -> int:
 
 
 def cmd_check(argv: list[str]) -> int:
-    """check [目录]：写完用例后自检，打印提示。有提示退出码 1，没有 0。执行时不做任何预检。"""
+    """静态检查源码和依赖；错误返回 1，警告保留待运行验证。"""
     from pathlib import Path
 
     from mino_scout.runtime.script_check import check_repo
 
     ap = argparse.ArgumentParser(prog="mino-scout check")
     ap.add_argument("path", nargs="?", default=".")
+    ap.add_argument("--require-cases", action="store_true", help="交付用例时要求至少存在一个测试脚本")
     ns = ap.parse_args(argv)
     root = Path(ns.path).expanduser()
     if not root.is_dir():
         print(f"不是目录：{root}", file=sys.stderr)
         return 2
-    hints = check_repo(root)
+    hints = check_repo(root, require_cases=ns.require_cases)
     for hint in hints:
         print(hint)
-    print(f"{len(hints)} 条提示" if hints else "没有提示")
-    return 1 if hints else 0
+    errors = sum(hint.severity == "error" for hint in hints)
+    print(f"{errors} 条错误，{len(hints) - errors} 条待运行验证的提示" if hints else "静态检查通过；可执行性与预期覆盖仍需运行验证")
+    return 1 if errors else 0
 
 
 def main(argv: list[str] | None = None) -> int:

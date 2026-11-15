@@ -2,7 +2,7 @@
 
 > **本文在 MinoNexus 与 MinoScout 两个仓库各有一份，必须逐字相同。**
 > 契约真源是两仓同步的本文和两仓 `protocol.py` 实现。改动必须在同一个 PR 周期内完成两仓同步：先改本文，再改两边实现。本地 fixture 仅供调试，不提交 Git。
-> 没有版本号字段，也没有 `version` 键。`script.run` 的 `params` 只有明文列出的字段。
+> 不增加新的信封类型。脚本及记录能力使用本文列出的字段；`record_api_version=1` 显式声明本地记录能力。
 
 用例步骤与框架指令的统一出入口是 `EXECUTE` → `RESULT`。截图、层级、探活、取消 run、节点 stop/restart/update、设备热插拔都是 `capability_id`，走同一套形状。线上只有五种 `type`：`REGISTER` / `REGISTERED` / `HEARTBEAT` / `EXECUTE` / `RESULT`。没有 `OBSERVE` / `PROBE` / `CANCEL_RUN` / `NODE_EVENT` / `NODE_COMMAND`。
 
@@ -62,7 +62,7 @@
 | 5 | 双向 | `RESULT` | — | `EXECUTE` 的应答，靠 `reply_to` 配对 |
 
 > **协议里没有 `DECIDE` / `STEP_EVENT` / `RUN_FINISH` / `NEED_HUMAN`。**
-> 执行循环在 Nexus（见本仓 `docs/架构/系统架构.md`），决策、trace 落库、问人全部在 Nexus 本地完成，不过网。
+> 脚本执行与完整记录在 Scout；Nexus 持久保存准入、任务与资源状态和已确认摘要。旧会话接口仅为历史记录兼容。
 > 用例主通信只剩 `EXECUTE` ↔ `RESULT`。
 
 ---
@@ -1039,7 +1039,7 @@ Nexus 不读脚本仓库。脚本仓库根 `config.yaml` 的 `apps` 改动并 pu
 
 - `PUT /project/{project_id}/repo-apps`（project_maintainer）：body `{revision, branch, apps, remove}`，按差异更新：`apps` 里的应用按 key 新增或整项替换，`remove`（key 数组）删除，其余保留；两者不能同时为空，同一 key 不能同时出现。
 - `GET /project/{project_id}/repo-apps`：返回 `{project_id, revision, branch, apps, synced_by, synced_at}`，未同步时 `apps={}`、`revision=""`。
-- 校验（不合格 422，`reason_code=repo_apps_invalid`，message 指明应用与字段）：本次提交的 apps 逐项校验，合并后 ≤32 个；key 匹配 `^[A-Za-z][A-Za-z0-9_]{0,31}$`；每项必须有 `app_id`（Nexus 应用 id）和 `platform ∈ {android,ios,web,mac,win}`；身份字段只允许 `package` / `bundle_id` / `url`（url 须 http/https），可带 `envs: {环境名: {package|bundle_id|url}}`；含 password / token / otp / secret / key 等敏感键名一律拒绝。
+- 校验（不合格 422，`reason_code=repo_apps_invalid`，message 指明应用与字段）：本次提交的 apps 逐项校验，合并后 ≤32 个；key 匹配 `^[A-Za-z][A-Za-z0-9_]{0,31}$`；每项必须有 `platform ∈ {android,ios,web,mac,win}`；`app_id` 可选（缺省时 Nexus 按 key 对齐或自动创建应用并回填）；身份字段只允许 `package` / `bundle_id` / `url`（url 须 http/https），可带 `envs: {环境名: {package|bundle_id|url}}`；含 password / token / otp / secret / key 等敏感键名一律拒绝；登录方式、验证码策略、Gmail 收件箱和自动新增序号由 Nexus 项目环境配置下发，`otp.code` 仅作旧仓库兼容，不属于新项目配置方式。`script.run` 的 `device_hint` 在能解析到清单时附带 `app_key`。
 - `case_run`：项目已有清单且 app 不在其中 → 400 `app_not_in_repo_config`；项目无清单则不校验。
 
 ## 应用安装与卸载
@@ -1146,3 +1146,55 @@ mac / win 同理：宿主在就可用，桌面未就绪时 `provides` 收窄到�
 `POST /forward/call` 与 MCP `nexus_forward` 是通用透传，不查能力目录。
 调用方只给 `capability_id` + `sn` 时，Nexus 按设备平台补 `executor_order`（恰好一个）与
 `selected_impl.executor`；Scout 的 Router 要求这两项，缺了会回 `executor_order_must_select_one`。
+
+
+## Scout 本地运行记录与异步执行
+
+两种 Nexus 部署实现同一业务契约。Scout 的完整事件、截图、界面结构和断言保存在本机独立 records 目录，不在临时 Git workspace；Nexus 仅保存执行索引、路由、租约和已确认摘要。记录读取通过现有反向连接进行，Scout 不开放监听端口。
+
+### 身份与异步派发
+
+REGISTER / HEARTBEAT 增加 `record_api_version`（缺省 0；支持此节的节点报 1）。`ScriptRun` 保留原字段，增加 `task_id`、`attempt_id`、`owner_user_id`、`execution_timeout_sec`（默认 600）。owner 来自 Nexus 的已认证任务身份。task_id 缺省沿用 run_id；attempt_id 缺省沿用 session_id；不重新解释既有 run_id/session_id。重投相同 attempt 只返回已有状态，载荷不一致拒绝；显式重跑生成新 attempt/session。
+
+`script.submit` 是短请求：Scout 持久接单后返回 RESULT PASS，data 为执行摘要，state=accepted、status=queued。**这只确认接单，不代表测试通过。** 脚本预算取 execution_timeout_sec，独立于本次通信 timeout_sec。旧 script.run 仍支持同步调用。
+
+摘要字段：task_id、run_id、session_id、attempt_id、case_id、owner_user_id、node_id、sn、platform、revision、script_path、state、status、summary、reason_code、failure_stage、elapsed_ms、execution_started、started_at、finished_at、summary_version、last_event_seq、sealed、detail_availability、assertions，可带 source_coverage/source_hash。state 为 accepted/running/completed/interrupted/cancel_requested；status 保留 queued/running/pass/fail/blocked/declined/skipped/cancelled。
+
+### 摘要确认与恢复
+
+Scout 通过新的 EXECUTE `record.sync` 发送摘要（params 直接为摘要）。Nexus 校验已持久化的任务/attempt/节点/用户归属，持久更新后返回 data `{attempt_id, ack_version}`。summary_version 单调递增，旧版本不能覆盖新版本，终态之后仍接受合法补报。执行终态和待补报消息在本地同一事务落盘；Scout 重连使用新信封补报，不能把旧连接 RESULT 直接重放。ACK 仅表示索引已保存，不表示明细已备份上云。
+
+断线不等于测试失败。取消请求与确认停止分开；进程重启发现开始但无结果的动作，应记录 interrupted/结果未知，不自动重放设备操作。Nexus 通过持久派发和对账处理任务，不依赖 HTTP waitUntil 维持长任务。
+
+### 读取与取消能力
+
+所有请求包含 task_id、session_id、attempt_id、owner_user_id（由 Nexus 从任务解析，不信任浏览器传入）。只能按记录 ID 读取，不能接受任意文件路径。
+
+| capability_id | params 补充 | RESULT.data |
+|---|---|---|
+| record.status | — | 执行摘要 |
+| record.manifest | 可仅指定 task_id | task_id、attempts 摘要列表 |
+| record.events | after_seq=0、limit=100（最多200）、max_bytes=524288（最多1048576） | items、next_seq、high_watermark、has_more、sealed、record_source=scout |
+| record.artifact | artifact_id、offset=0、length=262144（最多524288） | artifact_id、mime_type、total_size、offset、bytes_read、eof、data_base64、sha256 |
+| record.cancel | — | 持久取消请求后的摘要；仅 worker 停止后算 cancelled |
+
+事件为 `{seq, ts, type, payload}`；seq 在单次执行内单调递增。类型沿用 node/enter、node/leave、tool/call、tool/result、script/note，增加 assertion/result。payload 保留 source_ref/source_hash/step_id/app/capability_id/status/reason_code/observation_id/artifact_id 等关联字段。大结构或图片按 artifact 引用；敏感输入不写归档。artifact 是有界范围读取，每次响应是完整 JSON，并非传输分片。
+
+错误码：record_not_found、artifact_not_found、artifact_expired、record_owner_mismatch、record_unavailable。网关将节点离线转为 evidence_temporarily_unavailable；不能用空数组伪装成功。删除记录保留过期标记；未完成、未同步或结果未知的记录不被普通清理删除。
+
+### HTTP 与 MCP
+
+- GET /case-runner/tasks 及 /tasks/{task_id}：Nexus 索引，每例带 record_source=scout、record_node_id、attempt_id、session_id、detail_availability、status_sync_at。
+- GET /case-runner/sessions/{session_id}/record：从原 Scout 读取摘要。
+- GET /case-runner/sessions/{session_id}/events?from_seq=N&limit=100：Scout 记录中 from_seq 是排他游标（兼容 after_seq）；返回 items/next_seq/high_watermark/has_more/sealed。旧会话保持旧契约，不按错误猜回退。
+- GET /case-runner/sessions/{session_id}/artifacts/{artifact_id}：经 Nexus 鉴权后转发真实 MIME 媒体；按需有界取图，不把整批图片放进任务 JSON。
+- POST /case-runner/tasks/{task_id}/cancel：持久取消意图，最终状态等待 Scout 确认。
+- MCP session_events/session_screenshot 复用记录网关。任务返回 report_url，基于部署配置的 Workbench origin 和 `/testing/projects/{project_id}/apps/{app_id}/tasks/{task_id}`。
+
+### 用例原文与账号
+
+脚本可带同 stem `.yaml` 原文快照：case_id、source(url/revision)、preconditions/steps/expectations（每条 id/text）、account_requirements(all/prefer 子句列表)。source_hash 绑定原文及条款，完整快照仅归档在 Scout。prep/do/check 增加可选 source_ref，同一原文条款可被多个实现块引用；引用静态齐全不代表执行覆盖或语义正确。check 必须产生有效断言；零断言采集只留下证据，不能判正式测试通过。
+
+account(requirements=None, prefer=None) 通过原 script.callback op=account 明确传递 requirements。all/prefer 采用 `[{facet, op, value}]`；无参保留既有服务器用例条件。环境、归属、健康与占用仍校验；动态业务标签用于排序，不作为当前状态证明。未知前置保留待验证，不把 prep 标题当作事实或租号参数。
+
+执行摘要的 `resource_isolated` 是布尔值：取消确认只证明 worker 已停止；若最后设备动作结果不明，仍为 true，Nexus 必须保留设备和账号隔离。`started_at` / `finished_at` 使用 ISO 8601 UTC。

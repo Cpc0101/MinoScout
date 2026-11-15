@@ -13,7 +13,7 @@ def _provider():
     try:
         return load_provider()
     except ValueError as exc:
-        raise ScriptAbort(str(exc) or "这台机器还没有配置模型（~/.mino/config.toml）", reason_code="model_unconfigured") from exc
+        raise ScriptAbort(str(exc) or "这台机器还没有配置模型（~/.mino/config.toml）", reason_code="model_unconfigured", status="blocked") from exc
 
 
 def complete(case, prompt: str, text: str = "", schema: dict | None = None) -> Any:
@@ -48,16 +48,16 @@ def complete(case, prompt: str, text: str = "", schema: dict | None = None) -> A
         with request.urlopen(req, timeout=60) as resp:
             raw = json.loads(resp.read().decode("utf-8"))
     except error.HTTPError as exc:
-        raise ScriptAbort(f"模型请求失败：HTTP {exc.code}", reason_code="model_empty") from exc
+        raise ScriptAbort(f"模型请求失败：HTTP {exc.code}", reason_code="model_empty", status="blocked") from exc
     except (error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
-        raise ScriptAbort("模型没有返回结果", reason_code="model_empty") from exc
+        raise ScriptAbort("模型没有返回结果", reason_code="model_empty", status="blocked") from exc
     content = _content(raw)
     try:
         parsed = json.loads(content) if content else {}
     except json.JSONDecodeError as exc:
-        raise ScriptAbort("模型没有返回结果", reason_code="model_empty") from exc
+        raise ScriptAbort("模型没有返回结果", reason_code="model_empty", status="blocked") from exc
     if not isinstance(parsed, dict):
-        raise ScriptAbort("模型没有返回结果", reason_code="model_empty")
+        raise ScriptAbort("模型没有返回结果", reason_code="model_empty", status="blocked")
     if schema:
         return parsed
     return str(parsed.get("text") or "")
@@ -68,7 +68,7 @@ def see(case, prompt: str, *, verdict: str = "", index: int | None = None) -> st
 
     shot = getattr(case, "_shot", None)
     if shot is None or not getattr(shot, "has_image", lambda: False)():
-        raise ScriptAbort("没有可用截图，不能做视觉判断", reason_code="observation_missing")
+        raise ScriptAbort("没有可用截图，不能做视觉判断", reason_code="observation_missing", status="blocked")
     cfg = _provider()
     base, model, key = cfg["base_url"], cfg["model"], cfg["api_key"]
     url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
@@ -103,19 +103,22 @@ def see(case, prompt: str, *, verdict: str = "", index: int | None = None) -> st
         with request.urlopen(req, timeout=60) as resp:
             raw = json.loads(resp.read().decode("utf-8"))
     except error.HTTPError as exc:
-        raise ScriptAbort(f"模型请求失败：HTTP {exc.code}", reason_code="model_empty") from exc
+        raise ScriptAbort(f"模型请求失败：HTTP {exc.code}", reason_code="model_empty", status="blocked") from exc
     except (error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
-        raise ScriptAbort("视觉模型没有返回结果", reason_code="model_empty") from exc
+        raise ScriptAbort("视觉模型没有返回结果", reason_code="model_empty", status="blocked") from exc
     content = _content(raw)
     try:
         parsed = json.loads(content) if content else {}
     except json.JSONDecodeError as exc:
-        raise ScriptAbort("视觉模型没有返回结果", reason_code="model_empty") from exc
+        raise ScriptAbort("视觉模型没有返回结果", reason_code="model_empty", status="blocked") from exc
     if not isinstance(parsed, dict):
-        raise ScriptAbort("视觉模型没有返回结果", reason_code="model_empty")
+        raise ScriptAbort("视觉模型没有返回结果", reason_code="model_empty", status="blocked")
     summary = str(parsed.get("text") or "")
-    if verdict == "pass" and parsed.get("passed") is not True:
-        raise ScriptAbort(summary or "视觉断言未通过", reason_code="vlm_failed")
+    if verdict == "pass":
+        if parsed.get("passed") is False:
+            raise ScriptAbort(summary or "视觉断言未通过", reason_code="vlm_failed")
+        if parsed.get("passed") is not True:
+            raise ScriptAbort(summary or "视觉模型没有给出明确结论", reason_code="model_inconclusive", status="blocked")
     return summary
 
 

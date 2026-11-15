@@ -13,7 +13,8 @@ def call(case, capability: str, params: dict[str, Any], timeout: float) -> dict[
         raise ScriptAbort("无法回调 Nexus", reason_code="nexus_unreachable")
     reply = ask(P.Execute(
         run_id=case.run_id, step_idx=-1, sn=case._sn, capability_id=capability, platform=case._platform,
-        params={"session_id": case.session_id, "node_id": getattr(case.core, "node_id", ""), **params},
+        params={"session_id": case.session_id, "node_id": getattr(case.core, "node_id", ""),
+                **({"task_id": case._recorder.task_id, "attempt_id": case._recorder.attempt_id} if case._recorder else {}), **params},
         timeout_sec=timeout,
     ), timeout)
     status = str(getattr(getattr(reply, "status", None), "value", getattr(reply, "status", "")) or "")

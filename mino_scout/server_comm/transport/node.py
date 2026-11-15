@@ -310,6 +310,9 @@ class NodeTransport:
                 # Drain every task even when REGISTER, shutdown or recv failed.
                 await asyncio.gather(*connection_tasks, return_exceptions=True)
                 self._ws = None
+                records = getattr(self.core, "_script_records", None)
+                if records:
+                    records.connection(False)
                 self.core.binding_guard.set_connection("")
                 self._connection("disconnected")
 
@@ -361,6 +364,7 @@ class NodeTransport:
             plugins_ready=False,
             plugin_warning="正在核验插件账号归属",
             runtime_capabilities=runtime_caps,
+            record_api_version=1,
             **epoch,
             host=await asyncio.to_thread(
                 _announce_host, self.core.node_id, devices, mode=self.core.host_mode(),
@@ -413,6 +417,9 @@ class NodeTransport:
             self.core._plugins_ready = True
         self.core._plugin_warning = plugin_warning
         _apply_registered_credentials(reg, self.core, self)
+        from mino_scout.server_comm.script_records import bind as bind_records
+        records = await asyncio.to_thread(bind_records, self.core, reg.owner_user_id, self.nexus_url)
+        records.connection(True)
         self._connection("registered", connected=True, registered=True)
         from mino_scout.tools.keep_alive.runtime_sidecar import note_plugin_access
 
@@ -480,14 +487,14 @@ class NodeTransport:
         if devices is not None:
             desktop = next((d for d in devices if d.platform in {"mac", "win"}), None)
             if desktop is not None:
-                from mino_scout.executors.desktop import DesktopExecutor, INSTALL_CAPS
+                from mino_scout.executors.desktop import INSTALL_CAPS, host_caps
                 native_id = desktop.platform
                 ready = desktop.desktop_state == "ready"
                 by_id = {executor.id: executor for executor in (hb.executors or [])}
                 by_id[native_id] = P.ExecutorManifest(
                     id=native_id,
                     available=True,
-                    provides=sorted(set(INSTALL_CAPS) | (set(DesktopExecutor.provides) if ready else set())),
+                    provides=sorted(set(INSTALL_CAPS) | (set(host_caps()) if ready else set())),
                     reason="" if ready else desktop.blocked_reason,
                 )
                 hb.executors = list(by_id.values())
@@ -552,6 +559,7 @@ class NodeTransport:
             delta = changed_devices(self._last_devices, devices)
         hb = await asyncio.to_thread(self._heartbeat_payload, devices, device_delta=delta)
         await self._send(P.MsgType.HEARTBEAT, hb)
+        await self._sync_records()
         # _connection already persists the sidecar, including build diagnostics.
         await asyncio.to_thread(self._connection, "heartbeat", connected=True, registered=True)
         if devices is None:
@@ -653,7 +661,7 @@ class NodeTransport:
                 return self.core.execute(req)
             finally:
                 timing["core_ms"] = (time.perf_counter() - entered) * 1000
-        if req.capability_id in {"cancel_run", "write_stop_status"}:
+        if req.capability_id in {"cancel_run", "write_stop_status", "script.submit"} or req.capability_id.startswith("record."):
             result = await asyncio.to_thread(execute)
         else:
             context = contextvars.copy_context()
@@ -694,6 +702,33 @@ class NodeTransport:
             raise RuntimeError(f"帧过大 {size} > {_MAX_FRAME_BYTES}（协议 §1：应降质重发，不分片）")
         await self._ws.send(text)
         return env.msg_id
+
+    async def _sync_records(self) -> None:
+        """Retry durable summaries with new envelopes; never replay a device command."""
+        records = getattr(self.core, "_script_records", None)
+        if records is None or self._ws is None:
+            return
+        pending = await asyncio.to_thread(records.store.pending, 4, getattr(self, "_record_sync_cursor", None))
+        if pending:
+            self._record_sync_cursor = (pending[-1]["task_id"], pending[-1]["attempt_id"])
+
+        async def send_summary(summary):
+            if self._ws is None:
+                return
+            request = P.Execute(run_id=summary["run_id"], step_idx=-1, sn=summary["sn"], platform=summary["platform"],
+                                capability_id="record.sync", params=summary, timeout_sec=2)
+            try:
+                response = await self._request(P.MsgType.EXECUTE, request, timeout=2)
+                result = getattr(response, "payload", None)
+                if result is None or str(getattr(result.status, "value", result.status)) != "pass":
+                    return
+                ack = dict(result.data or {})
+                if ack.get("attempt_id") == summary["attempt_id"] and int(ack.get("ack_version", 0)) >= summary["summary_version"]:
+                    await asyncio.to_thread(records.store.acknowledge, summary["task_id"], summary["attempt_id"], summary["summary_version"])
+            except (OSError, ValueError, RuntimeError, asyncio.TimeoutError):
+                return
+
+        await asyncio.gather(*(send_summary(summary) for summary in pending))
 
     async def _reply_result(self, req_env: P.Envelope, result: P.Result) -> None:
         request_connection = self._ws

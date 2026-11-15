@@ -155,6 +155,9 @@ class ScoutCore:
     # ---------------- EXECUTE（唯一 dispatch） ----------------
 
     def execute(self, req: P.Execute) -> EventResult:
+        if req.capability_id == "script.submit" or req.capability_id.startswith("record."):
+            from mino_scout.server_comm.script_records import dispatch
+            return dispatch(self, req)
         # Management messages have no product mode. Bound device execution does.
         if req.execution_contract_version or "execution_mode" in req.device_hint:
             try:
@@ -207,7 +210,7 @@ class ScoutCore:
                         if old["params"] != wanted:
                             raise ValueError("operation_id 参数冲突")
                         data = updates.status(opid, self._loaded_build)
-                    elif tool_tasks.has_active() or self._update_io or any(self._requests.active(r) for r in self._active_runs):
+                    elif tool_tasks.has_active() or self._update_io or any(self._requests.active(r) for r in self._active_runs) or (getattr(self, "_script_records", None) and self._script_records.active()):
                         data = {"operation_id": opid, "state": "busy"}
                     else:
                         capacity = self._web_v5.capacity()
@@ -469,6 +472,9 @@ class ScoutCore:
                     "operation_ref": req.operation_ref}})
 
     def _run_script(self, req: P.Execute) -> EventResult:
+        if getattr(self, "_script_records", None) is not None:
+            from mino_scout.server_comm.script_records import run_legacy
+            return run_legacy(self, req)
         from mino_scout.server_comm import script_dispatch
 
         stop = threading.Event()
@@ -975,6 +981,9 @@ class ScoutCore:
         协议 §4.8：语义是"不再继续"，**不是回滚** —— 已经发给设备的动作撤不回来。
         幂等记录由 RequestGuard 持有；这里只做停止闩 + 资源释放，不替它清缓存。
         """
+        records = getattr(self, "_script_records", None)
+        if records:
+            records.cancel_run(run_id)
         self._requests.stop(run_id, "task_cancelled", {}, terminal=True)
         if self._requests.active(run_id):
             # 2026-10-23：Nexus 已宣告该 run 结束，但底层请求可能仍挂在旧 future 上。
@@ -1015,6 +1024,9 @@ class ScoutCore:
         Hub 用 thread-local，主线程调 shutdown_thread 关不到浏览器，
         进程一死就会刷 TargetClosedError。
         """
+        records = getattr(self, "_script_records", None)
+        if records:
+            records.close()
         for lane in self._web_v5.lanes:
             if lane["run"]:
                 self._web_v5.close(lane["run"], time.monotonic() + 2)
@@ -1037,7 +1049,7 @@ class ScoutCore:
     def enter_sleep(self) -> tuple[bool, str]:
         """放开睡眠抑制并关掉 Chromium。进程和心跳留着，网页才能再唤醒。"""
         with self._lock:
-            if self._active_runs:
+            if self._active_runs or (getattr(self, "_script_records", None) and self._script_records.active()):
                 return False, "有任务在跑，先停任务再休眠"
             if self._asleep:
                 return True, "已休眠"
@@ -1078,6 +1090,11 @@ class ScoutCore:
                 self._device_workload.values(),
                 key=lambda w: (w.sn, w.run_id, w.step_idx),
             )
+        records = getattr(self, "_script_records", None)
+        if records:
+            running = records.active()
+            active = sorted(set(active) | {job["run_id"] for job in running})
+            workload.extend(P.DeviceWorkload(sn=job["sn"], run_id=job["run_id"], capability_id="script.submit") for job in running)
         capacity = self._web_v5.capacity()
         workload.append(P.DeviceWorkload(sn=f"web{self.node_id}", **capacity))
         from mino_scout.runtime.input_contract import runtime_input_capabilities
@@ -1105,6 +1122,7 @@ class ScoutCore:
             plugin_warning=self._plugin_warning,
             runtime_environment="development" if development() else "production",
             runtime_capabilities=runtime_caps,
+            record_api_version=1,
         )
 
     def _remember_run(self, run_id: str) -> None:

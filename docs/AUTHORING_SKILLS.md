@@ -60,14 +60,13 @@ apps:
     envs:
       test:
         package: com.example.a.test
-        otp: {code: "123456"}   # 可选；不写则取码时要问人
       prod: {package: com.example.a}
   camera_ios:
     platform: ios
     bundle_id: com.example.a
 ```
 
-脚本仓认 **key**（`camera`），不要求也不依赖 `app_id` / `project_id`。环境名与 Nexus 项目环境一致。Scout 在拉下来的仓库根读它；`device_hint["env"]` 决定取哪份 `envs`，`device_hint["app_key"]`（由 Nexus 按清单回填）对应当前应用 key；`app_id` 仍可能下发，仅作兼容。缺文件、缺应用或缺环境 → `config_missing`。账号仍由 Nexus 号池经 `case.nexus.account()` 租用；固定验证码用 `otp.code`，取码见 `case.scout.otp`。
+脚本仓认 **key**（`camera`），不要求也不依赖 `app_id` / `project_id`。环境名与 Nexus 项目环境一致。Scout 在拉下来的仓库根读它；`device_hint["env"]` 决定取哪份 `envs`，`device_hint["app_key"]`（由 Nexus 按清单回填）对应当前应用 key；`app_id` 仍可能下发，仅作兼容。缺文件、缺应用或缺环境 → `config_missing`。账号由 Nexus 号池经 `case.nexus.account()` 租用；登录方式、验证码策略、Gmail 收件箱和手机号/Gmail 别名序号放在 Nexus 项目环境配置中，不写脚本仓。号池无匹配账号时 Nexus 自动新增；取码见 `case.scout.otp`。`otp.code` 仅为旧仓库兼容。
 
 ---
 

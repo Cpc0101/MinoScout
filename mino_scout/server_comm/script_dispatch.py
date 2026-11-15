@@ -124,6 +124,10 @@ def _lease(core, payload: P.ScriptRun) -> None:
         raise ValueError("设备与 sn 不符")
     if data.get("node_id") and str(data.get("node_id")) != str(getattr(core, "node_id", "")):
         raise ValueError("节点与这次运行不符")
+    hint = dict(getattr(payload, "device_hint", None) or {})
+    for field in ("lease_id", "lease_generation"):
+        if hint.get(field) is not None and hint.get(field) != "" and data.get(field) != hint[field]:
+            raise ValueError("device_lease_mismatch")
 
 
 def _missing(platform: str) -> str:

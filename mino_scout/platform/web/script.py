@@ -28,6 +28,7 @@ def act(case, kind: str, params: dict, text: str = ""):
         raise ScriptAbort("缺 chromium", reason_code="channel_missing")
     case.touched = True
     capability = "tap_element" if kind == "tap" else "input_text"
+    case._begin_action(capability, {**params, **({"text": text} if kind != "tap" else {})})
     import time
     started = time.perf_counter()
     try:
@@ -48,6 +49,9 @@ def act(case, kind: str, params: dict, text: str = ""):
     except Exception as exc:
         action = ActionResult(ok=False, summary="页面动作失败", status="fail", data={})
         case._report(capability, action, "playwright", int((time.perf_counter() - started) * 1000))
-        raise ScriptAbort(f"{type(exc).__name__}", reason_code="script_failed") from exc
+        error = ScriptAbort(f"{type(exc).__name__}", reason_code="write_outcome_unknown", status="blocked",
+                            details={"resource_isolated": True})
+        case.case._latched_error = case.case._latched_error or error
+        raise error from exc
     case._report(capability, action, "playwright", int((time.perf_counter() - started) * 1000))
     return action

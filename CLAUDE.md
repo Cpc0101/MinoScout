@@ -8,7 +8,7 @@
 
 ## 0. 本仓库的定位
 
-MinoScout 是执行器。它接收 [MinoNexus](../MinoNexus) 下发的动作，操作真实设备，回报结果。
+MinoScout 是执行器。它接收 [MinoNexus](../MinoNexus) 下发的动作，操作真实设备，并持久保存完整执行记录。Nexus 保存任务索引与状态投影；Workbench 通过 Nexus 转发读取执行节点上的详情。
 
 上游来源是 [MiniOrangeServer](../MiniOrangeServer)（**已停止维护，只读参考，禁止改动**）。搬迁映射见 [docs/MIGRATION.md](docs/MIGRATION.md)。
 
@@ -18,16 +18,25 @@ MinoScout 是执行器。它接收 [MinoNexus](../MinoNexus) 下发的动作，�
 
 | # | 约束 | 守门脚本 | 为什么 |
 |---|---|---|---|
-| 1 | **不碰数据库** —— 不 import `sqlalchemy`、不定义 ORM 模型、不写迁移 | — | 数据归属方是 Nexus。Scout 有状态就没法随时重启、没法多节点 |
-| 2 | **不调大模型** —— 不 import `openai` / `httpx` 打 LLM endpoint、不含 prompt 常量 | — | 决策权在 Nexus。Scout 一旦能"想"，两边就会各想一半 |
+| 1 | **不复制云端业务数据库** —— 不 import `sqlalchemy`、不定义 Nexus ORM；允许 stdlib SQLite 保存本地任务记录和同步 outbox | — | 完整执行事实归执行 Scout，任务索引、账号池和设备租约归 Nexus |
+| 2 | **设备 executor 不作模型决策**；脚本断言可经 `server_comm/model_call.py` 调本机配置的模型 | — | 模型判断必须绑定当前观察与有效断言，不能代替明确失败 |
 | 3 | **不读能力目录** —— 不解析 `plugins/**.yaml`、不含 `abstract_caps` 逻辑 | — | 能力目录唯一真源在 Nexus。Scout 只按 `EXECUTE` 载荷里给定的 `executor_order` 执行 |
 | 4 | **不 import Nexus** —— 任何 `mino_nexus` / `server.*` 引用 | — | 依赖必须单向 |
-| 5 | **不写/不改单元测试** —— 禁止新增 `tests/test_*.py`、禁止为自证修复跑 pytest | Agent 擅写 test 干扰现场；执行侧问题以 Nexus **`session_events`**（`tool/call`、`tool/result` 的 `summary`）为准 |
+| 5 | **不写/不改单元测试** —— 禁止新增 `tests/test_*.py`、禁止为自证修复跑 pytest；允许隔离临时目录 smoke | 真机问题以 Scout 完整本地记录为准；离线 smoke 验证契约与状态语义，不冒充真机验收 |
 
 边界说明：
 
 - 约束 3 的对象是 `plugins/**.yaml` 能力目录。`pages/<APP_KEY>/*.yaml` 是用例脚本仓库里的页面数据，由 `script_exec._load_pages` 读取，不是能力目录；`mino-scout check`（`runtime/script_check.py`）只读用例源码给 agent 提示，不读能力目录、不决定 `executor_order`。
 - 约束 5 禁止的是 `tests/test_*.py` 和 pytest。`mino-scout check` 是写用例时给 agent 的自检命令，不是单测，执行时 Scout 不做任何预检。
+
+### 本地执行记录（2026-11-15）
+
+- `script.submit` 在持久化接单后立即回复 accepted，独立子进程运行脚本；accepted 不是测试通过。相同 attempt 重复投递不重跑，变更载荷拒绝。
+- 记录在账号隔离的 `records/<task_id>/records.sqlite3` 与 artifact 目录，先写意图、后执行、再写结果。Git 临时 workspace 可以清理，记录保留。密码、OTP、令牌与输入正文不得进入记录。
+- 完整步骤、动作、断言、原文快照和截图保存在 Scout。`record.sync` 只发送状态投影，必须持久化 ACK 后清 outbox；断线只重传摘要，不重放设备动作。
+- Workbench / Agent 的 record.status/events/artifact/manifest 经 Nexus 和既有出站连接读取；Scout 不开监听端口，必须核对已验证账号、task、attempt 和 session。
+- 缺有效断言、空 check、原文覆盖缺失不得通过。失败状态须保留；页面成立不能代替业务条件成立，明确 no 不得被另一模型改成 yes。当前视觉断言取新图，历史帧只由显式 vlm_frame 使用。
+- 取消必须等执行停止才成为终态；重启遗留 attempt 标为 interrupted，不自动重跑。断线后到下一设备写入边界阻塞，写结果未知仍保留隔离。
 
 
 ---
@@ -80,6 +89,7 @@ mino_scout/
 │   ├── protocol.py     5 种消息 + 载荷 dataclass（stdlib，零依赖）
 │   ├── transport/node.py   daemon 形态：反向 dial Nexus 的 WS 客户端
 │   ├── script_dispatch.py  script.run 载荷校验 / 租约 / 落盘
+│   ├── script_records.py   script.submit 独立进程 / record RPC / 取消
 │   ├── callbacks.py    账号 / 验证码 / 步骤 / 失败回调
 │   ├── nexus_link.py   脚本 → Nexus 的请求
 │   └── model_call.py   脚本模式的本地文本/视觉模型（见 §1 约束 2 的例外）
@@ -89,6 +99,7 @@ mino_scout/
 │   ├── execution_binding.py  连接/进程代际与能力修订
 │   ├── platform_contract.py  目标平台与设备身份
 │   ├── script_exec.py        用例脚本运行时（Case API）
+│   ├── records.py            本地 SQLite 事件 / artifact / 摘要 outbox
 │   └── secret_redaction.py   出口脱敏
 ├── executors/          adb / ios_wda / playwright / mac·win 原生 + base
 ├── platform/           android / ios / web / mac / win 的原始动作
@@ -131,7 +142,7 @@ agent 技能（总览 / 仓库配置 / 编写 / 自检 / 执行汇报）不在�
 
 ## 6. 不要做的事
 
-- 不要为了"顺手"在 Scout 里读一次数据库 —— 需要的数据让 Nexus 塞进 `EXECUTE` 载荷
+- 不要在 Scout 读取 Nexus 业务数据库；本地 records SQLite 只存本节点执行事实，账号仍从 Nexus 租用
 - 不要在 Scout 里判断"这一步该不该做" —— 那是 Nexus 的循环
 - 不要把 `plugins/*.yaml` 复制进本仓
 - 不要改 `../MiniOrangeServer` 的任何文件

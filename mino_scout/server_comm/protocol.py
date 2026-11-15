@@ -1,6 +1,6 @@
 """MinoNexus ⇄ MinoScout shared wire contract; stdlib only.
 
-Contract: synchronized docs/PROTOCOL.md and this module. Local fixtures are not shipped.
+Contract: the synchronized Nexus/Scout protocol documents and this module.
 """
 from __future__ import annotations
 
@@ -124,6 +124,7 @@ class Register:
     plugins: Optional[list[dict[str, Any]]] = None
     plugins_ready: Optional[bool] = None
     tool_tasks_version: int = 0  # explicit download-centre contract, not a version guess
+    record_api_version: int = 0  # 1: durable script.submit and Scout-local record APIs
     plugin_warning: str = ""
     runtime_environment: str = ""
     # None：旧节点没报运行能力。不能用版本号猜测是否支持当前焦点输入。
@@ -175,6 +176,7 @@ class Heartbeat:
     plugins: Optional[list[dict[str, Any]]] = None
     plugins_ready: Optional[bool] = None
     tool_tasks_version: int = 0  # explicit download-centre contract, not a version guess
+    record_api_version: int = 0
     plugin_warning: str = ""
     runtime_environment: str = ""
     runtime_capabilities: Optional[list[dict[str, Any]]] = None
@@ -258,9 +260,18 @@ class ScriptRun:
     branch: str = ""
     revision: str = ""
     script_path: str = ""
+    task_id: str = ""
+    attempt_id: str = ""
+    owner_user_id: str = ""
+    execution_timeout_sec: float = 600.0
 
 
-_SCRIPT_RUN_FIELDS = ("run_id", "session_id", "case_id", "sn", "platform", "repo_url", "branch", "revision", "script_path")
+SCRIPT_RUN_CAPABILITY = "script.run"
+SCRIPT_SUBMIT_CAPABILITY = "script.submit"
+RECORD_API_VERSION = 1
+SCRIPT_RUN_FIELDS = ("run_id", "session_id", "case_id", "sn", "platform", "repo_url", "branch", "revision", "script_path",
+                     "task_id", "attempt_id", "owner_user_id", "execution_timeout_sec")
+_SCRIPT_RUN_FIELDS = SCRIPT_RUN_FIELDS
 
 
 def dump_script_run(payload: ScriptRun) -> dict[str, Any]:
@@ -278,6 +289,40 @@ def load_script_run(raw: dict[str, Any]) -> ScriptRun:
         raise ValueError("script_run_invalid") from exc
     if not isinstance(body, ScriptRun):
         raise ValueError("script_run_invalid")
+    from pathlib import PurePosixPath
+    from urllib.parse import urlsplit
+    import math
+
+    for key in ("run_id", "session_id", "case_id", "sn", "platform", "repo_url"):
+        value = getattr(body, key)
+        if not isinstance(value, str) or not value.strip() or any(ord(c) < 32 for c in value):
+            raise ValueError("script_run_incomplete")
+    for key in ("branch", "revision"):
+        value = getattr(body, key)
+        if not isinstance(value, str) or value.startswith("-") or len(value) > 200 or any(c.isspace() or ord(c) < 32 for c in value):
+            raise ValueError("script_run_revision_invalid")
+    if body.repo_url.startswith("-") or any(c.isspace() for c in body.repo_url):
+        raise ValueError("script_run_repo_invalid")
+    parsed = urlsplit(body.repo_url)
+    if parsed.scheme in {"http", "https"} and (parsed.username is not None or parsed.password is not None):
+        raise ValueError("script_run_repo_invalid")
+    if not isinstance(body.script_path, str):
+        raise ValueError("script_run_path_invalid")
+    body.script_path = body.script_path.replace("\\", "/")
+    if body.script_path and (body.script_path.startswith(("/", "~")) or ":" in body.script_path
+                            or ".." in PurePosixPath(body.script_path).parts
+                            or any(ord(c) < 32 for c in body.script_path) or not body.script_path.endswith(".py")):
+        raise ValueError("script_run_path_invalid")
+    for key in ("task_id", "attempt_id", "owner_user_id"):
+        if not isinstance(getattr(body, key), str):
+            raise ValueError("script_run_identity_invalid")
+    try:
+        budget = float(body.execution_timeout_sec)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("script_run_timeout_invalid") from exc
+    if not math.isfinite(budget) or not 1 <= budget <= 86400:
+        raise ValueError("script_run_timeout_invalid")
+    body.execution_timeout_sec = budget
     return body
 
 
