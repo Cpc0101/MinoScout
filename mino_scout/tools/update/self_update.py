@@ -20,7 +20,10 @@ from mino_scout.tools.update import update_progress as UP
 TAG = "SelfUpdate"
 
 DEFAULT_MANIFEST = (
-    "https://github.com/pengchengluoyi/MinoScout/releases/latest/download/manifest.json"
+    "https://github.com/Cpc0101/MinoScout/releases/latest/download/manifest.json"
+)
+LEGACY_MANIFEST_PREFIX = (
+    "https://github.com/pengchengluoyi/MinoScout/"
 )
 
 
@@ -65,6 +68,8 @@ def installed_layers(prefix: Path | None = None) -> dict[str, str] | None:
 def manifest_url_from_config() -> str:
     cfg = load_config()
     url = str(cfg.get("manifest_url") or os.environ.get("MINO_SCOUT_MANIFEST_URL") or "").strip()
+    if url.startswith(LEGACY_MANIFEST_PREFIX):
+        url = DEFAULT_MANIFEST.rsplit("/releases/", 1)[0] + "/" + url[len(LEGACY_MANIFEST_PREFIX):]
     return url or DEFAULT_MANIFEST
 
 
