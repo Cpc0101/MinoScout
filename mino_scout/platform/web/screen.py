@@ -8,6 +8,7 @@ import time
 from typing import Any
 
 from mino_scout.platform.web.playwright_hub import get_hub, headed_from_hint, pick_goto_url
+from mino_scout.platform.web.viewports import DEFAULT_WEB_RESOLUTION
 from mino_scout.schemas import CapturedScreen
 from mino_scout.screen import compress_web_png
 
@@ -24,6 +25,7 @@ def capture(device, *, timeout_sec: float = 15.0, compress_ratio: float = 2.0,
             base_url=url,
             headed=headed_from_hint(dict(device.extra or {})),
             screenshot_params=screenshot_params,
+            web_resolution=str(device.extra.get("web_resolution") or DEFAULT_WEB_RESOLUTION),
         )
     except Exception as exc:
         return CapturedScreen(

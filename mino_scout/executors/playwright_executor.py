@@ -26,9 +26,11 @@ from mino_scout.platform.web.playwright_locators import (
     locator_from_params,
     unique_exact_text,
 )
+from mino_scout.platform.web.viewports import DEFAULT_WEB_RESOLUTION, web_viewport
 from mino_scout.platform.web.web_focus import locate_editable_at
 
 TAG = "PlaywrightExecutor"
+_DEFAULT_WEB_VIEWPORT = web_viewport(DEFAULT_WEB_RESOLUTION)
 
 _CSRF_NAME = re.compile(r"csrf|xsrf", re.I)
 _AUTH_TOKEN_NAME = re.compile(
@@ -269,6 +271,7 @@ class PlaywrightExecutor:
             self._forget_focus(focus_key)
         hub = get_hub()
         headed = headed_from_hint(ctx.device.extra)
+        web_resolution = str(ctx.device.extra.get("web_resolution") or DEFAULT_WEB_RESOLUTION)
         try:
             if cap == "launch_app":
                 p = event.params or {}
@@ -285,6 +288,7 @@ class PlaywrightExecutor:
                         base_url=url,
                         headed=headed,
                         goto_params=p,
+                        web_resolution=web_resolution,
                     )
                 elif url:
                     goto_url(page, url, params=p)
@@ -307,6 +311,7 @@ class PlaywrightExecutor:
                     run_id=run_id,
                     base_url=pick_goto_url(ctx.device.extra.get("target_package")),
                     headed=headed,
+                    web_resolution=web_resolution,
                 )
             if cap == "get_foreground_app":
                 return self._get_foreground_app(event, hub, sn, run_id, started_at, t0)
@@ -391,7 +396,7 @@ class PlaywrightExecutor:
             if cap == "swipe_direction":
                 p = event.params or {}
                 direction = str(p.get("direction") or "down").lower()
-                box = page.viewport_size or {"width": 1280, "height": 800}
+                box = page.viewport_size or _DEFAULT_WEB_VIEWPORT
                 w, h = int(box["width"]), int(box["height"])
                 fx, fy, tx, ty = p.get("from_x"), p.get("from_y"), p.get("to_x"), p.get("to_y")
                 if None not in (fx, fy, tx, ty):

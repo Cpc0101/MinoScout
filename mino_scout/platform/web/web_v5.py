@@ -12,6 +12,7 @@ import uuid
 from dataclasses import asdict
 
 from mino_scout.runtime.secret_redaction import register_inputs, remember, sanitize
+from mino_scout.platform.web.viewports import DEFAULT_WEB_RESOLUTION, normalize_web_resolution, web_viewport
 
 CONTRACTS = {"web_v5": 1, "locator_contract": "web.locator.v1", "predicate_facts_contract": "web.atomic.v1"}
 READS = frozenset({"probe", "read_web_target_facts", "screenshot"})
@@ -86,8 +87,16 @@ def _worker(conn):
                     url = str(params.get("url") or "")
                     if not url.startswith(("http://", "https://")):
                         raise ValueError("invalid_url")
+                    resolution = normalize_web_resolution(
+                        req.device_hint.get("web_resolution") or params.get("web_resolution")
+                    )
+                    viewport = web_viewport(resolution)
                     browser = pw.chromium.launch(headless=True, timeout=ms)
-                    context = browser.new_context(viewport={"width": 1280, "height": 800})
+                    context = browser.new_context(
+                        viewport=viewport,
+                        screen=viewport,
+                        device_scale_factor=1,
+                    )
                     page = context.new_page()
                     started, phase = "yes", "action"
                     conn.send({"boundary": True})
@@ -101,10 +110,12 @@ def _worker(conn):
                     masks = [page.locator('input[type="password"]')]
                     for control in params.get("sensitive_controls", []):
                         masks.append(_locator(page, control["locator_spec"]))
-                    shot = page.screenshot(timeout=ms, mask=masks)
+                    full_page = bool(params["full_page"] if "full_page" in params else params.get("fullPage", True))
+                    shot = page.screenshot(timeout=ms, mask=masks, full_page=full_page)
+                    viewport = page.viewport_size or web_viewport(DEFAULT_WEB_RESOLUTION)
                     data = response(phase="completed", observation=source,
                                     image_base64=base64.b64encode(shot).decode(), image_mime="image/png",
-                                    width=1280, height=800)
+                                    width=int(viewport["width"]), height=int(viewport["height"]))
                 elif cap in {"tap_target", "input_target", "read_web_target_facts"}:
                     if page is None:
                         raise ValueError("context_missing")

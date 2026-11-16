@@ -98,8 +98,10 @@ def _scan(tree: ast.AST) -> list[tuple[int, str, str]]:
                 elif owner == "time" and attr == "sleep":
                     out.append((line, "reuse", "不要 time.sleep：用 case.scout.wait(ms)，它会响应取消和超时"))
                 elif owner == "case" and attr == "init":
-                    if not _is_config_ref(node.args[0] if len(node.args) == 1 and not node.keywords else None):
-                        out.append((line, "case_init", "case.init 的参数必须是 case.config.<KEY>"))
+                    keywords_ok = all(k.arg == "web_resolution" for k in node.keywords)
+                    if len(node.args) != 1 or not _is_config_ref(node.args[0]) or not keywords_ok:
+                        out.append((line, "case_init",
+                                    'case.init 只接受 case.config.<KEY>，可选关键字 web_resolution="720P|1080P|2K|3K/4K"'))
             if isinstance(func, ast.Attribute) and func.attr in _STEP_CALLS and _is_nexus(func.value):
                 if not _titled(node):
                     out.append((line, "step_title", f"case.nexus.{func.attr}() 要写这一步具体做什么的文字标题，它就是测试报告里的步骤名"))

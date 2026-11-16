@@ -226,7 +226,7 @@ Scout 重装保留 `scout_id` 和已有长期 token，先以 `pending_install_to
 
 | `capability_id` | 方向 | 说明 |
 |---|---|---|
-| `screenshot` | N→S | 截图。`params.compress_ratio` 对 playwright 与 adb 都生效 |
+| `screenshot` | N→S | 截图。`params.compress_ratio` 对 playwright 与 adb 都生效。Web 的 `params.full_page` 默认 `true`，截取完整文档；显式 `false` 只截当前视口 |
 | `hierarchy` | N→S | UI 层级 dump |
 | `get_app_version`（别名 `app_version`） | N→S | 目标包版本。回执在原有 `package` / `version_name` / `version_code` 上追加同一份 dumpsys 里的 `install_path` 与 `signing`（见 §4.4.3） |
 | `get_foreground_app`（别名 `foreground_app`） | N→S | 前台包名 / bundle id |

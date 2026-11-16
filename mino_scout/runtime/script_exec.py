@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
 from mino_scout.executors.base import DeviceRef, ExecutorContext
+from mino_scout.platform.web.viewports import DEFAULT_WEB_RESOLUTION, normalize_web_resolution
 from mino_scout.schemas import PlanEvent
 
 _CELLS = {"android": "uiautomator", "ios": "xcuitest", "web": "playwright", "mac": "ax", "win": "uia"}
@@ -546,15 +547,28 @@ class Case:
         raise _unknown("case", name, ["config", "env", "app_id", "app_key", "init", "scout", "nexus"],
                        "。设备动作写在 app = case.init(case.config.<KEY>) 返回的 app 上")
 
-    def init(self, ref: AppRef) -> "App":
+    def init(self, ref: AppRef, *, web_resolution: str = "") -> "App":
         self._guard()
         if not isinstance(ref, AppRef):
             raise ScriptAbort("case.init 只接受 case.config.<KEY>", reason_code="config_invalid")
         if ref.platform != self._platform:
             raise ScriptAbort(f"应用 {ref.key} 是 {ref.platform}，本次运行是 {self._platform}", reason_code="platform_mismatch")
+        resolution = ""
+        if ref.platform == "web":
+            try:
+                resolution = normalize_web_resolution(web_resolution)
+            except ValueError as exc:
+                raise ScriptAbort(str(exc), reason_code="config_invalid") from None
+        elif str(web_resolution or "").strip():
+            raise ScriptAbort("web_resolution 只适用于 Web 应用", reason_code="config_invalid")
         app = self._apps.get(ref.key)
         if app is None:
-            app = self._apps[ref.key] = App(self, ref)
+            app = self._apps[ref.key] = App(self, ref, web_resolution=resolution)
+        elif app._web_resolution != resolution:
+            raise ScriptAbort(
+                f"应用 {ref.key} 已按 {app.web_resolution_label or DEFAULT_WEB_RESOLUTION} 初始化，不能在同一用例内切换分辨率",
+                reason_code="config_invalid",
+            )
         return app
 
     def _report(self, capability: str, result: ActionResult, executor: str, elapsed: int, image=None,
@@ -634,11 +648,12 @@ class App:
     _started = _shared("_started")
     _mail_to = _shared("_mail_to")
 
-    def __init__(self, case: Case, ref: AppRef):
+    def __init__(self, case: Case, ref: AppRef, *, web_resolution: str = ""):
         self._case = case
         self.key = ref.key
         self._package = ref.package
         self._url = ref.url
+        self._web_resolution = str(web_resolution or "")
         self._pages = case._all_pages.get(ref.key, {})
         self._page_key = ""
         self._shot = None
@@ -652,6 +667,20 @@ class App:
         """这个 app 所属的运行上下文；app.expect 用它写证据。"""
         return self._case
 
+    @property
+    def web_resolution(self) -> str:
+        """本用例固定的 Web canonical 分辨率；非 Web 应用为空串。"""
+        return self._web_resolution
+
+    @property
+    def web_resolution_label(self) -> str:
+        """运行时证据使用的展示名，例如 1080P、2K、3K/4K。"""
+        if not self._web_resolution:
+            return ""
+        from mino_scout.platform.web.viewports import WEB_VIEWPORTS
+
+        return str(WEB_VIEWPORTS[self._web_resolution]["label"])
+
     # ---- 启停
     def __getattr__(self, name: str):
         if name.startswith("_"):
@@ -659,7 +688,10 @@ class App:
         raise _unknown("app", name, _public_names(App))
 
     def launch(self) -> ActionResult:
-        return self._device("launch_app", {"package": self._package, "bundle": self._package, "bundle_id": self._package, "url": self._url})
+        params = {"package": self._package, "bundle": self._package, "bundle_id": self._package, "url": self._url}
+        if self._web_resolution:
+            params["web_resolution"] = self._web_resolution
+        return self._device("launch_app", params)
 
     def close(self) -> ActionResult:
         return self._device("close_app", {"package": self._package, "bundle": self._package, "bundle_id": self._package})
@@ -762,20 +794,33 @@ class App:
         return self._device("wait_screen_ready", params)
 
     # ---- 观察
-    def screenshot(self) -> ActionResult:
+    def screenshot(self, *, full_page: bool = True,
+                   screenshot_params: Optional[dict[str, Any]] = None) -> ActionResult:
         self._guard()
         self._require_channel()
         from mino_scout import screen as SCREEN
-        self._begin_action("screenshot", {})
+        params = dict(screenshot_params or {})
+        if self._platform == "web":
+            # Web 默认截取完整文档；调用方仍可用 full_page=False 只截当前视口。
+            if "full_page" not in params and "fullPage" in params:
+                params["full_page"] = bool(params.pop("fullPage"))
+            params.setdefault("full_page", bool(full_page))
+        ratio = float(params.pop("compress_ratio", 2.0))
+        self._begin_action("screenshot", params)
         self.touched = True
-        shot = SCREEN.capture(self._device_ref(), timeout_sec=15, compress_ratio=2.0)
+        shot = SCREEN.capture(
+            self._device_ref(),
+            timeout_sec=15,
+            compress_ratio=ratio,
+            screenshot_params=params,
+        )
         self._shot = shot
         self._observation_id = "obs_" + uuid.uuid4().hex
         ok = bool(shot.has_image())
         result = ActionResult(ok=ok, summary="已截图" if ok else (shot.error or "没有截到图"), status="pass" if ok else "fail",
                                data={"width": int(shot.width or 0), "height": int(shot.height or 0)})
         body = self._report("screenshot", result, str(shot.source or _EXECUTOR.get(self._platform) or "screen"), int(shot.elapsed_ms or 0), image=shot if ok else None,
-                            extra={"observation_id": self._observation_id})
+                            extra={"observation_id": self._observation_id, "full_page": bool(params.get("full_page"))})
         self._artifact_id = str(body.get("artifact_id") or "")
         if not ok:
             raise ScriptAbort(result.summary or "没有截到图", reason_code="script_failed")
@@ -995,6 +1040,7 @@ class App:
             extra["target_package"] = self._package
         if self._url:
             extra["url"] = self._url
+        extra["web_resolution"] = self._web_resolution
         serial = str(hint.get("adb_serial") or "")
         udid = str(hint.get("udid") or "")
         if self._platform == "android":

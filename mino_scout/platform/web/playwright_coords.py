@@ -3,9 +3,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from mino_scout.platform.web.viewports import DEFAULT_WEB_RESOLUTION, web_viewport
+
+
+_DEFAULT_WEB_VIEWPORT = web_viewport(DEFAULT_WEB_RESOLUTION)
+
 
 def viewport_wh(page: Any) -> tuple[int, int]:
-    box = page.viewport_size or {"width": 1280, "height": 800}
+    box = page.viewport_size or _DEFAULT_WEB_VIEWPORT
     return int(box["width"]), int(box["height"])
 
 

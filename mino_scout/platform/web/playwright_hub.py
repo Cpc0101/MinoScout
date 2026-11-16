@@ -16,13 +16,19 @@ import traceback
 from pathlib import Path
 from typing import Any, Optional
 
+from mino_scout.platform.web.viewports import (
+    DEFAULT_WEB_RESOLUTION,
+    normalize_web_resolution,
+    web_viewport,
+)
 from mino_scout.tools.keep_alive.log import SLog
 
 TAG = "PlaywrightHub"
 
-# Old global name. Kept so is_web_slot still recognizes leftover REGISTER payloads.
-VIEWPORT_W = 1280
-VIEWPORT_H = 800
+# Backward-compatible globals now describe the configured default viewport.
+_DEFAULT_VIEWPORT = web_viewport(DEFAULT_WEB_RESOLUTION)
+VIEWPORT_W = int(_DEFAULT_VIEWPORT["width"])
+VIEWPORT_H = int(_DEFAULT_VIEWPORT["height"])
 
 _URL_SCHEMES = ("http://", "https://", "file://", "about:", "data:")
 # 带点的主机才当网址；末段是常见 TLD。Android 包名 com.foo.bar 的末段不是 TLD。
@@ -76,6 +82,11 @@ def _session_key(sn: str, run_id: str = "") -> str:
     if rid:
         return f"{base}::{rid}"
     return base
+
+
+def _browser_key(sn: str, resolution: str = DEFAULT_WEB_RESOLUTION) -> str:
+    """同一 Web 设备的不同分辨率不能复用带固定 window-size 的浏览器。"""
+    return f"{_session_key(sn)}::{normalize_web_resolution(resolution)}"
 
 
 def looks_like_url(value: str) -> bool:
@@ -278,8 +289,16 @@ class PlaywrightHub:
             return
         loop.set_exception_handler(handler)
 
-    def _browser(self, sn: str, *, headed: Optional[bool] = None):
-        key = _session_key(sn)
+    def _browser(
+        self,
+        sn: str,
+        *,
+        headed: Optional[bool] = None,
+        web_resolution: str = DEFAULT_WEB_RESOLUTION,
+    ):
+        resolution = normalize_web_resolution(web_resolution)
+        viewport = web_viewport(resolution)
+        key = _browser_key(sn, resolution)
         head = headed_from_env() if headed is None else bool(headed)
         browsers: dict = getattr(self._local, "browsers", None) or {}
         modes: dict = getattr(self._local, "browser_headed", None) or {}
@@ -306,7 +325,7 @@ class PlaywrightHub:
         if head:
             launch_args.extend(
                 [
-                    f"--window-size={VIEWPORT_W},{VIEWPORT_H}",
+                    f"--window-size={viewport['width']},{viewport['height']}",
                     "--window-position=80,40",
                 ]
             )
@@ -329,13 +348,16 @@ class PlaywrightHub:
         base_url: str = "",
         headed: Optional[bool] = None,
         goto_params: dict[str, Any] | None = None,
+        web_resolution: str = DEFAULT_WEB_RESOLUTION,
     ) -> Any:
         key = _session_key(sn, run_id)
+        resolution = normalize_web_resolution(web_resolution)
+        viewport = web_viewport(resolution)
         self.close_case(sn, run_id=run_id)
-        browser = self._browser(_session_key(sn), headed=headed)
+        browser = self._browser(_session_key(sn), headed=headed, web_resolution=resolution)
         context = browser.new_context(
-            viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
-            screen={"width": VIEWPORT_W, "height": VIEWPORT_H},
+            viewport=viewport,
+            screen=viewport,
             device_scale_factor=1,
             ignore_https_errors=True,
         )
@@ -345,10 +367,10 @@ class PlaywrightHub:
             goto_url(page, url, params=goto_params)
         self._publish_session(
             key,
-            {"context": context, "page": page, "base_url": url},
+            {"context": context, "page": page, "base_url": url, "web_resolution": resolution},
             run_id=str(run_id or ""),
         )
-        SLog.i(TAG, f"case context ready sn={key} url={url or 'about:blank'}")
+        SLog.i(TAG, f"case context ready sn={key} resolution={resolution} url={url or 'about:blank'}")
         return page
 
     def note_lane(self, run_id: str) -> None:
@@ -496,10 +518,17 @@ class PlaywrightHub:
         base_url: str = "",
         headed: Optional[bool] = None,
         screenshot_params: dict[str, Any] | None = None,
+        web_resolution: str = DEFAULT_WEB_RESOLUTION,
     ) -> bytes:
         page = self.current_page(sn, run_id=run_id)
         if page is None:
-            page = self.open_case(sn, run_id=run_id, base_url=base_url, headed=headed)
+            page = self.open_case(
+                sn,
+                run_id=run_id,
+                base_url=base_url,
+                headed=headed,
+                web_resolution=web_resolution,
+            )
         if page is None:
             raise RuntimeError("playwright 当前没有打开的页面")
         try:
@@ -508,7 +537,8 @@ class PlaywrightHub:
             pass
         p = dict(screenshot_params or {})
         cap_ms = max(2000, min(int(p.get("timeout_ms") or timeout_ms or 8_000), 30_000))
-        full_page = bool(p.get("full_page") or p.get("fullPage"))
+        # Web 默认截取完整文档；显式 full_page=False 可退化为当前视口。
+        full_page = bool(p["full_page"] if "full_page" in p else p.get("fullPage", True))
         clip = self._clip_from_params(p)
         kwargs: dict[str, Any] = {
             "type": "png",
@@ -668,11 +698,14 @@ class PlaywrightHub:
         sn_key = _session_key(sn)
         browsers: dict = getattr(self._local, "browsers", None) or {}
         modes: dict = getattr(self._local, "browser_headed", None) or {}
-        browser = browsers.pop(sn_key, None)
-        modes.pop(sn_key, None)
         self._local.browsers = browsers
         self._local.browser_headed = modes
-        if browser is not None:
+        keys = [k for k in browsers if k == sn_key or k.startswith(sn_key + "::")]
+        for key in keys:
+            browser = browsers.pop(key, None)
+            modes.pop(key, None)
+            if browser is None:
+                continue
             try:
                 browser.close()
             except Exception:
