@@ -99,7 +99,7 @@ Scout 对 `do("标题")` 回调传 `title`（传整数时仍传 `number`）。Ne
 
 执行路径上**没有预检**：脚本写什么都会跑，唯一保留的是运行时的设备库 import 拦截。
 
-`mino-scout check [目录]`（`runtime/script_check.py`）只读源码，每行 `文件:行号: [类型] 说明`，有提示退出码 1。检查：
+`mino-scout check [目录]`（`runtime/script_check.py`）只读源码，每行 `文件:行号: [类型] 说明`。检查错误退出码 1，只有 warning 时不失败。它同时承载语法、原文映射与 `case_isolation` 仓库策略检查，不另设外部检查器。检查：
 
 | 类型 | 内容 |
 |---|---|
@@ -108,6 +108,7 @@ Scout 对 `do("标题")` 回调传 `title`（传整数时仍传 `number`）。Ne
 | `case_attr` / `case_init` / `step_title` | 旧写法、`case.init` 参数、步骤没标题 |
 | `prep_missing` / `prep_reason` | `tests/` 下的用例没有 `prep`；标题只写了「无」 |
 | `config_*` / `page_layout` | `config.yaml` 缺失或格式、脚本引用了不存在的应用、页面文件位置 |
+| `case_isolation` | 一条用例必须由一个文件直接承载业务；禁止 wrapper 转交集中 handler、按用例编号分派、共享 `flows/`/`scripts` 接收整个 `case` 或写 Nexus 事件与业务断言 |
 
 它不检查方法名（变量名不固定），也不能保证脚本能跑通。
 

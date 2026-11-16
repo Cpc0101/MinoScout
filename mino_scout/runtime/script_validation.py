@@ -27,7 +27,7 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     from mino_scout.runtime.script_exec import parse_yaml
     value = parse_yaml(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
-        raise ValueError("YAML 顶层必须是对象")
+        raise ValueError("YAML top level must be an object")
     return value
 
 
@@ -127,7 +127,7 @@ def validate_sources(root: Path, trees: dict[Path, ast.Module], *, require_cases
         page_key = str(page.get("page_key") or path.stem)
         key = (parts[0], page_key)
         if key in pages:
-            add(path, 1, "page_duplicate", f"应用 {key[0]} 的页面 {key[1]} 重复定义")
+            add(path, 1, "page_duplicate", f"Application {key[0]} defines page {key[1]} more than once")
         pages[key] = page
 
     case_count = 0
@@ -143,14 +143,14 @@ def validate_sources(root: Path, trees: dict[Path, ast.Module], *, require_cases
                 try:
                     target.relative_to(root)
                 except ValueError:
-                    add(path, node.lineno, "import_outside_repo", "相对导入超出脚本仓")
+                    add(path, node.lineno, "import_outside_repo", "Relative import resolves outside the script repository")
                     continue
                 if target.is_dir():
                     for alias in node.names:
                         if alias.name != "*" and not (target / (alias.name + ".py")).is_file() and not (target / alias.name).is_dir():
-                            add(path, node.lineno, "import_symbol_missing", f"{node.module} 没有模块 {alias.name}")
+                            add(path, node.lineno, "import_symbol_missing", f"{node.module} does not contain module {alias.name}")
                 elif not target.is_file():
-                    add(path, node.lineno, "import_missing", f"本地模块不存在：{node.module or '.'}")
+                    add(path, node.lineno, "import_missing", f"Local module does not exist: {node.module or '.'}")
                 elif target in trees:
                     exported, dynamic = _exports(trees[target])
                     for alias in node.names:
@@ -158,7 +158,7 @@ def validate_sources(root: Path, trees: dict[Path, ast.Module], *, require_cases
                             continue
                         if target.name == "__init__.py" and (target.parent / (alias.name + ".py")).is_file():
                             continue
-                        add(path, node.lineno, "import_symbol_missing", f"{node.module} 没有定义 {alias.name}")
+                        add(path, node.lineno, "import_symbol_missing", f"{node.module} does not define {alias.name}")
 
         apps = _app_bindings(tree)
         for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
@@ -172,39 +172,39 @@ def validate_sources(root: Path, trees: dict[Path, ast.Module], *, require_cases
                     page_key, control_id = control.split(".", 1)
                     page = pages.get((app_key, page_key))
                     if page is None:
-                        add(path, call.lineno, "page_missing", f"应用 {app_key} 没有页面 {page_key}")
+                        add(path, call.lineno, "page_missing", f"Application {app_key} does not define page {page_key}")
                         continue
                     controls = [item for item in page.get("controls", []) if isinstance(item, dict)
                                 and (item.get("id") == control_id or item.get("label") == control_id)]
                     if len(controls) != 1:
-                        add(path, call.lineno, "control_unknown", f"{app_key}/{control} 必须唯一对应一个控件")
+                        add(path, call.lineno, "control_unknown", f"{app_key}/{control} must resolve to exactly one control")
                     elif not controls[0].get("locator_spec"):
-                        add(path, call.lineno, "locator_missing", f"{app_key}/{control} 没有真实设备定位，采集后补齐再验证")
+                        add(path, call.lineno, "locator_missing", f"{app_key}/{control} has no device-observed locator; collect it before verification")
             elif fn.attr == "on_page" and call.args:
                 page_key = _literal(call.args[0])
                 if page_key and (app_key, page_key) not in pages:
-                    add(path, call.lineno, "page_missing", f"应用 {app_key} 没有页面 {page_key}")
+                    add(path, call.lineno, "page_missing", f"Application {app_key} does not define page {page_key}")
 
         if "tests" not in rel.parts or path.name == "__init__.py":
             continue
         case_count += 1
         runs = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "run"]
         if len(runs) != 1 or isinstance(runs[0], ast.AsyncFunctionDef):
-            add(path, 1, "entry_missing", "一条用例需要一个同步 def run(case) 入口")
+            add(path, 1, "entry_missing", "Each case needs exactly one synchronous def run(case) entry point")
         elif len(runs[0].args.posonlyargs + runs[0].args.args) != 1 or runs[0].args.kwonlyargs or runs[0].args.vararg or runs[0].args.kwarg:
-            add(path, runs[0].lineno, "entry_signature", "用例入口签名必须是 run(case)")
+            add(path, runs[0].lineno, "entry_signature", "Case entry signature must be run(case)")
 
         for node in ast.walk(tree):
             if isinstance(node, ast.With) and any(_scope(item.context_expr) == "check" for item in node.items):
                 effective = [part for part in node.body if not isinstance(part, ast.Pass)
                              and not (isinstance(part, ast.Expr) and isinstance(part.value, ast.Constant))]
                 if not effective:
-                    add(path, node.lineno, "check_empty", "check 中必须验证预期并产生断言，不能只写标题")
+                    add(path, node.lineno, "check_empty", "A check block must verify its expectation and produce an assertion; a title alone is insufficient")
                 else:
                     possible, unresolved = _assertion_calls(node.body)
                     if not possible:
                         add(path, node.lineno, "check_assertion_unresolved" if unresolved else "check_no_assertion",
-                            "该 check 的 helper 是否产生断言须在运行时核验" if unresolved else "截图、note 或原生 assert 通过不登记预期；请用 on_page/expect/vlm(verdict='pass')/assert_equal",
+                            "Whether this check's helper produces an assertion must be verified at runtime" if unresolved else "Screenshots, notes, and passing native asserts do not register an expectation; use on_page/expect/vlm(verdict='pass')/assert_equal",
                             "warning" if unresolved else "error")
 
         spec_path = path.with_suffix(".yaml")
@@ -218,12 +218,12 @@ def validate_sources(root: Path, trees: dict[Path, ast.Module], *, require_cases
             continue
         if binding is not None:
             if spec_path.is_file():
-                add(path, 1, "source_conflict", "CASE_SOURCE 与同名 YAML 不能同时存在，请删除重复快照")
-            add(path, 1, "source_remote", "飞书原文将在执行前读取；静态检查只验证来源配置，条目映射与覆盖须在运行时核验", "warning")
+                add(path, 1, "source_conflict", "CASE_SOURCE and a same-name YAML snapshot cannot coexist; remove the duplicate snapshot")
+            add(path, 1, "source_remote", "The Feishu source is read before execution; static checks only validate source configuration, while item mapping and coverage require runtime verification", "warning")
             continue
         if not spec_path.is_file():
             if refs:
-                add(path, 1, "source_missing", "使用 source_ref 时需要 CASE_SOURCE 来源变量或旧格式同名 .yaml 快照")
+                add(path, 1, "source_missing", "source_ref requires CASE_SOURCE or a legacy same-name .yaml snapshot")
             continue
         try:
             spec = _read_yaml(spec_path)
@@ -231,24 +231,24 @@ def validate_sources(root: Path, trees: dict[Path, ast.Module], *, require_cases
             add(spec_path, 1, "source_invalid", str(exc))
             continue
         if str(spec.get("case_id") or "") != path.stem:
-            add(spec_path, 1, "source_case_mismatch", "原文快照 case_id 必须等于脚本文件名")
+            add(spec_path, 1, "source_case_mismatch", "Source snapshot case_id must equal the script filename")
         source = spec.get("source")
         if not isinstance(source, dict) or not str(source.get("revision") or "").strip():
-            add(spec_path, 1, "source_revision_missing", "source.revision 必须固定原文版本或内容哈希")
+            add(spec_path, 1, "source_revision_missing", "source.revision must pin the source version or content hash")
         ids: dict[str, str] = {}
         for group in _ROLES.values():
             rows = spec.get(group, [])
             if not isinstance(rows, list):
-                add(spec_path, 1, "source_invalid", f"{group} 必须是条目列表")
+                add(spec_path, 1, "source_invalid", f"{group} must be a list of items")
                 continue
             if group == "expectations" and not rows:
-                add(spec_path, 1, "expectations_missing", "正式用例必须声明原文预期")
+                add(spec_path, 1, "expectations_missing", "A formal case must declare at least one source expectation")
             for row in rows:
                 key = str(row.get("id") or "") if isinstance(row, dict) else ""
                 if not key or not isinstance(row, dict) or not str(row.get("text") or "").strip():
-                    add(spec_path, 1, "source_invalid", f"{group} 每条需要 id 和原文 text")
+                    add(spec_path, 1, "source_invalid", f"Every item in {group} needs id and source text")
                 elif key in ids:
-                    add(spec_path, 1, "source_duplicate", f"原文编号 {key} 重复")
+                    add(spec_path, 1, "source_duplicate", f"Duplicate source item ID {key}")
                 else:
                     ids[key] = group
         seen: set[str] = set()
@@ -258,17 +258,17 @@ def validate_sources(root: Path, trees: dict[Path, ast.Module], *, require_cases
             ref = _literal(ref_node)
             if ref_node is not None and ref is None:
                 dynamic = True
-                add(path, call.lineno, "source_dynamic", "动态 source_ref 无法静态确认，必须在运行覆盖中核对", "warning")
+                add(path, call.lineno, "source_dynamic", "A dynamic source_ref cannot be confirmed statically; verify coverage at runtime", "warning")
             elif ref:
                 if ref not in ids:
-                    add(path, call.lineno, "source_unknown", f"原文没有编号 {ref}")
+                    add(path, call.lineno, "source_unknown", f"Source does not contain item {ref}")
                 elif ids[ref] != _ROLES[_scope(call)]:
-                    add(path, call.lineno, "source_role_mismatch", f"{ref} 与当前 prep/do/check 类型不一致")
+                    add(path, call.lineno, "source_role_mismatch", f"{ref} does not match the current prep/do/check role")
                 else:
                     seen.add(ref)
         missing = set(ids) - seen
         if missing:
-            add(path, 1, "source_unmapped", "原文尚无静态实现映射：" + ", ".join(sorted(missing)), "warning" if dynamic else "error")
+            add(path, 1, "source_unmapped", "Source items have no static implementation mapping: " + ", ".join(sorted(missing)), "warning" if dynamic else "error")
     if require_cases and case_count == 0:
-        findings.append(("tests", 0, "cases_missing", "没有发现用例脚本；静态配置通过不等于测试已完成", "error"))
+        findings.append(("tests", 0, "cases_missing", "No case scripts were found; passing static configuration checks does not mean testing is complete", "error"))
     return findings

@@ -14,10 +14,10 @@ from mino_scout.runtime.script_exec import _BANNED, parse_yaml
 
 _NO_CONCURRENCY = {"threading", "multiprocessing", "asyncio", "signal", "concurrent"}
 _REUSE = {
-    "imaplib": "取验证码用 case.scout.otp(account)",
-    "poplib": "取验证码用 case.scout.otp(account)",
-    "openai": "调模型用 case.scout.llm() / app.vlm()",
-    "anthropic": "调模型用 case.scout.llm() / app.vlm()",
+    "imaplib": "use case.scout.otp(account) for verification codes",
+    "poplib": "use case.scout.otp(account) for verification codes",
+    "openai": "use case.scout.llm() / app.vlm() for model calls",
+    "anthropic": "use case.scout.llm() / app.vlm() for model calls",
 }
 _CASE_ATTRS = {"config", "env", "app_id", "app_key", "init", "scout", "nexus"}
 _STEP_CALLS = {"prep", "do", "check"}
@@ -66,10 +66,12 @@ def check_repo(root: Path, *, require_cases: bool = False) -> list[Hint]:
     if keys is not None:
         for key, (rel, line) in sorted(used.items()):
             if key not in keys:
-                hints.append(Hint(rel, line, "config_missing", f"config.yaml 的 apps 里没有 {key}"))
+                hints.append(Hint(rel, line, "config_missing", f"config.yaml apps does not define {key}"))
     hints.extend(_page_layout(root, keys))
     from mino_scout.runtime.script_validation import validate_sources
     hints.extend(Hint(*row) for row in validate_sources(root, trees, require_cases=require_cases))
+    from mino_scout.runtime.case_isolation import validate_case_isolation
+    hints.extend(Hint(*row) for row in validate_case_isolation(root, trees))
     return hints
 
 
@@ -82,36 +84,36 @@ def _scan(tree: ast.AST) -> list[tuple[int, str, str]]:
             for name in names:
                 top = name.split(".", 1)[0]
                 if top in _BANNED:
-                    out.append((line, "forbidden", f"不要 import {top}：设备动作走 app.*，设备命令走 app.exec()"))
+                    out.append((line, "forbidden", f"Do not import {top}: use app.* for device actions and app.exec() for device commands"))
                 elif top in _NO_CONCURRENCY:
-                    out.append((line, "forbidden", f"不要 import {top}：线程/进程挂住会拖垮整个节点，顺序写"))
+                    out.append((line, "forbidden", f"Do not import {top}: blocked threads/processes can stall the entire node; run steps sequentially"))
                 elif top in _REUSE:
-                    out.append((line, "reuse", f"不要自己实现：{_REUSE[top]}"))
+                    out.append((line, "reuse", f"Do not reimplement this: {_REUSE[top]}"))
         elif isinstance(node, ast.Call):
             func = node.func
             if isinstance(func, ast.Name) and func.id in {"exec", "eval", "__import__"}:
-                out.append((line, "forbidden", f"不要调用 {func.id}()：设备命令走 app.exec()"))
+                out.append((line, "forbidden", f"Do not call {func.id}(): use app.exec() for device commands"))
             elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
                 owner, attr = func.value.id, func.attr
                 if owner == "os" and attr in {"system", "popen"}:
-                    out.append((line, "forbidden", f"不要调用 os.{attr}()：设备命令走 app.exec()"))
+                    out.append((line, "forbidden", f"Do not call os.{attr}(): use app.exec() for device commands"))
                 elif owner == "time" and attr == "sleep":
-                    out.append((line, "reuse", "不要 time.sleep：用 case.scout.wait(ms)，它会响应取消和超时"))
+                    out.append((line, "reuse", "Do not use time.sleep: use case.scout.wait(ms) so cancellation and timeouts are respected"))
                 elif owner == "case" and attr == "init":
                     keywords_ok = all(k.arg == "web_resolution" for k in node.keywords)
                     if len(node.args) != 1 or not _is_config_ref(node.args[0]) or not keywords_ok:
                         out.append((line, "case_init",
-                                    'case.init 只接受 case.config.<KEY>，可选关键字 web_resolution="720P|1080P|2K|3K/4K"'))
+                                    'case.init accepts case.config.<KEY> and optional web_resolution="720P|1080P|2K|3K/4K" only'))
             if isinstance(func, ast.Attribute) and func.attr in _STEP_CALLS and _is_nexus(func.value):
                 if not _titled(node):
-                    out.append((line, "step_title", f"case.nexus.{func.attr}() 要写这一步具体做什么的文字标题，它就是测试报告里的步骤名"))
+                    out.append((line, "step_title", f"case.nexus.{func.attr}() needs a concrete step title; it becomes the report step name"))
                 elif func.attr == "prep" and _blank_prep(node):
-                    out.append((line, "prep_reason", "前置标题不能只写「无」。写清做了什么；确实不用做，就写为什么"))
+                    out.append((line, "prep_reason", "Preparation title cannot be empty filler such as 'none'. State what was done, or why no preparation is needed"))
         elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "case":
             if node.attr not in _CASE_ATTRS:
-                out.append((line, "case_attr", f"case.{node.attr} 不存在：设备动作写在 app = case.init(case.config.<KEY>) 的 app 上，本机能力 case.scout，Nexus 能力 case.nexus"))
+                out.append((line, "case_attr", f"case.{node.attr} does not exist: use app = case.init(case.config.<KEY>) for device actions, case.scout for node capabilities, and case.nexus for Nexus events"))
         elif isinstance(node, ast.If) and _mentions_platform(node.test):
-            out.append((line, "forbidden", "不要按 platform 分支：同一份脚本要在所有渠道跑，差异放进 pages 的 locator_spec"))
+            out.append((line, "forbidden", "Do not branch on platform: the same script must run on every channel; put differences in pages locator_spec"))
     return out
 
 
@@ -143,7 +145,7 @@ def _prep_required(tree: ast.AST, rel: str) -> list[Hint]:
         return []
     line = int(runs[0].lineno or 1)
     return [Hint(rel, line, "prep_missing",
-                 "用例要写前置：case.nexus.prep(\"做了什么\")。确实不用做，标题写为什么，这句话会写入 Nexus")]
+                 "Add case.nexus.prep(\"what was done\"). If preparation is unnecessary, state why; this title is recorded in Nexus")]
 
 
 def _is_prep_call(node: ast.AST) -> bool:
@@ -177,22 +179,22 @@ def _mentions_platform(node: ast.AST) -> bool:
 def _config_keys(root: Path, hints: list[Hint]) -> set[str] | None:
     path = root / "config.yaml"
     if not path.is_file():
-        hints.append(Hint("config.yaml", 0, "config_missing", "仓库根目录没有 config.yaml"))
+        hints.append(Hint("config.yaml", 0, "config_missing", "Repository root does not contain config.yaml"))
         return None
     try:
         doc = parse_yaml(path.read_text(encoding="utf-8"))
     except Exception as exc:
-        hints.append(Hint("config.yaml", 0, "config_invalid", f"解析失败：{exc}"))
+        hints.append(Hint("config.yaml", 0, "config_invalid", f"Unable to parse config.yaml: {exc}"))
         return None
     apps = doc.get("apps") if isinstance(doc, dict) else None
     if not isinstance(apps, dict) or not apps:
-        hints.append(Hint("config.yaml", 0, "config_invalid", "顶层要有 apps，且至少一个应用"))
+        hints.append(Hint("config.yaml", 0, "config_invalid", "Top-level apps must be an object containing at least one application"))
         return None
     for key, row in apps.items():
         if not isinstance(row, dict) or not str(row.get("platform") or ""):
-            hints.append(Hint("config.yaml", 0, "config_invalid", f"{key} 缺 platform"))
+            hints.append(Hint("config.yaml", 0, "config_invalid", f"{key} is missing platform"))
         if not re.match(r"^[A-Za-z][A-Za-z0-9_]{0,31}$", str(key)):
-            hints.append(Hint("config.yaml", 0, "config_invalid", f"应用 key {key} 要以英文字母开头，只含英文、数字、下划线"))
+            hints.append(Hint("config.yaml", 0, "config_invalid", f"Application key {key} must start with an ASCII letter and contain only letters, digits, and underscores"))
         if isinstance(row, dict):
             hints.extend(_otp_hints(str(key), row))
             envs = row.get("envs")
@@ -210,14 +212,14 @@ def _otp_hints(label: str, row: dict) -> list[Hint]:
     if otp is None:
         return []
     if not isinstance(otp, dict):
-        return [Hint("config.yaml", 0, "config_invalid", f"{label}.otp 必须是对象，可选字段只有 code")]
+        return [Hint("config.yaml", 0, "config_invalid", f"{label}.otp must be an object whose only allowed field is code")]
     unknown = [str(k) for k in otp if str(k) != "code"]
     out: list[Hint] = []
     if unknown:
         out.append(Hint("config.yaml", 0, "config_invalid",
-                        f"{label}.otp 只允许 code，不认识：{', '.join(unknown)}"))
+                        f"{label}.otp only allows code; unknown fields: {', '.join(unknown)}"))
     if "code" in otp and otp.get("code") is not None and not isinstance(otp.get("code"), str):
-        out.append(Hint("config.yaml", 0, "config_invalid", f"{label}.otp.code 必须是字符串"))
+        out.append(Hint("config.yaml", 0, "config_invalid", f"{label}.otp.code must be a string"))
     return out
 
 
@@ -232,7 +234,7 @@ def _page_layout(root: Path, keys: set[str] | None) -> list[Hint]:
         parts = path.relative_to(folder).parts
         rel = str(path.relative_to(root))
         if len(parts) < 2:
-            out.append(Hint(rel, 0, "page_layout", "页面文件要放在 pages/<APP_KEY>/ 下"))
+            out.append(Hint(rel, 0, "page_layout", "Page files must be under pages/<APP_KEY>/"))
         elif keys is not None and parts[0] not in keys:
-            out.append(Hint(rel, 0, "page_layout", f"目录 {parts[0]} 不是 config.yaml 里的应用 key"))
+            out.append(Hint(rel, 0, "page_layout", f"Directory {parts[0]} is not an application key in config.yaml"))
     return out
