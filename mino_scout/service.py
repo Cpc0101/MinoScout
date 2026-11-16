@@ -3,14 +3,16 @@
 Studio 和运维都走这三件事，不要再让人去 `launchctl unload`。
 `run` 在 `scout.lock` 上 flock 后写 pid 再 dial Nexus，避免 kickstart 与旧进程双 REGISTER；
 `status` 看进程在不在；`stop` 发 SIGTERM，Scout 自己发
-`EXECUTE node.shutting_down` 再退出。launchd / systemd 的 KeepAlive 配的是
-Crashed / on-failure，正常退出不会被拉起来。
+`EXECUTE node.shutting_down` 再退出。macOS LaunchAgent、Linux systemd 与 Windows
+Scheduled Task 都会在启动前检查并修复服务定义；正常退出不会被拉起来。
 """
 from __future__ import annotations
 
 import json
 import os
+import plistlib
 import signal
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -23,6 +25,8 @@ TAG = "Service"
 
 _STALE_LOCK_WAIT_SEC = 5.0
 _STALE_LOCK_POLL_SEC = 0.12
+_LAUNCH_AGENT_LABEL = "com.mino.scout"
+_SYSTEMD_UNIT_NAME = "mino-scout.service"
 
 
 def pid_path() -> Path:
@@ -224,8 +228,223 @@ def cmd_public_status() -> int:
     return 0
 
 
+def _service_argv() -> tuple[Path, list[str]]:
+    from mino_scout.tools.keep_alive.process_control import run_argv
+
+    argv = run_argv()
+    return Path(argv[0]).expanduser().resolve(), argv[1:]
+
+
+def _service_environment() -> dict[str, str]:
+    """Environment needed by a login-launched Scout, including frozen TLS CAs."""
+    prefix = config_dir()
+    environment = {
+        "MINO_SCOUT_HOME": str(prefix),
+        "HOME": str(Path.home()),
+        "PLAYWRIGHT_BROWSERS_PATH": str(prefix / "bin" / "ms-playwright"),
+    }
+    if os.name == "nt":
+        environment["USERPROFILE"] = str(Path.home())
+    elif sys.platform == "darwin":
+        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
+    else:
+        environment["PATH"] = str(os.environ.get("PATH") or "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+    try:
+        from mino_scout.runtime.startup import configure_tls_environment
+
+        environment.update(configure_tls_environment())
+    except Exception as exc:
+        SLog.w(TAG, f"服务 CA 环境初始化失败: {exc}")
+    return environment
+
+
+def _write_if_changed(path: Path, data: bytes, *, mode: int | None = None) -> bool:
+    try:
+        if path.read_bytes() == data:
+            return False
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_bytes(data)
+        if mode is not None:
+            temporary.chmod(mode)
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+    return True
+
+
+def launch_agent_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{_LAUNCH_AGENT_LABEL}.plist"
+
+
+def _launch_agent_payload() -> dict[str, Any]:
+    prefix = config_dir()
+    binary, arguments = _service_argv()
+    return {
+        "Label": _LAUNCH_AGENT_LABEL,
+        "ProgramArguments": [str(binary), *arguments],
+        "WorkingDirectory": str(prefix),
+        "EnvironmentVariables": _service_environment(),
+        "RunAtLoad": True,
+        "KeepAlive": {"Crashed": True},
+        "StandardOutPath": str(prefix / "logs" / "scout.log"),
+        "StandardErrorPath": str(prefix / "logs" / "scout.err.log"),
+    }
+
+
+def ensure_launch_agent() -> tuple[Path, bool]:
+    """Create or repair the per-user macOS LaunchAgent before starting Scout."""
+    path = launch_agent_path()
+    payload = _launch_agent_payload()
+    (config_dir() / "logs").mkdir(parents=True, exist_ok=True)
+    return path, _write_if_changed(path, plistlib.dumps(payload), mode=0o644)
+
+
+def systemd_unit_path() -> Path:
+    """Per-user on normal Linux installs, system-wide only when Scout runs as root."""
+    if os.geteuid() == 0:
+        return Path("/etc/systemd/system") / _SYSTEMD_UNIT_NAME
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+    return config_home.expanduser() / "systemd" / "user" / _SYSTEMD_UNIT_NAME
+
+
+def _systemd_quote(value: str) -> str:
+    escaped = str(value).replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return f'"{escaped}"'
+
+
+def _systemd_unit_text() -> str:
+    prefix = config_dir()
+    binary, arguments = _service_argv()
+    wanted_by = "multi-user.target" if os.geteuid() == 0 else "default.target"
+    command = " ".join(_systemd_quote(part) for part in [str(binary), *arguments])
+    lines = [
+        "[Unit]",
+        "Description=Mino Scout",
+        "After=network-online.target",
+    ]
+    if os.geteuid() == 0:
+        lines.append("Wants=network-online.target")
+    lines.extend([
+        "",
+        "[Service]",
+        "Type=simple",
+        f"ExecStart={command}",
+        f"WorkingDirectory={_systemd_quote(str(prefix))}",
+    ])
+    lines.extend(f"Environment={_systemd_quote(f'{key}={value}')}" for key, value in _service_environment().items())
+    lines.extend([
+        "Restart=on-failure",
+        "RestartSec=5",
+        "",
+        "[Install]",
+        f"WantedBy={wanted_by}",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def ensure_systemd_unit() -> tuple[Path, bool]:
+    path = systemd_unit_path()
+    return path, _write_if_changed(path, _systemd_unit_text().encode("utf-8"), mode=0o644)
+
+
+def _powershell_quote(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def windows_task_name() -> str:
+    import hashlib
+
+    suffix = hashlib.sha256(str(config_dir()).lower().encode("utf-8")).hexdigest()[:12]
+    return f"Mino Scout {suffix}"
+
+
+def windows_launcher_path() -> Path:
+    return config_dir() / "run-scout.ps1"
+
+
+def windows_startup_path() -> Path:
+    appdata = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
+    suffix = windows_task_name().rsplit(" ", 1)[-1]
+    return appdata / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / f"MinoScout-{suffix}.cmd"
+
+
+def _windows_launcher_text() -> str:
+    prefix = config_dir()
+    binary, arguments = _service_argv()
+    lines = ["$ErrorActionPreference = 'Stop'"]
+    lines.extend(f"$env:{key} = {_powershell_quote(value)}" for key, value in _service_environment().items())
+    lines.append(f"Set-Location -LiteralPath {_powershell_quote(str(prefix))}")
+    command = " ".join(_powershell_quote(part) for part in [str(binary), *arguments])
+    lines.append(f"& {command}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _windows_startup_text(launcher: Path) -> str:
+    rendered = str(launcher).replace("%", "%%")
+    return (
+        "@echo off\r\n"
+        "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass "
+        f'-File "{rendered}"\r\n'
+    )
+
+
+def ensure_windows_autostart() -> tuple[str, bool]:
+    """Register a per-user logon task; retain Startup-folder fallback on failure."""
+    import base64
+    import subprocess
+
+    launcher = windows_launcher_path()
+    _write_if_changed(launcher, _windows_launcher_text().encode("utf-8"), mode=0o600)
+    task = windows_task_name()
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$taskName = {_powershell_quote(task)}
+$launcher = {_powershell_quote(str(launcher))}
+$prefix = {_powershell_quote(str(config_dir()))}
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$arguments = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{{0}}"' -f $launcher
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments -WorkingDirectory $prefix
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
+$principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit 0 -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
+"""
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    registered = False
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+            capture_output=True,
+            timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        registered = result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        registered = False
+
+    startup = windows_startup_path()
+    if registered:
+        try:
+            startup.unlink()
+        except OSError:
+            pass
+    else:
+        _write_if_changed(startup, _windows_startup_text(launcher).encode("utf-8"), mode=0o600)
+        SLog.w(TAG, f"计划任务注册失败，已使用启动目录兜底: {startup}")
+    return task, registered
+
+
 def try_start_service(*, wait_sec: float = 4.0) -> int:
-    """拉起 launchd / systemd；未注册服务时在后台 exec `mino-scout run`。"""
+    """拉起平台服务；启动前自动创建或修复对应服务的启动定义。"""
     import subprocess
     import sys
 
@@ -238,37 +457,58 @@ def try_start_service(*, wait_sec: float = 4.0) -> int:
         return start(wait_sec=wait_sec)
 
     started = False
+    strict_service = False
     if sys.platform == "darwin":
+        strict_service = True
         uid = os.getuid()
-        target = f"gui/{uid}/com.mino.scout"
-        for cmd in (
+        target = f"gui/{uid}/{_LAUNCH_AGENT_LABEL}"
+        try:
+            plist, changed = ensure_launch_agent()
+        except Exception as exc:
+            SLog.w(TAG, f"LaunchAgent 初始化失败: {exc}")
+            plist, changed = launch_agent_path(), False
+        if changed:
+            try:
+                subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        commands = (
+            ["launchctl", "bootstrap", f"gui/{uid}", str(plist)],
             ["launchctl", "kickstart", target],
-            ["launchctl", "bootstrap", f"gui/{uid}", str(Path.home() / "Library/LaunchAgents/com.mino.scout.plist")],
-        ):
+            ["launchctl", "load", str(plist)],
+            ["launchctl", "kickstart", target],
+        )
+        for cmd in commands:
             try:
                 result = subprocess.run(cmd, capture_output=True, timeout=15)
                 if result.returncode == 0:
                     started = True
-                    break
             except (OSError, subprocess.TimeoutExpired):
                 continue
     elif sys.platform.startswith("linux"):
-        for cmd in (
-            ["systemctl", "--user", "start", "mino-scout.service"],
-            ["systemctl", "start", "mino-scout.service"],
-        ):
+        try:
+            ensure_systemd_unit()
+        except Exception as exc:
+            SLog.w(TAG, f"systemd unit 初始化失败: {exc}")
+        scope = ["systemctl"] if os.geteuid() == 0 else ["systemctl", "--user"]
+        commands = (
+            [*scope, "daemon-reload"],
+            [*scope, "enable", "--now", _SYSTEMD_UNIT_NAME],
+        )
+        for cmd in commands:
             try:
                 r = subprocess.run(cmd, capture_output=True, timeout=15)
                 if r.returncode == 0:
                     started = True
-                    break
             except (OSError, subprocess.TimeoutExpired):
                 continue
 
     elif os.name == "nt":
-        # Per-user tasks; a different configuration directory must use its own process.
-        import hashlib
-        task = "Mino Scout " + hashlib.sha256(str(config_dir()).lower().encode()).hexdigest()[:12]
+        task = windows_task_name()
+        try:
+            task, _ = ensure_windows_autostart()
+        except Exception as exc:
+            SLog.w(TAG, f"Windows 自启动初始化失败: {exc}")
         try:
             result = subprocess.run(["schtasks.exe", "/Run", "/TN", task], capture_output=True, timeout=15)
             started = result.returncode == 0
@@ -281,7 +521,7 @@ def try_start_service(*, wait_sec: float = 4.0) -> int:
             return cmd_public_status()
         time.sleep(0.25)
 
-    if not started:
+    if not started and not strict_service:
         SLog.i(TAG, "未找到系统服务，后台启动 mino-scout run")
         from mino_scout.tools.keep_alive.process_control import spawn_run
         spawn_run()

@@ -271,7 +271,12 @@ def main(argv: list[str] | None = None) -> int:
     import multiprocessing
     multiprocessing.freeze_support()
     from mino_scout.config import configure_proxy_bypass
+    from mino_scout.runtime.startup import configure_tls_environment
 
+    try:
+        configure_tls_environment()
+    except Exception as exc:
+        SLog.w(TAG, f"certifi CA 初始化失败: {exc}")
     configure_proxy_bypass()
 
     raw = list(argv) if argv is not None else sys.argv[1:]
