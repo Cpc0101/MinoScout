@@ -465,25 +465,34 @@ class Case:
         self._failure_role = ""
         self._covered: set[str] = set()
         sidecar = (root / payload.script_path).with_suffix(".yaml")
-        self._source_snapshot = parse_yaml(sidecar.read_text(encoding="utf-8")) if sidecar.is_file() else {}
+        from mino_scout.runtime.script_source import load_source
+        self._guard()
+        try:
+            external = load_source(root / payload.script_path, core.node_id)
+        except ValueError as exc:
+            raise ScriptAbort(str(exc), reason_code="source_read_failed", status="blocked") from None
+        except Exception:
+            raise ScriptAbort("用例来源读取失败，请检查来源配置、飞书授权及访问权限", reason_code="source_read_failed", status="blocked") from None
+        self._guard()
+        self._source_snapshot = external if external is not None else parse_yaml(sidecar.read_text(encoding="utf-8")) if sidecar.is_file() else {}
         if not isinstance(self._source_snapshot, dict):
-            raise ScriptAbort("用例 sidecar 不是对象", reason_code="source_invalid", status="blocked")
-        if sidecar.is_file():
+            raise ScriptAbort("用例原文快照不是对象", reason_code="source_invalid", status="blocked")
+        if self._source_snapshot:
             source = self._source_snapshot.get("source")
             if str(self._source_snapshot.get("case_id") or "") != (root / payload.script_path).stem:
-                raise ScriptAbort("sidecar case_id 与脚本不一致", reason_code="source_case_mismatch", status="blocked")
+                raise ScriptAbort("原文快照 case_id 与脚本不一致", reason_code="source_case_mismatch", status="blocked")
             if not isinstance(source, dict) or not str(source.get("revision") or "").strip():
-                raise ScriptAbort("sidecar 缺固定原文版本", reason_code="source_revision_missing", status="blocked")
+                raise ScriptAbort("原文快照缺固定版本", reason_code="source_revision_missing", status="blocked")
             seen_ids = set()
             for group in ("preconditions", "steps", "expectations"):
                 rows = self._source_snapshot.get(group, [])
                 if not isinstance(rows, list) or group == "expectations" and not rows:
-                    raise ScriptAbort(f"sidecar {group} 无效", reason_code="source_invalid", status="blocked")
+                    raise ScriptAbort(f"原文快照 {group} 无效", reason_code="source_invalid", status="blocked")
                 for row in rows:
                     if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"].strip() or not str(row.get("text") or "").strip():
-                        raise ScriptAbort("sidecar 条目缺 id/text", reason_code="source_invalid", status="blocked")
+                        raise ScriptAbort("原文快照条目缺 id/text", reason_code="source_invalid", status="blocked")
                     if row["id"] in seen_ids:
-                        raise ScriptAbort("sidecar 条目编号重复", reason_code="source_duplicate", status="blocked")
+                        raise ScriptAbort("原文快照条目编号重复", reason_code="source_duplicate", status="blocked")
                     seen_ids.add(row["id"])
         self._source_clauses = {str(row["id"]): row for key in ("preconditions", "steps", "expectations")
             for row in (self._source_snapshot.get(key) or []) if isinstance(row, dict) and row.get("id")}
@@ -491,6 +500,8 @@ class Case:
             for row in (self._source_snapshot.get(key) or []) if isinstance(row, dict) and row.get("id")}
         immutable = {key: self._source_snapshot.get(key, {} if key == "source" else [])
             for key in ("source", "preconditions", "steps", "expectations")}
+        if external is not None:
+            immutable["source"] = {key: value for key, value in immutable["source"].items() if key != "fetched_at"}
         self._source_hash = hashlib.sha256(json.dumps(immutable, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest() if self._source_snapshot else ""
         if self._recorder:
             from mino_scout.runtime.records import scrub

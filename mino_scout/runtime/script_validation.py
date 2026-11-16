@@ -210,9 +210,20 @@ def validate_sources(root: Path, trees: dict[Path, ast.Module], *, require_cases
         spec_path = path.with_suffix(".yaml")
         calls = [node for node in ast.walk(tree) if _scope(node)]
         refs = [kw.value for call in calls for kw in call.keywords if kw.arg == "source_ref"]
+        from mino_scout.runtime.script_source import source_binding
+        try:
+            binding = source_binding(tree)
+        except ValueError as exc:
+            add(path, 1, "source_invalid", str(exc))
+            continue
+        if binding is not None:
+            if spec_path.is_file():
+                add(path, 1, "source_conflict", "CASE_SOURCE 与同名 YAML 不能同时存在，请删除重复快照")
+            add(path, 1, "source_remote", "飞书原文将在执行前读取；静态检查只验证来源配置，条目映射与覆盖须在运行时核验", "warning")
+            continue
         if not spec_path.is_file():
             if refs:
-                add(path, 1, "source_missing", "使用 source_ref 时需要同名 .yaml 原文快照")
+                add(path, 1, "source_missing", "使用 source_ref 时需要 CASE_SOURCE 来源变量或旧格式同名 .yaml 快照")
             continue
         try:
             spec = _read_yaml(spec_path)
