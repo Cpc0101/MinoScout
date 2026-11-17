@@ -246,7 +246,7 @@ def _os_getpid() -> int:
 
 
 def cmd_check(argv: list[str]) -> int:
-    """Statically check source and dependencies; errors return 1 and warnings require runtime verification."""
+    """Statically check source and dependencies; errors and actionable warnings return 1."""
     from pathlib import Path
 
     from mino_scout.runtime.script_check import check_repo
@@ -263,8 +263,14 @@ def cmd_check(argv: list[str]) -> int:
     for hint in hints:
         print(hint)
     errors = sum(hint.severity == "error" for hint in hints)
-    print(f"{errors} error(s), {len(hints) - errors} item(s) requiring runtime verification" if hints else "Static checks passed; executability and expectation coverage still require runtime verification")
-    return 1 if errors else 0
+    warnings = sum(hint.severity == "warning" for hint in hints)
+    infos = sum(hint.severity == "info" for hint in hints)
+    runtime_note = "app behavior, page locators, and remote-source coverage still require runtime verification"
+    if errors or warnings:
+        print(f"Static checks need fixes: {errors} error(s), {warnings} actionable warning(s), {infos} informational item(s); {runtime_note}")
+        return 1
+    print(f"Static checks passed: 0 error(s), 0 actionable warning(s), {infos} informational item(s); {runtime_note}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

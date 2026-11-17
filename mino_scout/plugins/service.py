@@ -7,14 +7,14 @@ from typing import Any
 from mino_scout.server_comm import protocol as P
 from mino_scout.executors.base import make_event_result, now_iso
 from mino_scout.tools.keep_alive.log import SLog
-from mino_scout.plugins.gmail_otp import GmailOtpError, fetch_otp_via_imap
+from mino_scout.plugins.mail_otp import MailOtpError, fetch_otp_via_imap
 from mino_scout.plugins.install import PluginInstallError, install, remove
 from mino_scout.plugins.secret_store import SecretStoreError
 from mino_scout.plugins.state import apply_config, configured, plain_value, secret_value, status_list
 from mino_scout.schemas import EventResult, EventStatus
 
 TAG = "PluginService"
-_GMAIL_HINT = "请在这台 Scout 节点的「邮箱 / Gmail」里填写收件箱和应用专用密码"
+_MAIL_HINT = "请在这台 Scout 节点的「收信」里填写收件邮箱和应用专用密码；使用 Gmail 以外的邮箱时再填写 IMAP 服务器"
 
 
 def _blocked_plugin(core: Any, event: Any, started: str) -> EventResult:
@@ -197,9 +197,10 @@ def _gmail(core: Any, req: P.Execute, event: Any, started: str) -> EventResult:
         except (KeyError, TypeError, ValueError, OverflowError):
             return _fail(event, started, 'otp_request_invalid', 'plugin.gmail.fetch_otp', t0=t0)
     inbox = plain_value("mail", "gmail", "inbox_address")
+    imap_host = plain_value("mail", "gmail", "imap_server")
     password = secret_value(core.node_id, "mail", "gmail", "app_password")
     if not inbox or not password:
-        return _fail(event, started, _GMAIL_HINT, "plugin.gmail.fetch_otp")
+        return _fail(event, started, _MAIL_HINT, "plugin.gmail.fetch_otp")
     since = params.get("since_ts")
     try:
         since_ts = float(since) if since else None
@@ -217,6 +218,7 @@ def _gmail(core: Any, req: P.Execute, event: Any, started: str) -> EventResult:
         diagnostics = {}
         code = fetch_otp_via_imap(
             inbox_address=inbox,
+            imap_host=imap_host,
             app_password=password,
             to_address=str(params.get("to_address") or ""),
             since_ts=since_ts,
@@ -227,10 +229,10 @@ def _gmail(core: Any, req: P.Execute, event: Any, started: str) -> EventResult:
             deadline_ts=min(deadline_ts or float("inf"), time.time() + max(0.0, end - time.monotonic())),
             should_stop=stopped, diagnostics=diagnostics,
         )
-    except GmailOtpError as exc:
+    except MailOtpError as exc:
         text = str(exc)
         if "未配置" in text:
-            text = _GMAIL_HINT
+            text = _MAIL_HINT
         result = _fail(event, started, text, "plugin.gmail.fetch_otp", t0=t0)
         result.raw_response['otp_diagnostics'] = {k: v for k, v in diagnostics.items()
             if k in {'connection_attempts', 'reconnects', 'error_code', 'phase'}}

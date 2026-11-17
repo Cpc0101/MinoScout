@@ -89,7 +89,8 @@ CATALOG: list[dict[str, Any]] = [
         "id": "gmail",
         "needs_install": False,
         "fields": [
-            _f("inbox_address", "收件邮箱", "name@gmail.com"),
+            _f("inbox_address", "收件邮箱", "name@gmail.com / name@qq.com"),
+            _f("imap_server", "IMAP 服务器", "留空默认 imap.gmail.com", optional=True),
             _f("app_password", "应用专用密码", "", secret=True),
         ],
     },

@@ -26,6 +26,6 @@ CASE_SOURCE = {
 
 原文读取使用执行节点自己的飞书授权。权限不足、网络失败、来源不完整、重复用例 ID、缺少预期、原文编号重复或运行引用不符均阻塞，不退回历史 YAML。飞书调整了操作或预期后，自动化实现及 `source_ref` 仍需相应核对；自动读取不等于自动修改业务断言。
 
-静态 `mino-scout check --require-cases .` 用 AST 读取 `CASE_SOURCE`，不导入脚本、不调用飞书。验证配置后给出 `source_remote` 提示，原文映射与覆盖在执行时核验。失败读取返回 `source_read_failed`，没有开始设备动作时保持未执行。
+静态 `mino-scout check --require-cases .` 用 AST 读取 `CASE_SOURCE`，不导入脚本、不调用飞书。验证配置后为每条 `CASE_SOURCE` 给出 `source_remote/info`，说明原文映射与覆盖必须在执行时核验；这是静态检查的能力边界，不是待修复问题，也不会阻塞静态门禁。运行时仍会核验原文映射与覆盖。失败读取返回 `source_read_failed`，没有开始设备动作时保持未执行。
 
 旧同名 YAML 保留兼容。单条用例迁移到 `CASE_SOURCE` 时删除同名 YAML；两者并存视为配置冲突。`config.yaml` 和页面定位 YAML 不属于用例原文快照，继续保留。

@@ -219,7 +219,7 @@ def validate_sources(root: Path, trees: dict[Path, ast.Module], *, require_cases
         if binding is not None:
             if spec_path.is_file():
                 add(path, 1, "source_conflict", "CASE_SOURCE and a same-name YAML snapshot cannot coexist; remove the duplicate snapshot")
-            add(path, 1, "source_remote", "The Feishu source is read before execution; static checks only validate source configuration, while item mapping and coverage require runtime verification", "warning")
+            add(path, 1, "source_remote", "The Feishu source is read before execution; static checks only validate source configuration, while item mapping and coverage require runtime verification", "info")
             continue
         if not spec_path.is_file():
             if refs:

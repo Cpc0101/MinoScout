@@ -34,7 +34,7 @@ class Hint:
     severity: str = "error"
 
     def __str__(self) -> str:
-        label = self.code if self.severity == "error" else f"{self.code}/warning"
+        label = self.code if self.severity == "error" else f"{self.code}/{self.severity}"
         return f"{self.path}:{self.line}: [{label}] {self.text}"
 
 
