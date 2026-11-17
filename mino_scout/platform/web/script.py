@@ -15,7 +15,13 @@ def observe_control(app, selector):
         raise ScriptAbort("缺 Chromium 会话", reason_code="channel_missing", status="blocked")
     value = str(selector.get("value") or "")
     try:
-        locator = page.locator(value) if selector["kind"] == "css" else page.get_by_test_id(value)
+        from mino_scout.platform.web.playwright_context import resolve_locator_scope
+        from mino_scout.platform.web.playwright_locators import exact_visible_pattern
+        scope = resolve_locator_scope(page, selector)
+        if selector["kind"] == "role":
+            locator = scope.get_by_role(str(selector.get("name") or ""), name=exact_visible_pattern(value))
+        else:
+            locator = scope.locator(value) if selector["kind"] == "css" else scope.get_by_test_id(value)
         observation = locator.evaluate_all("""els => {
             const count = els.length;
             if (count !== 1) return {count, nodes:[]};
@@ -50,8 +56,10 @@ def locator_params(kind: str, value: str, name: str, label: str) -> dict:
     elif kind == "test_id":
         params["test_id"] = value
     elif kind == "role":
-        params["selector_text"] = name
-        params["target"] = {"text": name}
+        params["role"] = name
+        params["role_name"] = value
+        params["selector_text"] = value
+        params["target"] = {"text": value}
     return params
 
 

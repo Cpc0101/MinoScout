@@ -17,7 +17,7 @@ from mino_scout.tools.keep_alive.log import SLog
 from mino_scout.tools.app_package import PackageError
 from mino_scout.schemas import EventStatus
 from mino_scout.platform.ios.wda_session import (
-    WdaError, app_version, client_for, device_online, install_app, installed_apps,
+    WdaError, WdaLocatorError, app_version, client_for, device_online, install_app, installed_apps,
     list_attached_devices, uninstall_app,
 )
 
@@ -98,6 +98,9 @@ class WdaExecutor:
                 data = self._package(event, ctx)
             else:
                 data = self._run(event, ctx)
+        except WdaLocatorError as exc:
+            status, error = EventStatus.BLOCKED, str(exc)
+            data = {"execution": {"execution_started": "no", "phase": "resolve", "reason_code": exc.reason_code, "source": "wda.native.v1"}}
         except WdaError as exc:
             status, error = EventStatus.FAIL, str(exc)
             data = {**(data if isinstance(data, dict) else {}), "execution": {
@@ -216,7 +219,7 @@ class WdaExecutor:
             target = _target_text(params)
             has_xy = params.get("x") is not None and params.get("y") is not None
             if target and policy != "coordinate":
-                client.tap_target(target)
+                client.tap_target(target, selector=params.get("bound_selector") if params.get("require_unique") else None)
                 return {"summary": "已点击", "tap_strategy": "anchor", "target": target}
             if has_xy:
                 client.tap_xy(int(params["x"]), int(params["y"]))
@@ -240,7 +243,10 @@ class WdaExecutor:
         if cap == "input_text":
             if params.get("ocr_observation_id") and params.get("x") is not None and params.get("y") is not None:
                 client.tap_xy(int(params["x"]), int(params["y"]))
-            client.keys(str(params.get("text") or ""))
+            if params.get("require_unique"):
+                client.input_target(params["bound_selector"], str(params.get("text") or ""))
+            else:
+                client.keys(str(params.get("text") or ""))
             return {"summary": "已输入"}
         if cap == "press_key":
             button = {"home": "home", "volume_up": "volumeUp", "volumeup": "volumeUp",
@@ -375,7 +381,7 @@ def _point(client, params: dict) -> tuple[int, int]:
     target = _target_text(params)
     if not target:
         raise WdaError("缺少坐标或目标")
-    return client.element_center(target)
+    return client.element_center(target, selector=params.get("bound_selector") if params.get("require_unique") else None)
 
 
 def _swipe_points(client, params: dict) -> tuple[int, int, int, int]:

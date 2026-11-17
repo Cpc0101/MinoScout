@@ -264,6 +264,8 @@ class ScriptRun:
     attempt_id: str = ""
     owner_user_id: str = ""
     execution_timeout_sec: float = 600.0
+    inputs: dict[str, Any] = field(default_factory=dict)
+    source_context: dict[str, Any] = field(default_factory=dict)
 
 
 SCRIPT_RUN_CAPABILITY = "script.run"
@@ -273,8 +275,69 @@ RECORD_RESOURCE_STATUS_CAPABILITY = "record.resource_status"
 RECORD_RESOURCE_STOP_CONTRACT = "script_resource_stop.v1"
 RECORD_REPORT_VERSION = 1  # Optional bounded business projection in record.sync.
 SCRIPT_RUN_FIELDS = ("run_id", "session_id", "case_id", "sn", "platform", "repo_url", "branch", "revision", "script_path",
-                     "task_id", "attempt_id", "owner_user_id", "execution_timeout_sec")
+                     "task_id", "attempt_id", "owner_user_id", "execution_timeout_sec", "inputs", "source_context")
 _SCRIPT_RUN_FIELDS = SCRIPT_RUN_FIELDS
+
+
+def validate_runtime_data(value: Any, *, max_bytes: int = 16384) -> dict[str, Any]:
+    """Portable bounded business values; never page handles or credentials."""
+    import json
+    if not isinstance(value, dict):
+        raise ValueError("runtime_data_invalid")
+    secret_keys = {"password", "passwd", "otp", "otp_code", "token", "api_key", "authorization", "cookie", "cookies", "access_token", "refresh_token", "secret"}
+    def check(item, depth=0):
+        if depth > 8:
+            raise ValueError("runtime_data_too_deep")
+        if isinstance(item, dict):
+            for key, val in item.items():
+                if not isinstance(key, str) or not key or len(key) > 128 or key.lower() in secret_keys or key.startswith("__"):
+                    raise ValueError("runtime_data_key_invalid")
+                check(val, depth + 1)
+        elif isinstance(item, list):
+            for val in item:
+                check(val, depth + 1)
+        elif type(item) not in (str, int, float, bool, type(None)):
+            raise ValueError("runtime_data_value_invalid")
+    check(value)
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("runtime_data_value_invalid") from exc
+    if len(encoded.encode("utf-8")) > max_bytes:
+        raise ValueError("runtime_data_too_large")
+    return json.loads(encoded)
+
+
+def validate_case_inputs(value: Any) -> dict[str, Any]:
+    data = validate_runtime_data({} if value is None else value, max_bytes=65536)
+    if any(not isinstance(inputs, dict) for inputs in data.values()):
+        raise ValueError("case_inputs_invalid")
+    return {key: validate_runtime_data(inputs) for key, inputs in data.items()}
+
+
+def validate_source_context(value: Any) -> dict[str, Any]:
+    data = validate_runtime_data({} if value is None else value)
+    if not data:
+        return {}
+    if set(data) - {"parent_task_id", "purpose", "data_need"} or data.get("purpose") not in {"prepare", "resume"}:
+        raise ValueError("source_context_invalid")
+    if not isinstance(data.get("parent_task_id"), str) or not data["parent_task_id"] or len(data["parent_task_id"]) > 255:
+        raise ValueError("source_context_invalid")
+    if not isinstance(data.get("data_need", ""), str) or len(data.get("data_need", "")) > 2000:
+        raise ValueError("source_context_invalid")
+    return data
+
+
+def validate_data_summary(value: Any) -> dict[str, Any]:
+    outputs = validate_runtime_data(value.get("data_outputs", {}))
+    missing = value.get("data_missing", [])
+    if not isinstance(missing, list) or len(missing) > 20:
+        raise ValueError("data_missing_invalid")
+    validate_runtime_data({"missing": missing})
+    for need in missing:
+        if not isinstance(need, dict) or set(need) - {"name", "description", "kind", "attributes"} or not isinstance(need.get("name"), str) or not need["name"] or not isinstance(need.get("description", ""), str) or not isinstance(need.get("kind", ""), str) or not isinstance(need.get("attributes", {}), dict):
+            raise ValueError("data_missing_invalid")
+    return {"data_outputs": outputs, "data_missing": missing}
 
 
 def dump_script_run(payload: ScriptRun) -> dict[str, Any]:
@@ -286,6 +349,10 @@ def load_script_run(raw: dict[str, Any]) -> ScriptRun:
     if not isinstance(raw, dict):
         raise ValueError("script_run_invalid")
     known = {name: raw[name] for name in _SCRIPT_RUN_FIELDS if name in raw}
+    if "inputs" in known:
+        known["inputs"] = validate_runtime_data(known["inputs"])
+    if "source_context" in known:
+        known["source_context"] = validate_source_context(known["source_context"])
     try:
         body = _decode(ScriptRun, known)
     except (TypeError, ValueError) as exc:
@@ -326,6 +393,8 @@ def load_script_run(raw: dict[str, Any]) -> ScriptRun:
     if not math.isfinite(budget) or not 1 <= budget <= 86400:
         raise ValueError("script_run_timeout_invalid")
     body.execution_timeout_sec = budget
+    body.inputs = validate_runtime_data(body.inputs)
+    body.source_context = validate_source_context(body.source_context)
     return body
 
 
@@ -366,7 +435,7 @@ def _encode(value: Any) -> Any:
         out = {}
         for f in fields(value):
             raw = getattr(value, f.name)
-            if f.name == "data" and not raw:
+            if f.name in ("data", "inputs", "source_context") and not raw:
                 continue
             if f.name in ("device_id", "platform", "node_id", "node_token") and not raw and not (isinstance(value, Register) and f.name == "platform"):
                 continue

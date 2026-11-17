@@ -45,11 +45,11 @@ def accept(core, req: P.Execute, stop: threading.Event | None = None):
         timeout = float(req.timeout_sec or 0) or 30.0
         from mino_scout.runtime import script_exec
         outcome = script_exec.run(core, _with_hint(payload, req), root, deadline=time.monotonic() + timeout, stop=stop)
-        status = EventStatus.PASS if outcome["status"] == "pass" else EventStatus.FAIL
+        status = EventStatus(outcome["status"]) if outcome["status"] in {status.value for status in EventStatus} else EventStatus.FAIL
         started = str(outcome.get("execution_started") or "unknown")
         return _result(req, status, str(outcome.get("summary") or ""), error=str(outcome.get("error") or ""),
                        started=started, phase="completed" if started == "yes" else "script", state=outcome["status"],
-                       case_id=payload.case_id, reason=str(outcome.get("reason_code") or ""))
+                       case_id=payload.case_id, reason=str(outcome.get("reason_code") or ""), data_summary=outcome)
     except ValueError as exc:
         return _result(req, EventStatus.DECLINED, str(exc)[:300], started="no", phase="admission", state="declined",
                        reason=str(getattr(exc, "code", "") or str(exc)[:300]))
@@ -148,7 +148,7 @@ def _release(key: tuple[str, str]) -> None:
         _ACTIVE.discard(key)
 
 
-def _result(req, status, summary, *, error="", started, phase, state, case_id="", reason=""):
+def _result(req, status, summary, *, error="", started, phase, state, case_id="", reason="", data_summary=None):
     event = PlanEvent(seq=req.step_idx if req.step_idx >= 0 else 0, capability_id="script_run", params={})
     return make_event_result(
         event,
@@ -161,5 +161,7 @@ def _result(req, status, summary, *, error="", started, phase, state, case_id=""
         raw_response={
             "execution": {"execution_started": started, "phase": phase, "reason_code": reason},
             "script_run": {"state": state, "case_id": case_id},
+            **P.validate_data_summary(data_summary or {}),
+            **{key: data_summary[key] for key in ("run_purpose", "test_report", "assertions", "source_coverage", "source_hash", "started_at", "finished_at") if data_summary and key in data_summary},
         },
     )

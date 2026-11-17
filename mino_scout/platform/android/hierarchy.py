@@ -346,6 +346,7 @@ def resolve_target(
     *,
     prefer_clickable: bool = True,
     index: Optional[int] = None,
+    require_unique: bool = False,
 ) -> Optional[AnchorMatch]:
     """按优先级把语义锚点解析成节点。
 
@@ -367,6 +368,13 @@ def resolve_target(
     desc = _norm(target.get("content_desc") or target.get("content-desc") or target.get("desc"))
     cls = _norm(target.get("class"))
 
+    if require_unique:
+        filters = [("resource_id", str(target.get("resource_id") or "")), ("text", str(target.get("text") or "")), ("content_desc", str(target.get("content_desc") or "")), ("cls", str(target.get("class") or ""))]
+        exact = [n for n in nodes if all(str(getattr(n, key)) == value for key, value in filters if value)]
+        if len(exact) != 1 or not exact[0].enabled or exact[0].area <= 0:
+            return None
+        chosen = _clickable_target(exact[0]) or exact[0]
+        return AnchorMatch(node=chosen, matched_by="bound_exact", candidates=1, clickable_candidates=1 if chosen.clickable else 0)
     usable = [n for n in nodes if n.enabled and n.area > 0]
     if cls:
         # 按控件类型收窄：内容型控件（列表卡片、贴图按钮）只靠类型就能圈定。

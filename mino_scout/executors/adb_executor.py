@@ -1196,7 +1196,7 @@ class AdbExecutor:
         from mino_scout.platform.android import hierarchy as H
 
         params = H.lift_text_anchor(event.params or {})
-        dump = H.dump_ui_nodes(serial)
+        dump = H.dump_ui_nodes(serial, force_fresh=bool(params.get("require_unique")))
         if not dump.ok:
             return None, None, {"anchor": {"ok": False, "reason": f"层级采集失败: {dump.error[:120]}"}}
         anchor = params.get("anchor_between")
@@ -1219,8 +1219,8 @@ class AdbExecutor:
                 index = int(raw_index)
             except (TypeError, ValueError):
                 index = None
-        match = H.resolve_target(dump.nodes, target, index=index)
-        if match is None and index is None:
+        match = H.resolve_target(dump.nodes, target, index=index, require_unique=bool(params.get("require_unique")))
+        if match is None and index is None and not params.get("require_unique"):
             label = str(target.get("text") or target.get("content_desc") or "").strip()
             if label:
                 match = H.resolve_bottom_tab_text(dump.nodes, label)
@@ -1242,10 +1242,12 @@ class AdbExecutor:
             ax, ay, audit = self._resolve_anchor_xy(event, serial)
             audit = {**audit, "point_policy": "node"}
             if ax is None or ay is None:
+                if raw.get("require_unique"):
+                    return None, None, audit, "none"
                 # 锚点没命中不是拒绝执行的理由：Nexus 已经算好的坐标就是指令。
                 # 回「不用坐标兜底」会把整条用例判死（cr-9f7f478af02c 的 21 条弹窗），
                 # 而 Scout 的职责是执行收到的指令，不是替 Nexus 决定策略。
-                fy = raw.get("fallback_xy")
+                fy = None if raw.get("require_unique") else raw.get("fallback_xy")
                 if isinstance(fy, (list, tuple)) and len(fy) == 2:
                     try:
                         return int(fy[0]), int(fy[1]), {**audit, "point_policy": "anchor_fallback"}, "fallback_xy"

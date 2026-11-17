@@ -37,10 +37,26 @@ def resolve_locator_scope(page: Any, params: dict[str, Any] | None) -> Any:
     if host:
         try:
             loc = scope.locator(host) if hasattr(scope, "locator") else page.locator(host)
+            if (params or {}).get("require_unique") and int(loc.count()) == 0:
+                from mino_scout.runtime.script_exec import ScriptAbort
+                raise ScriptAbort("动态对象作用域未找到", reason_code="locator_missing", status="blocked")
             if loc.count() > 0:
-                scope = loc.first
+                if (params or {}).get("require_unique"):
+                    if int(loc.count()) != 1:
+                        from mino_scout.runtime.script_exec import ScriptAbort
+                        raise ScriptAbort("动态对象作用域不唯一", reason_code="locator_ambiguous", status="blocked")
+                    scope = loc
+                else:
+                    scope = loc.first
         except Exception:
-            pass
+            if (params or {}).get("require_unique"):
+                raise
+    container = str((params or {}).get("scope_css") or "").strip()
+    if container:
+        scope = scope.locator(container)
+        if (params or {}).get("require_unique") and int(scope.count()) != 1:
+            from mino_scout.runtime.script_exec import ScriptAbort
+            raise ScriptAbort("动态对象作用域不唯一", reason_code="locator_ambiguous", status="blocked")
     return scope
 
 

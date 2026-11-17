@@ -7,14 +7,30 @@ _OTP_WAIT_DEFAULT_MS = 30_000
 _OTP_WAIT_CEILING_MS = 90_000
 
 
-def account(case, requirements=None, prefer=None):
+def account(case, requirements=None, prefer=None, data_need=None, data_requirements=None):
     from types import SimpleNamespace
 
     from mino_scout.runtime.script_exec import ScriptAbort
 
     case._guard()
     requirements = requirements if requirements is not None else case._source_snapshot.get("account_requirements")
+    if requirements is not None and not isinstance(requirements, dict):
+        raise ScriptAbort("requirements 必须是 all/prefer 对象", reason_code="account_requirements_invalid", status="blocked")
     params = {"op": "account"}
+    inputs = getattr(getattr(case, "data", None), "inputs", {})
+    if "account_id" in inputs and (not isinstance(inputs["account_id"], str) or not inputs["account_id"].strip()):
+        raise ScriptAbort("account_id 必须是明确的账号标识", reason_code="account_requirements_invalid", status="blocked")
+    if inputs.get("account_id"):
+        requirements = dict(requirements or {})
+        requirements["all"] = [*(requirements.get("all") or []), {"facet": "id", "op": "eq", "value": str(inputs["account_id"])}]
+    if data_requirements is not None:
+        if not isinstance(data_requirements, list) or len(data_requirements) > 20:
+            raise ScriptAbort("data_requirements 必须是最多 20 项的列表", reason_code="account_data_invalid", status="blocked")
+        params["data_requirements"] = data_requirements
+    if data_need is not None:
+        if not isinstance(data_need, str) or len(data_need) > 2000:
+            raise ScriptAbort("data_need 必须是最多 2000 字的描述", reason_code="account_data_invalid", status="blocked")
+        params["data_need"] = data_need.strip()
     if requirements is not None or prefer is not None:
         if requirements is not None and not isinstance(requirements, dict):
             raise ScriptAbort("requirements 必须是 all/prefer 对象", reason_code="account_requirements_invalid", status="blocked")
@@ -40,6 +56,10 @@ def account(case, requirements=None, prefer=None):
     case._mail_to = str(data.get("email") or "")
     return SimpleNamespace(
         id=identity,
+        project_id=str(data.get("project_id") or ""),
+        data_need=str(data_need or ""),
+        data_matches=list(data.get("data_matches") or []),
+        data_match_count=int(data.get("data_match_count") or 0),
         email=case._mail_to,
         phone=str(data.get("phone") or ""),
         username=str(data.get("username") or ""),

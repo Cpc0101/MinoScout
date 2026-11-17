@@ -29,6 +29,12 @@ class WdaError(RuntimeError):
     pass
 
 
+class WdaLocatorError(WdaError):
+    def __init__(self, message: str, reason_code: str):
+        self.reason_code = reason_code
+        super().__init__(message)
+
+
 def wda_base_url() -> str:
     return default_wda_url()
 
@@ -98,8 +104,8 @@ class WdaClient:
     def tap_xy(self, x: int, y: int) -> None:
         self._json("POST", self._path("/wda/tap"), {"x": int(x), "y": int(y)})
 
-    def tap_target(self, target: str) -> None:
-        element = self._find(target)
+    def tap_target(self, target: str, *, selector=None) -> None:
+        element = self._find_bound(selector) if selector else self._find(target)
         self._json("POST", self._path(f"/element/{element}/click"), {})
 
     def activate(self, bundle_id: str) -> None:
@@ -140,13 +146,38 @@ class WdaClient:
         content = base64.b64encode(str(text or "").encode()).decode()
         self._json("POST", self._path("/wda/setPasteboard"), {"content": content, "contentType": "plaintext"})
 
-    def element_center(self, target: str) -> tuple[int, int]:
-        element = self._find(target)
+    def element_center(self, target: str, *, selector=None) -> tuple[int, int]:
+        element = self._find_bound(selector) if selector else self._find(target)
         body = self._json("GET", self._path(f"/element/{element}/rect"))
         value = body.get("value") if isinstance(body, dict) else {}
         if not isinstance(value, dict) or "x" not in value:
             raise WdaError("WDA 没有返回控件位置")
         return int(value["x"] + value.get("width", 0) / 2), int(value["y"] + value.get("height", 0) / 2)
+
+    def _find_bound(self, selector: dict) -> str:
+        kind = selector.get("kind")
+        key = {"name": "name", "accessibility_id": "name", "content_desc": "name", "label": "label", "text": "label"}.get(kind)
+        value = selector.get("value") or selector.get("name")
+        if not key or not isinstance(value, str) or not value:
+            raise WdaLocatorError("动态对象定位不支持该 iOS 选择器", "locator_unsupported")
+        literal = value.replace("\\", "\\\\").replace('"', '\\"')
+        try:
+            body = self._json("POST", self._path("/elements"), {"using": "predicate string", "value": f'{key} == "{literal}"'})
+        except WdaError as exc:
+            raise WdaLocatorError(str(exc), "observation_insufficient") from exc
+        found = body.get("value", [])
+        if not isinstance(found, list) or len(found) != 1:
+            raise WdaLocatorError("动态对象没有唯一匹配", "locator_ambiguous" if isinstance(found, list) and len(found) > 1 else "locator_missing")
+        if not isinstance(found[0], dict):
+            raise WdaLocatorError("动态对象元素响应无效", "observation_insufficient")
+        element = str(found[0].get("ELEMENT") or found[0].get("element-6066-11e4-a52e-4f735466cecf") or "")
+        if not element:
+            raise WdaLocatorError("动态对象元素引用缺失", "observation_insufficient")
+        return element
+
+    def input_target(self, selector: dict, text: str) -> None:
+        element = self._find_bound(selector)
+        self._json("POST", self._path(f"/element/{element}/value"), {"value": list(text)})
 
     def _find(self, target: str) -> str:
         text = str(target or "").strip()

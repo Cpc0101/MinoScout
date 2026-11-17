@@ -171,9 +171,11 @@ class RecordStore:
                 "finished_at": _timestamp(row["finished_at"]), "sealed": state in TERMINAL,
                 "resource_isolated": bool(row["resource_isolated"]), "assertions": counts,
                 "detail_availability": "available", "failure_stage": meta.get("failure_stage", ""),
-                "elapsed_ms": int(max(0, (row["finished_at"] or time.time()) - (row["started_at"] or row["created_at"])) * 1000),
+                "elapsed_ms": int(max(0, (row["finished_at"] or time.time()) - row["started_at"]) * 1000) if row["started_at"] else 0,
+                "run_purpose": meta.get("run_purpose", "unclassified"),
                 "execution_started": meta.get("execution_started", "no"),
                 **{key: meta[key] for key in ("execution_stopped", "browser_closed", "scout_process_generation") if key in meta},
+                "data_outputs": meta.get("data_outputs", {}), "data_missing": meta.get("data_missing", []),
                 "source_hash": meta.get("source_hash", ""), "source_coverage": meta.get("source_coverage", {}),
                 **({"test_report": meta["test_report"]} if "test_report" in meta else {}),
                 "cancel_requested": bool(row["cancel_requested"]),
@@ -197,7 +199,10 @@ class RecordStore:
     def update_metadata(self, task_id, attempt_id, changes):
         with self._db(task_id) as db:
             db.execute("BEGIN IMMEDIATE")
-            meta = json.loads(self._row(db, attempt_id)["metadata"])
+            row = self._row(db, attempt_id)
+            if row["state"] in TERMINAL:
+                raise ValueError("record_sealed")
+            meta = json.loads(row["metadata"])
             meta.update(scrub(changes))
             db.execute("UPDATE attempts SET metadata=? WHERE attempt_id=?", (_json(meta), attempt_id))
             self._append(db, attempt_id, "run/snapshot", changes)
@@ -206,8 +211,22 @@ class RecordStore:
     def append(self, task_id, attempt_id, event_type, data):
         with self._db(task_id) as db:
             db.execute("BEGIN IMMEDIATE")
-            if self._row(db, attempt_id)["state"] in TERMINAL:
+            row = self._row(db, attempt_id)
+            if row["state"] in TERMINAL:
                 raise ValueError("record_sealed")
+            if event_type in {"data/bind", "data/missing"}:
+                from mino_scout.server_comm.protocol import validate_data_summary
+                metadata = json.loads(row["metadata"])
+                outputs = dict(metadata.get("data_outputs") or {})
+                missing = {item["name"]: item for item in metadata.get("data_missing") or []}
+                name = data.get("name")
+                if event_type == "data/bind":
+                    outputs[name] = data.get("value")
+                    missing.pop(name, None)
+                else:
+                    missing[name] = {key: data[key] for key in ("name", "description", "kind", "attributes") if key in data}
+                metadata.update(validate_data_summary({"data_outputs": outputs, "data_missing": list(missing.values())}))
+                db.execute("UPDATE attempts SET metadata=? WHERE attempt_id=?", (_json(metadata), attempt_id))
             seq = self._append(db, attempt_id, event_type, data)
             self._publish(db, task_id, attempt_id)
             return seq
@@ -233,7 +252,9 @@ class RecordStore:
             if row["state"] in TERMINAL:
                 return self._summary(db, task_id, row)
             metadata = json.loads(row["metadata"])
-            metadata.update({key: outcome[key] for key in ("failure_stage", "execution_started", "source_coverage", "execution_stopped", "browser_closed") if key in outcome})
+            from mino_scout.server_comm.protocol import validate_data_summary
+            outcome = {**outcome, **validate_data_summary({**metadata, **outcome})}
+            metadata.update({key: outcome[key] for key in ("failure_stage", "execution_started", "source_coverage", "execution_stopped", "browser_closed", "data_outputs", "data_missing") if key in outcome})
             from mino_scout.runtime.business_report import build_report
             events = [(seq, kind, json.loads(data)) for seq, kind, data in db.execute(
                 "SELECT seq,type,data FROM events WHERE attempt_id=? ORDER BY seq", (attempt_id,))]

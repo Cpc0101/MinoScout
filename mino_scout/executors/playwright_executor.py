@@ -687,6 +687,8 @@ class PlaywrightExecutor:
         if not files:
             return self._fail(event, started_at, t0, "upload_file 需要 file_path 或 file_paths")
         loc = locator_from_params(page, p)
+        if loc is None and p.get("require_unique"):
+            return self._fail(event, started_at, t0, "动态上传控件未找到", execution_started="no")
         if loc is None:
             css = css_selector_from_params(p)
             if css:
@@ -705,6 +707,12 @@ class PlaywrightExecutor:
         timeout = max(1000, min(int(p.get("timeout_ms") or 20_000), 120_000))
         sel = css_selector_from_params(p) or str(p.get("wait_selector") or "").strip()
         try:
+            if p.get("require_unique"):
+                loc = locator_from_params(page, p)
+                if loc is None:
+                    return self._fail(event, started_at, t0, "动态对象未找到", execution_started="no")
+                loc.wait_for(state="visible", timeout=timeout)
+                return self._ok(event, started_at, t0, "动态对象已出现", execution_started="no")
             if sel:
                 scope.locator(sel).first.wait_for(state="visible", timeout=timeout)
                 return self._ok(event, started_at, t0, f"已出现 {sel[:48]}", execution_started="no")

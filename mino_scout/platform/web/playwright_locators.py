@@ -61,6 +61,24 @@ def locator_from_params(page: Any, params: dict[str, Any] | None, *, name: str =
     p = _p(params)
     scope = resolve_locator_scope(page, p)
     css = css_selector_from_params(p)
+    if p.get("require_unique") or p.get("role"):
+        from mino_scout.runtime.script_exec import ScriptAbort
+        if css:
+            loc = scope.locator(css)
+        elif p.get("role"):
+            pattern = exact_visible_pattern(str(p.get("role_name") or ""))
+            if pattern is None:
+                raise ScriptAbort("动态对象缺少明确文案", reason_code="locator_missing", status="blocked")
+            loc = scope.get_by_role(str(p["role"]), name=pattern)
+        else:
+            pattern = exact_visible_pattern(str(p.get("selector_text") or name or ""))
+            if pattern is None:
+                raise ScriptAbort("动态对象缺少明确文案", reason_code="locator_missing", status="blocked")
+            loc = scope.get_by_text(pattern)
+        count = int(loc.count())
+        if count > 1:
+            raise ScriptAbort("动态对象有多个候选", reason_code="locator_ambiguous", status="blocked")
+        return loc if count == 1 else None
     if css:
         try:
             loc = scope.locator(css)

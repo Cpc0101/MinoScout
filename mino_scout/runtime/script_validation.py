@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 Finding = tuple[str, int, str, str, str]
-_CONTROLS = {"tap", "input", "long_press"}
+_CONTROLS = {"tap", "input", "long_press", "bind"}
 _ROLES = {"prep": "preconditions", "do": "steps", "check": "expectations"}
 
 

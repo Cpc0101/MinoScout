@@ -1008,6 +1008,8 @@ ADB Keyboard 的电脑 APK 缓存与手机已安装事实独立：缓存缺失�
 | `repo_url` | 项目脚本仓库地址，必填；Nexus 下发前去掉内嵌凭据。私有仓库由 Scout 本机的 git 凭据（SSH agent / credential helper）访问，Nexus 不保存、不下发令牌 |
 | `branch` | 分支，可空 |
 | `revision` | 提交，可空。空表示 Scout 取分支最新；非空是不透明字符串，Nexus 不校验是否存在，取不到由 Scout 以 `revision_missing` 返回 |
+| `inputs` | 单例业务值字典，默认空并省略，最多 16KiB，不含凭据或 UI 句柄 |
+| `source_context` | 显式 Agent 任务关系，默认空并省略；parent_task_id、purpose=prepare/resume、可选 data_need |
 | `script_path` | 仓库内相对路径，必须是 `.py`，可空。空表示 Scout 自己按 `tests/**/<case_id>.py` 定位 |
 
 不再有 `files`：Nexus 不读取、不打包脚本仓库。Scout 自己拉取 `repo_url`，在 `revision`（或分支最新）上读脚本、`config.yaml`、`pages/` 并执行；应用与环境的对应由 Scout 读仓库里的 `config.yaml`。
@@ -1160,7 +1162,7 @@ REGISTER / HEARTBEAT 增加 `record_api_version`（缺省 0；支持此节的节
 
 摘要字段：task_id、run_id、session_id、attempt_id、case_id、owner_user_id、node_id、sn、platform、revision、script_path、state、status、summary、reason_code、failure_stage、elapsed_ms、execution_started、started_at、finished_at、summary_version、last_event_seq、sealed、detail_availability、assertions，可带 source_coverage/source_hash。state 为 accepted/running/completed/interrupted/cancel_requested；status 保留 queued/running/pass/fail/blocked/declined/skipped/cancelled。
 
-assertions 的规范计数为 total/pass/fail/unknown；接收端兼容旧 assertions/passed/failed/inconclusive，不能过滤掉规范计数。摘要可带 test_report（version=1）：run_purpose=authoring|verification|regression、按原文预期聚合的 counts(total/pass/fail/unknown/not_run)、有界 items(source_ref/title/status/expected/actual/checker/event_seq/artifact_id/reason_code/attribution)、items_truncated、总归因与 reason_code、可选 failure(source_ref/title/actual/event_seq)、model_usage(calls/llm_calls/vlm_calls/elapsed_ms/total_tokens/usage_complete)。缺 token 用量为 null；断言数量不等于预期或用例数量。suspected_product 只表示业务差异待归因。索引最多 100 项，Scout 当前最多展开 50 项；完整事件仍在执行节点。没有该字段的历史记录保留原有读取，不凭已加载的一页推断完整结论。
+assertions 的规范计数为 total/pass/fail/unknown；接收端兼容旧 assertions/passed/failed/inconclusive，不能过滤掉规范计数。摘要可带 test_report（version=1）：run_purpose=authoring|verification|regression|preparation|unclassified、按原文预期聚合的 counts(total/pass/fail/unknown/not_run)、有界 items(source_ref/title/status/expected/actual/checker/event_seq/artifact_id/reason_code/attribution)、items_truncated、总归因与 reason_code、可选 context(task_id/session_id/attempt_id/case_id/node_id/revision/script_path/source_hash)、auxiliary_assertions(total/pass/fail/unknown)、failure(source_ref/title/actual/event_seq)、model_usage(calls/llm_calls/vlm_calls/elapsed_ms/total_tokens/usage_complete)。缺 token 用量为 null；断言数量不等于预期或用例数量。suspected_product 只表示业务差异待归因。索引最多 100 项，Scout 当前最多展开 50 项；完整事件仍在执行节点。没有该字段的历史记录保留原有读取，不凭已加载的一页推断完整结论。
 
 ### 摘要确认与恢复
 
@@ -1200,7 +1202,7 @@ model/call 与 model/result 是诊断事件，记录 request_id/kind/purpose/run
 
 脚本可带同 stem `.yaml` 原文快照：case_id、source(url/revision)、preconditions/steps/expectations（每条 id/text）、account_requirements(all/prefer 子句列表)。source_hash 绑定原文及条款，完整快照仅归档在 Scout。prep/do/check 增加可选 source_ref，同一原文条款可被多个实现块引用；引用静态齐全不代表执行覆盖或语义正确。check 必须产生有效断言；零断言采集只留下证据，不能判正式测试通过。
 
-account(requirements=None, prefer=None) 通过原 script.callback op=account 明确传递 requirements。all/prefer 采用 `[{facet, op, value}]`；无参保留既有服务器用例条件。环境、归属、健康与占用仍校验；动态业务标签用于排序，不作为当前状态证明。未知前置保留待验证，不把 prep 标题当作事实或租号参数。
+account(requirements=None, prefer=None, data_need=None, data_requirements=None) 通过原 script.callback op=account 明确传递 requirements，data_need 是可选的最多 2000 字的数据需求描述。Nexus 将描述与实际租到的账号及 run/session/app/case 关联保存；缺省不新增需求记录，不自动造数。账号响应附 project_id。all/prefer 采用 `[{facet, op, value}]`；无参保留既有服务器用例条件。环境、归属、健康与占用仍校验；动态业务标签用于排序，不作为当前状态证明。未知前置保留待验证，不把 prep 标题当作事实或租号参数。
 
 执行摘要的 `resource_isolated` 是布尔值：取消确认只证明 worker 已停止；若最后设备动作结果不明，仍为 true，Nexus 必须保留设备和账号隔离。`started_at` / `finished_at` 使用 ISO 8601 UTC。
 
@@ -1214,3 +1216,29 @@ account(requirements=None, prefer=None) 通过原 script.callback op=account 明
 任务 owner 可调用 `POST /case-runner/tasks/{task_id}/resources/reconcile` 显式核验已结束 Web 任务。Nexus 经原认证节点获取每个已接单 attempt 的新证明，核对身份、摘要版本和当前租约代次；同一事务保存 resource_resolution 并释放设备槽位、账号租约与准入。Python 对应释放 execution resource、device lease、reservation 和账号租约。重复调用幂等；迟到摘要不会重隔离已恢复任务，也不会释放新持有者。实体设备仍需应用基线恢复。原始 Scout 结论、reason_code 和 execution_started 保留。
 
 正常结束从持久封存结果原子结算；后台补偿处理中断在索引/任务投影/释放之间的故障。明确从未派发的终态用例无需 Scout 停止证据；已派发但结果未知不能按取消、超时、节点重启或 TTL 自动释放。device_list 提供 active_run_count、running_run_count、isolated_run_count、Web 的 web_parallel_max 和 blocking_tasks；占满且有隔离时 blocking_code=isolation。
+
+### 输入数据与执行用途
+
+账号业务标签未知或未命中时，在脚本分配路径作为偏好而非门禁；真正隔离、锁定、登录身份、项目归属与环境约束保持。账号数据记忆由独立 MCP/HTTP 接口查询和更新，不放入 facet。缺数据后的准备和重试决策只归 Agent；Scout 执行明确业务操作，脚本仓不内置自动造数策略。
+
+`test_report.run_purpose=authoring` 的记录保留原执行状态、断言和证据，但不计入正式用例通过/失败数量及通过率；verification/regression 参与正式统计。没有用途声明的历史记录保留既有统计，不推测其用途。原文未执行仍为 not_run，探针不得改成通过。任务执行终态与正式通过/失败计数分开表达。
+
+
+### Agent 数据准备与运行时对象（2026-11-17）
+
+`case_run` 接受 `case_inputs`：按本次 case_id 或 script_path 索引的业务字典，同项路径优先，每例 16KiB、总量 64KiB、深度最多 8，JSON 可序列化且不含凭据。未知目标拒绝。Python 与 Cloudflare 将选中输入冻结到 ScriptRun.inputs；传输恢复仍使用同一载荷。
+
+`source_context` 只允许 `parent_task_id`（≤255 字）、`purpose`（prepare/resume）和可选 `data_need`（≤2000 字）。父任务须属于同一发起用户、项目与运行环境；任务摘要暴露该关系。prepare 是独立任务，不计入正式用例通过/失败；resume 创建原用例的新任务，从脚本起点执行，保留原结论。Nexus 不作缺数据构造或 UI 决策。
+
+`case.data.require` 缺输入时返回 blocked/data_missing，并记录 data/missing；`bind` 记录 data/bind。record.sync、task_get.cases 同步有界 `data_outputs`（字典，≤16KiB）与 `data_missing`（≤20 项、合计≤16KiB，name/description/kind/attributes）。完整操作与断言仍在 Scout；对象输出不自动成为测试通过。Agent 核对输出和证据、保存账号记忆后，显式传回原用例。
+
+`resource_account_select` / POST `/project/{project_id}/resources/accounts/select` 接受 env/app_id/data_requirements；返回按记忆匹配数稳定排序的空闲账号及 data_matches/data_match_count。data_requirements 为≤20项、≤8KiB 的 `{kind, object_ref?, attributes?}` 精确子集偏好；无匹配仍保留候选，不盘点或认证资产。account 回调接受同一偏好并返回匹配线索；账号身份、归属、环境和租约约束仍适用。case.inputs.account_id 成为明确身份约束。
+
+`app.bind(control, **values)` 填充 locator_spec 中 `{{name}}` / `{{model.id}}` 模板，CSS 值转义；返回 app 本地临时控件键，每次动作/观察都重新解析当前页面。绑定定位要求唯一，禁止 index、坐标或备用首项；Web 支持 css/test_id/role 和 frame_selector/shadow_host_css/scope_css。role.name 是角色、role.value 是可见名称。原生按实际支持的节点属性匹配，结构不足或候选歧义明确阻塞。跨应用传业务值并在消费 app 新建绑定；UI 句柄不能作为对象身份。
+
+
+### 统计、来源与时间补充（2026-11-17）
+
+记录摘要可带 run_purpose；脚本用途读取前为 unclassified，prepare 任务的报告用途为 preparation。接收端核对 report.context 与当前摘要身份、用途、event_seq 水位和断言计数。pass 不得含失败/未知断言、未执行预期或缺失来源覆盖。封存的报告、来源、断言、水位、时间不得被高版本改写；重复/旧版本只 ACK。
+
+started_at/finished_at 来自 Scout 实际执行，带时区，缺失保留 null。execution_started 仍是设备写回执，不能替代脚本执行事实。elapsed_ms 保留毫秒精度；任务收口和状态同步时间不能补作执行时间。任务 API 提供 statistics 分组与 timing，定义见 Nexus《执行统计与报告口径》。

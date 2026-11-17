@@ -6,14 +6,9 @@ import time
 
 def control_selector(app, control):
     from mino_scout.runtime.script_exec import ScriptAbort
-    page_key, control_id = app._split_control(control)
-    page = app._pages.get(page_key) or {}
-    controls = [row for row in page.get("controls", []) if isinstance(row, dict) and row.get("id") == control_id]
-    if len(controls) != 1:
-        raise ScriptAbort("控件未定义", reason_code="control_unknown", status="blocked")
-    from mino_scout.runtime.script_exec import _CELLS
-    cell = (controls[0].get("locator_spec") or {}).get(_CELLS[app._platform]) or {}
+    cell = app._control_cell(control)
     selector = cell.get("selector") or {}
+    selector = {**selector, **{key: cell[key] for key in ("scope_css", "frame_selector", "shadow_host_css", "require_unique") if key in cell}}
     return selector
 
 
@@ -45,7 +40,7 @@ def read_condition(app, kind, subject, control, ocr, region):
     data, nodes, complete = {}, [], False
     if control:
         selector = control_selector(app, control)
-        if app._platform == "web" and selector.get("kind") in {"css", "test_id"}:
+        if app._platform == "web" and selector.get("kind") in {"css", "test_id", "role"}:
             from mino_scout.platform.web.script import observe_control
             observation = observe_control(app, selector)
             nodes = observation["nodes"]
@@ -54,7 +49,7 @@ def read_condition(app, kind, subject, control, ocr, region):
                 return observation["count"], {"count": observation["count"]}, True
             if observation["count"] != 1:
                 return (False, {"matches": observation["count"]}, observation["count"] == 0) if kind == "state" and subject == "visible" else (None, {"matches": observation["count"]}, False)
-    if not data and not (control and app._platform == "web" and selector.get("kind") in {"css", "test_id"}):
+    if not data and not (control and app._platform == "web" and selector.get("kind") in {"css", "test_id", "role"}):
         data = app.hierarchy().data
         nodes = data.get("nodes", [])
         complete = not data.get("truncated", True)
@@ -62,19 +57,21 @@ def read_condition(app, kind, subject, control, ocr, region):
             if not data.get("structured"):
                 return None, {"reason": "structured_nodes_missing"}, False
             nodes = control_nodes(app, control, nodes)
+            if selector.get("require_unique") and kind != "count" and len(nodes) != 1:
+                return None, {"matches": len(nodes)}, False
     if kind == "count":
         return len(nodes), {"count": len(nodes)}, complete
     if kind == "state" and subject == "visible":
         visible = any(n.get("visible") is True for n in nodes)
         known = visible or complete and all(type(n.get("visible")) is bool for n in nodes)
         return visible if known else None, {"visible": visible if known else None, "matches": len(nodes)}, known
-    if kind in {"state", "value"}:
+    if kind in {"state", "value", "content"}:
         if len(nodes) != 1:
             return None, {"matches": len(nodes)}, False
         node = nodes[0]
-        if kind == "value" and node.get("sensitive"):
+        if kind in {"value", "content"} and node.get("sensitive"):
             return None, {"reason": "secret_value_unreadable"}, False
-        field = subject if kind == "state" else "value"
+        field = subject if kind == "state" else "text" if kind == "content" else "value"
         if field == "value" and "value" not in node and node.get("editable"):
             field = "text"
         known = field in node and (field != "checked" or node.get("checked_known", True))
@@ -88,6 +85,22 @@ def read_condition(app, kind, subject, control, ocr, region):
     matched = [s for s in texts if s == subject]
     # Positive exact text can be established in a partial tree; absence cannot.
     return bool(matched), {"matched": matched, "observed": list(dict.fromkeys(texts))[:32]}, complete or bool(matched)
+
+
+def observe(app, control, field, text):
+    """Read a business signal without declaring an expectation or adding an assertion."""
+    from mino_scout.runtime.script_exec import ActionResult, ScriptAbort
+    fields = {"visible", "enabled", "checked", "selected", "focused", "value", "text", "count", "text_present"}
+    if field not in fields or not control and field != "text_present" or field == "text_present" and not text:
+        raise ScriptAbort("观察需要控件及明确属性，或 text_present 与精确文字", reason_code="observation_invalid", status="blocked")
+    app._guard()
+    kind = {"value": "value", "text": "content", "count": "count", "text_present": "text"}.get(field, "state")
+    subject = text if field == "text_present" else field if kind == "state" else ""
+    value, detail, known = read_condition(app, kind, subject, control, False, None)
+    return ActionResult(ok=True, status="pass", summary="已读取业务信号", data={
+        "value": value if known else None, "known": bool(known), "detail": detail,
+        "observation_id": app._observation_id, "artifact_id": app._artifact_id,
+    })
 
 
 def verify(app, kind, subject, *, control="", wanted=True, timeout_ms=0, ocr=False, region=None):

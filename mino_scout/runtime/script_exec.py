@@ -191,7 +191,22 @@ def _outside_import_machinery(filename: str) -> bool:
 def run(core, payload, root: Path, *, deadline: float, stop) -> dict[str, Any]:
     """执行一份已经落盘的脚本包。异常留在返回值里。"""
     with _RUN_LOCK:
-        return _run_locked(core, payload, root, deadline=deadline, stop=stop)
+        from mino_scout.runtime.model_policy import declarations
+        import ast
+        purpose = "unclassified"
+        try:
+            purpose, _ = declarations(ast.parse((root / payload.script_path).read_text(encoding="utf-8")))
+        except (ValueError, SyntaxError, OSError):
+            pass
+        recorder = getattr(core, "_recording", None)
+        if recorder:
+            recorder.store.update_metadata(recorder.task_id, recorder.attempt_id, {"run_purpose": purpose})
+        started = time.time()
+        result = _run_locked(core, payload, root, deadline=deadline, stop=stop)
+        from datetime import datetime, timezone
+        result.update(run_purpose=purpose, started_at=datetime.fromtimestamp(started, timezone.utc).isoformat(),
+                      finished_at=datetime.now(timezone.utc).isoformat())
+        return result
 
 
 def _run_locked(core, payload, root: Path, *, deadline: float, stop) -> dict[str, Any]:
@@ -212,8 +227,8 @@ def _run_locked(core, payload, root: Path, *, deadline: float, stop) -> dict[str
         missing = sorted(set(case._source_clauses) - case._covered)
         if missing:
             raise ScriptAbort("原文条目未覆盖：" + ", ".join(missing), reason_code="source_coverage_missing", status="blocked")
-        return {"status": "pass", "summary": "脚本执行完成且断言通过", "error": "", "reason_code": "", "touched": bool(case.touched),
-                "execution_started": "yes" if case.touched else "no", "source_coverage": case._coverage()}
+        return _report_outcome(case, {"status": "pass", "summary": "脚本执行完成且断言通过", "error": "", "reason_code": "", "touched": bool(case.touched),
+                "execution_started": "yes" if case.touched else "no", "source_coverage": case._coverage(), **case.data.snapshot()})
     except ScriptHalt as exc:
         return _failure(exc, case)
     except ScriptAbort as exc:
@@ -228,7 +243,7 @@ def _failure(exc: BaseException, case: Case | None) -> dict[str, Any]:
     execution_started = explicit_started if explicit_started in {"yes", "no", "unknown"} else (
         "yes" if case and case.touched else "no"
     )
-    return {
+    return _report_outcome(case, {
         "status": str(getattr(exc, "status", "") or ("cancelled" if getattr(exc, "reason_code", "") == "cancelled" else "fail")),
         "summary": str(exc)[:300],
         "error": str(exc)[:400],
@@ -240,7 +255,28 @@ def _failure(exc: BaseException, case: Case | None) -> dict[str, Any]:
         "failure_title": case._failure_title if case else "",
         "resource_isolated": bool(details.get("resource_isolated")),
         "source_coverage": case._coverage() if case else {},
-    }
+        **(case.data.snapshot() if case and hasattr(case, "data") else {}),
+    })
+
+
+def _report_outcome(case, outcome):
+    if case is None:
+        return outcome
+    from mino_scout.runtime.business_report import build_report
+    assertions = case._assertions
+    counts = {"total": len(assertions), "pass": sum(r["status"] == "pass" for r in assertions),
+              "fail": sum(r["status"] == "fail" for r in assertions), "unknown": sum(r["status"] not in {"pass", "fail"} for r in assertions)}
+    # The durable path builds the final report from full events at RecordStore.finish.
+    # Legacy synchronous nodes still return a bounded business projection.
+    meta = {"source_snapshot": case._source_snapshot, "source_hash": case._source_hash,
+            "run_purpose": case._model_gate.run_purpose, "source_context": case._source_context}
+    outcome.update(assertions=counts, test_report=build_report(meta, outcome, [(0, "assertion/result", r) for r in assertions]))
+    usage = outcome["test_report"]["model_usage"]
+    gate = case._model_gate
+    usage.update(calls=gate.calls, llm_calls=sum(count for key, count in gate.by_rule.items() if key[0] == "llm"),
+                 vlm_calls=sum(count for key, count in gate.by_rule.items() if key[0] == "vlm"), elapsed_ms=int(gate.elapsed_ms),
+                 total_tokens=0 if not gate.calls else None, usage_complete=not bool(gate.calls))
+    return outcome
 
 
 def _execute_hooks(root: Path, script_path: str, case: "Case") -> None:
@@ -423,10 +459,10 @@ class _Nexus:
 
         return check(self._case, number, source_ref=source_ref)
 
-    def account(self, requirements: dict | None = None, prefer: list | None = None) -> SimpleNamespace:
+    def account(self, requirements: dict | None = None, prefer: list | None = None, data_need: str | None = None, data_requirements: list | None = None) -> SimpleNamespace:
         from mino_scout.server_comm.callbacks import account
 
-        return account(self._case, requirements=requirements, prefer=prefer)
+        return account(self._case, requirements=requirements, prefer=prefer, data_need=data_need, data_requirements=data_requirements)
 
     def assert_equal(self, actual: Any, expected: Any, message: str = "") -> None:
         self._case._guard()
@@ -453,6 +489,7 @@ class Case:
         self.core = core
         self.run_id = str(payload.run_id)
         self.session_id = str(payload.session_id)
+        self._source_context = dict(getattr(payload, "source_context", {}) or {})
         self._sn = str(payload.sn)
         self._platform = str(payload.platform)
         self._hint = dict(getattr(payload, "device_hint", None) or {})
@@ -482,6 +519,8 @@ class Case:
         self._failure_ref = ""
         self._failure_title = ""
         self._covered: set[str] = set()
+        from mino_scout.runtime.case_data import CaseData
+        self.data = CaseData(self, getattr(payload, "inputs", {}))
         sidecar = (root / payload.script_path).with_suffix(".yaml")
         from mino_scout.runtime.script_source import load_source
         self._guard()
@@ -569,7 +608,7 @@ class Case:
     def __getattr__(self, name: str):
         if name.startswith("_"):
             raise AttributeError(name)
-        raise _unknown("case", name, ["config", "env", "app_id", "app_key", "init", "scout", "nexus"],
+        raise _unknown("case", name, ["config", "env", "app_id", "app_key", "init", "scout", "nexus", "data"],
                        "。设备动作写在 app = case.init(case.config.<KEY>) 返回的 app 上")
 
     def init(self, ref: AppRef, *, web_resolution: str = "") -> "App":
@@ -686,6 +725,7 @@ class App:
         self._frame_refs: list[dict] = []
         self._observation_id = ""
         self._artifact_id = ""
+        self._bound_controls: dict[str, dict] = {}
 
     @property
     def case(self) -> "Case":
@@ -740,6 +780,19 @@ class App:
         return self._device("get_foreground_app", {})
 
     # ---- 操作
+    def bind(self, control: str, **values: Any) -> str:
+        """Resolve selector placeholders from explicit business values."""
+        self._guard()
+        from mino_scout.runtime.locator_binding import bind_cell
+        try:
+            cell = bind_cell(self._control_cell(control), values)
+        except ValueError as exc:
+            raise ScriptAbort(str(exc), reason_code="data_binding_invalid", status="blocked") from None
+        cell["require_unique"] = True
+        key = "@bound:" + uuid.uuid4().hex
+        self._bound_controls[key] = cell
+        return key
+
     def tap(self, control: str, index: Optional[int] = None) -> ActionResult:
         params = self._locate(str(control or ""), "tap", index=index)
         if self._platform == "web":
@@ -893,6 +946,11 @@ class App:
             raise ScriptAbort(result.summary or "没有读到界面结构", reason_code="script_failed")
         return result
 
+    def observe(self, control: str = "", *, field: str = "visible", text: str = "") -> ActionResult:
+        """Read an exact UI signal for a flow; unknown facts remain unknown, without assertions."""
+        from mino_scout.runtime.deterministic import observe
+        return observe(self, control, field, text)
+
     def on_page(self, page_key: str) -> ActionResult:
         from mino_scout.platform.scout.run import on_page
 
@@ -947,7 +1005,16 @@ class App:
     # ---- 内部
     def _locate(self, control: str, kind: str, index: Optional[int] = None) -> dict[str, Any]:
         try:
-            return self._locator_params(control, index=index)
+            params = self._locator_params(control, index=index)
+            if params.get("require_unique") and self._platform != "web" and not params.get("ocr_observation_id"):
+                from mino_scout.runtime.deterministic import control_nodes
+                observation = self.hierarchy().data
+                if not observation.get("structured") or observation.get("truncated", True):
+                    raise ScriptAbort("当前结构不足以确定动态对象", reason_code="observation_insufficient", status="blocked")
+                nodes = control_nodes(self, control, observation.get("nodes", []))
+                if len(nodes) != 1:
+                    raise ScriptAbort("动态对象有多个候选" if nodes else "动态对象未找到", reason_code="locator_ambiguous" if nodes else "locator_missing", status="blocked")
+            return params
         except ScriptAbort as exc:
             if exc.reason_code in {"locator_missing", "control_unknown"}:
                 self._report(kind, ActionResult(ok=False, summary=exc.reason_code, status="fail"), "script", 0)
@@ -1017,6 +1084,14 @@ class App:
 
     def _locator_params(self, control: str, index: Optional[int] = None) -> dict[str, Any]:
         self._guard()
+        cell = self._control_cell(control)
+        selector = cell.get("selector") if isinstance(cell.get("selector"), dict) else {}
+        return self._cell_params(cell, selector, index)
+
+    def _control_cell(self, control: str) -> dict[str, Any]:
+        from copy import deepcopy
+        if control in self._bound_controls:
+            return deepcopy(self._bound_controls[control])
         page_key, control_id = self._split_control(control)
         page = self._pages.get(page_key)
         if not isinstance(page, dict):
@@ -1028,7 +1103,9 @@ class App:
         cell = spec.get(_CELLS[self._platform])
         if not isinstance(cell, dict):
             raise ScriptAbort("locator_missing", reason_code="locator_missing")
-        selector = cell.get("selector") if isinstance(cell.get("selector"), dict) else {}
+        return deepcopy(cell)
+
+    def _cell_params(self, cell, selector, index=None):
         kind = str(selector.get("kind") or "")
         if kind == "ocr_text":
             if index is not None:
@@ -1069,6 +1146,16 @@ class App:
             raise ScriptAbort("locator_missing", reason_code="locator_missing") from None
         if not params:
             raise ScriptAbort("locator_missing", reason_code="locator_missing")
+        if cell.get("require_unique"):
+            if index is not None:
+                raise ScriptAbort("动态对象定位不能按首项或序号替代", reason_code="locator_ambiguous", status="blocked")
+            if "x" in selector or "y" in selector or extra:
+                raise ScriptAbort("动态对象需要明确的单一节点定位", reason_code="data_binding_invalid", status="blocked")
+            params["require_unique"] = True
+            params["bound_selector"] = dict(selector)
+        for key in ("scope_css", "frame_selector", "shadow_host_css"):
+            if cell.get(key):
+                params[key] = cell[key]
         if extra and isinstance(params.get("target"), dict):
             # 备用选择器挂在 target 上，解析器按 resource_id → text → content_desc 的顺序试。
             fallback = dict(params["target"])

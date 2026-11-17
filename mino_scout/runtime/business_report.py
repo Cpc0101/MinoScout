@@ -53,6 +53,8 @@ def _describe(row):
 
 
 def attribution(status, reason):
+    if reason in {"data_missing", "prerequisite_unavailable", "resource_account_missing", "resource_busy", "otp_requires_human", "otp_environment_unavailable"}:
+        return "blocked"
     if reason in _AUTOMATION:
         return "automation"
     if reason.startswith("source_"):
@@ -106,13 +108,20 @@ def build_report(meta, outcome, events):
                 and row.get("source_ref") == failure_ref and (row.get("status") in {"fail", "blocked", "unknown"} or row.get("failed"))]
     failure = {"source_ref": failure_ref, "title": str(outcome.get("failure_title") or "")[:300],
                "actual": _short(outcome.get("summary")), "event_seq": failures[0][0] if failures else 0}
-    return {"version": 1, "run_purpose": meta.get("run_purpose", "regression"), "counts": counts,
+    auxiliary = [row for _, row in assertions if row.get("source_ref") not in {str(c.get("id") or "") for c in expectations}]
+    auxiliary_counts = {"total": len(auxiliary), "pass": sum(r.get("status") == "pass" for r in auxiliary),
+                        "fail": sum(r.get("status") == "fail" for r in auxiliary),
+                        "unknown": sum(r.get("status") not in {"pass", "fail"} for r in auxiliary)}
+    purpose = "preparation" if (meta.get("source_context") or {}).get("purpose") == "prepare" else meta.get("run_purpose", "unclassified")
+    return {"version": 1, "run_purpose": purpose, "counts": counts,
+            "auxiliary_assertions": auxiliary_counts,
+            "context": {key: str(meta.get(key) or "") for key in ("task_id", "session_id", "attempt_id", "case_id", "node_id", "revision", "script_path", "source_hash")},
             "items": entries[:50], "items_truncated": len(entries) > 50,
             "attribution": attribution(outcome.get("status", ""), reason) if outcome.get("status") != "pass" else "",
             "reason_code": reason, "model_usage": {"calls": len(model_calls),
                 "llm_calls": sum(row.get("kind") == "llm" for _, row in model_calls),
                 "vlm_calls": sum(row.get("kind") == "vlm" for _, row in model_calls),
                 "elapsed_ms": sum(row.get("elapsed_ms", 0) for row in model_results),
-                "total_tokens": sum(reported) if reported else None,
-                "usage_complete": len(reported) == len(model_calls)},
+                "total_tokens": sum(reported) if reported else 0 if not model_calls else None,
+                "usage_complete": len(model_results) == len(model_calls) and len(reported) == len(model_calls)},
             **({"failure": failure} if outcome.get("status") != "pass" else {})}
