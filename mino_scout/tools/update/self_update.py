@@ -73,6 +73,44 @@ def manifest_url_from_config() -> str:
     return url or DEFAULT_MANIFEST
 
 
+def check_update(*, manifest_url: str = "") -> dict[str, Any]:
+    """只读比较本机安装与发布 manifest，不下载、不安装、不写配置。"""
+    from mino_scout.tools.update.app_version import read_app_semver
+
+    prefix = config_dir()
+    bin_dir = prefix / "bin"
+    url = str(manifest_url or manifest_url_from_config()).strip()
+    manifest = fetch_json(url)
+    item = pick_manifest_item(manifest)
+    installed = installed_layers(prefix)
+    plan = plan_scout_update(
+        item,
+        installed,
+        bin_dir=bin_dir if bin_dir.is_dir() else None,
+    )
+    current = read_app_semver().strip().lstrip("vV")
+    latest = str(item.get("version") or manifest.get("version") or "").strip().lstrip("vV")
+    build_id = str(manifest.get("build_id") or item.get("build_id") or latest).strip()
+    release_tag = str(manifest.get("release_tag") or item.get("release_tag") or "").strip()
+    if not release_tag and latest:
+        release_tag = "v" + latest
+    available = plan.get("mode") != "up-to-date"
+    return {
+        "ok": True,
+        "update_available": bool(available),
+        "current": current,
+        "latest": latest,
+        "build_id": build_id,
+        "release_tag": release_tag,
+        "mode": str(plan.get("mode") or ""),
+        "reason": str(plan.get("reason") or ""),
+        "bytes": int(plan.get("bytes") or 0),
+        "layers": [str(step.get("layer") or "") for step in plan.get("steps") or []],
+        "manifest_url": url,
+        "requires_confirmation": True,
+    }
+
+
 def _verify_sha256(path: Path, expected: str) -> None:
     digest = hashlib.sha256()
     with path.open("rb") as f:

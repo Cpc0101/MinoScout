@@ -127,6 +127,21 @@ def cmd_update(argv: list[str]) -> int:
         return 1
 
 
+def cmd_update_check(argv: list[str]) -> int:
+    from mino_scout.tools.update.self_update import check_update
+
+    ap = argparse.ArgumentParser(prog="mino-scout update-check")
+    ap.add_argument("--manifest-url", default="")
+    ns = ap.parse_args(argv)
+    try:
+        out = check_update(manifest_url=ns.manifest_url)
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_configure(argv: list[str]) -> int:
     if argv and argv[0] == "closed-lid":
         from mino_scout.tools.keep_alive.lid_sleep import configure
@@ -336,6 +351,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_stop()
     if sub == "update":
         return cmd_update(raw[1:])
+    if sub == "update-check":
+        return cmd_update_check(raw[1:])
     if sub == "update-helper" and len(raw) == 2:
         from mino_scout.tools.update.fixed_update import helper
         return helper(raw[1])
@@ -361,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     if sub == "probe":
         return cmd_probe(build_core())
 
-    print(f"未知命令: {sub}（可用: run start probe status stop update heavy-deps configure）", file=sys.stderr)
+    print(f"未知命令: {sub}（可用: run start probe status stop update update-check heavy-deps configure）", file=sys.stderr)
     return 2
 
 

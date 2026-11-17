@@ -160,6 +160,7 @@ Windows 根据系统选择 `install.ps1`。当 Scout 仍在运行时，先下载
 
 `mino-scout update --operation-id <id> --release-tag <tag> --build-id <build>` 只在节点已停止时受理；在线节点经 Nexus 门禁。
 回退增加 `--rollback-of <原成功操作>`；状态 `update-status <id>`，中断人工恢复 `update-recover <id>`。
+启动前预检用只读的 `mino-scout update-check`：读取当前 manifest、比较本机层指纹并输出 `update_available`、`current`、`latest`、`build_id` 与 `release_tag`。它不下载、不安装、不写配置；网络或 manifest 不可用时以非零退出，不能把未知状态当成已是最新。
 恢复命令从 `updates/<id>/helper-bin/mino-scout` 运行，避免 bin 在切换中缺失。
 CLI 恢复也须旧进程退出；不能通过删除锁文件清除维护状态。
 保留配置和完整旧 bin，未添加自动清理；需预留当前 bin 两份及下载/暂存空间。
