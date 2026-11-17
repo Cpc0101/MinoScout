@@ -1272,6 +1272,13 @@ class AdbExecutor:
             x, y = int(x), int(y)
         except (TypeError, ValueError):
             return None, None, {"point_policy": "coordinate"}, "none"
+        if raw.get("coordinate_space") == "screenshot_pixels":
+            from mino_scout.screen import last_capture_size
+            size = last_capture_size(serial)
+            if not (size[0] > 0 and size[1] > 0 and 0 <= x < size[0] and 0 <= y < size[1]):
+                return None, None, {"point_policy": "coordinate", "reason_code": "observation_stale"}, "none"
+            x, y = scale_to_display(x, y, shot=size, display=self._wm_size(serial))
+            return x, y, {"point_policy": "coordinate", "coordinate_space": "screenshot_pixels"}, "pixels"
         return x, y, {"point_policy": "coordinate"}, "xy"
 
     def _wm_size(self, serial: str) -> tuple[int, int]:

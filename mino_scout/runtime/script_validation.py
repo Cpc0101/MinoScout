@@ -70,7 +70,7 @@ def _assertion_calls(body: list[ast.stmt]) -> tuple[bool, bool]:
             continue
         if isinstance(node, ast.Call):
             name = node.func.attr if isinstance(node.func, ast.Attribute) else ""
-            if name in {"on_page", "expect", "assert_equal"}:
+            if name in {"on_page", "expect", "expect_text", "expect_state", "expect_count", "expect_value", "wait_for", "assert_equal"}:
                 possible = True
             elif name in {"vlm", "vlm_frame"}:
                 verdict = next((kw.value for kw in node.keywords if kw.arg == "verdict"), None)
@@ -129,6 +129,15 @@ def validate_sources(root: Path, trees: dict[Path, ast.Module], *, require_cases
         if key in pages:
             add(path, 1, "page_duplicate", f"Application {key[0]} defines page {key[1]} more than once")
         pages[key] = page
+        from mino_scout.platform.ocr import validate_selector
+        for control in page.get("controls", []):
+            for cell in (control.get("locator_spec") or {}).values() if isinstance(control, dict) else []:
+                selector = cell.get("selector") if isinstance(cell, dict) else None
+                if isinstance(selector, dict) and selector.get("kind") == "ocr_text":
+                    try:
+                        validate_selector(selector)
+                    except Exception as exc:
+                        add(path, 1, "ocr_config", str(exc))
 
     case_count = 0
     for path, tree in trees.items():

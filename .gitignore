@@ -258,3 +258,38 @@ coverage/
 
 # Archify local artifacts
 .archify/
+
+# 系统杂文件与编辑器临时文件。
+._*
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+.vscode/
+.cursor/
+.run/
+
+# 本地环境配置；示例配置保留在版本控制中。
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+!.env.*.example
+!.env.*.sample
+!.env.*.template
+
+# 本地 Scout 调试状态和 SQLite 执行记录。
+.mino-test/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal

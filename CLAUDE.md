@@ -36,6 +36,7 @@ MinoScout 是执行器。它接收 [MinoNexus](../MinoNexus) 下发的动作，�
 - 完整步骤、动作、断言、原文快照和截图保存在 Scout。`record.sync` 只发送状态投影，必须持久化 ACK 后清 outbox；断线只重传摘要，不重放设备动作。
 - Workbench / Agent 的 record.status/events/artifact/manifest 经 Nexus 和既有出站连接读取；Scout 不开监听端口，必须核对已验证账号、task、attempt 和 session。
 - 缺有效断言、空 check、原文覆盖缺失不得通过。失败状态须保留；页面成立不能代替业务条件成立，明确 no 不得被另一模型改成 yes。当前视觉断言取新图，历史帧只由显式 vlm_frame 使用。
+- 普通脚本模型缺省关闭；语义判断必须声明字面量 MODEL_POLICY，绑定原文和预算。确定性断言与本地 OCR、业务报告见 [DETERMINISTIC_CASES](docs/DETERMINISTIC_CASES.md)。OCR 在 Scout 用系统 Vision 或 Tesseract CLI，不引入大型图像算法依赖，不作隐式模型选路。
 - 取消必须等执行停止才成为终态；重启遗留 attempt 标为 interrupted，不自动重跑。断线后到下一设备写入边界阻塞，写结果未知仍保留隔离。
 
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 from urllib import error, request
 
@@ -16,7 +17,33 @@ def _provider():
         raise ScriptAbort(str(exc) or "这台机器还没有配置模型（~/.mino/config.toml）", reason_code="model_unconfigured", status="blocked") from exc
 
 
-def complete(case, prompt: str, text: str = "", schema: dict | None = None) -> Any:
+def _invoke(case, kind, purpose, callback, *args, **kwargs):
+    owner = getattr(case, "_case", case)
+    request_info = owner._model_gate.begin(kind, purpose)
+    started, usage = time.monotonic(), {}
+    status, reason = "pass", ""
+    try:
+        result = callback(case, *args, timeout=request_info["timeout_ms"] / 1000, usage=usage, **kwargs)
+        if (time.monotonic() - started) * 1000 > request_info["timeout_ms"]:
+            from mino_scout.runtime.script_exec import ScriptAbort
+            raise ScriptAbort("模型响应超出本次耗时预算", reason_code="model_budget_exceeded", status="blocked")
+        return result
+    except BaseException as exc:
+        status, reason = "blocked", str(getattr(exc, "reason_code", "model_empty"))
+        if reason == "vlm_failed":
+            status = "fail"
+        if isinstance(exc, Exception):
+            owner._latched_error = owner._latched_error or exc
+        raise
+    finally:
+        owner._model_gate.finish(request_info, started, status=status, reason_code=reason, usage=usage or None)
+
+
+def complete(case, prompt: str, text: str = "", schema: dict | None = None, *, purpose="text_assertion") -> Any:
+    return _invoke(case, "llm", purpose, _complete, prompt, text=text, schema=schema)
+
+
+def _complete(case, prompt: str, text: str = "", schema: dict | None = None, *, timeout, usage) -> Any:
     from mino_scout.runtime.script_exec import ScriptAbort
 
     cfg = _provider()
@@ -45,12 +72,13 @@ def complete(case, prompt: str, text: str = "", schema: dict | None = None) -> A
         "Content-Type": "application/json",
     })
     try:
-        with request.urlopen(req, timeout=60) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
+        with request.urlopen(req, timeout=timeout) as resp:
+            raw = json.loads(resp.read(1048576).decode("utf-8"))
     except error.HTTPError as exc:
         raise ScriptAbort(f"模型请求失败：HTTP {exc.code}", reason_code="model_empty", status="blocked") from exc
     except (error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
         raise ScriptAbort("模型没有返回结果", reason_code="model_empty", status="blocked") from exc
+    usage.update(_usage(raw))
     content = _content(raw)
     try:
         parsed = json.loads(content) if content else {}
@@ -64,6 +92,11 @@ def complete(case, prompt: str, text: str = "", schema: dict | None = None) -> A
 
 
 def see(case, prompt: str, *, verdict: str = "", index: int | None = None) -> str:
+    return _invoke(case, "vlm", "visual_assertion" if verdict == "pass" else "exploration",
+                   _see, prompt, verdict=verdict, index=index)
+
+
+def _see(case, prompt: str, *, verdict: str = "", index: int | None = None, timeout, usage) -> str:
     from mino_scout.runtime.script_exec import ScriptAbort
 
     shot = getattr(case, "_shot", None)
@@ -100,12 +133,13 @@ def see(case, prompt: str, *, verdict: str = "", index: int | None = None) -> st
         "Content-Type": "application/json",
     })
     try:
-        with request.urlopen(req, timeout=60) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
+        with request.urlopen(req, timeout=timeout) as resp:
+            raw = json.loads(resp.read(1048576).decode("utf-8"))
     except error.HTTPError as exc:
         raise ScriptAbort(f"模型请求失败：HTTP {exc.code}", reason_code="model_empty", status="blocked") from exc
     except (error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
         raise ScriptAbort("视觉模型没有返回结果", reason_code="model_empty", status="blocked") from exc
+    usage.update(_usage(raw))
     content = _content(raw)
     try:
         parsed = json.loads(content) if content else {}
@@ -132,3 +166,9 @@ def _content(raw: Any) -> str:
     if not isinstance(message, dict):
         return ""
     return str(message.get("content") or "")
+
+
+def _usage(raw):
+    value = raw.get("usage") if isinstance(raw, dict) else None
+    return {k: v for k, v in value.items() if k in {"prompt_tokens", "completion_tokens", "total_tokens"}
+            and type(v) is int and v >= 0} if isinstance(value, dict) else {}

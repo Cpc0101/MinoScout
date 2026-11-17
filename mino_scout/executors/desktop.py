@@ -608,6 +608,8 @@ class DesktopRuntime:
             self._clear_focus(run_id)
         if capability not in {"launch_app", "hierarchy"} and (not obs or obs["session_generation"] != hint["session_generation"]):
             raise DesktopUnavailable("桌面动作需要重新截图，旧捕获引用已消费或失效")
+        if params.get("ocr_observation_id") and params.get("capture_id") != (obs or {}).get("capture_id"):
+            raise DesktopUnavailable("OCR 捕获引用已变化，请重新观察目标")
         if capability == "launch_app":
             if os_name == "macos":
                 from mino_scout.platform.mac.actions import launch

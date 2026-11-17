@@ -46,7 +46,7 @@ def accept(core, req: P.Execute, stop: threading.Event | None = None):
         from mino_scout.runtime import script_exec
         outcome = script_exec.run(core, _with_hint(payload, req), root, deadline=time.monotonic() + timeout, stop=stop)
         status = EventStatus.PASS if outcome["status"] == "pass" else EventStatus.FAIL
-        started = "yes" if outcome.get("touched") else "no"
+        started = str(outcome.get("execution_started") or "unknown")
         return _result(req, status, str(outcome.get("summary") or ""), error=str(outcome.get("error") or ""),
                        started=started, phase="completed" if started == "yes" else "script", state=outcome["status"],
                        case_id=payload.case_id, reason=str(outcome.get("reason_code") or ""))

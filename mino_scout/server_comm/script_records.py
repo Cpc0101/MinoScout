@@ -124,6 +124,8 @@ class ScriptRecords:
         task_id, attempt_id = self._resolve(params)
         if capability == "record.status":
             return self.store.status(task_id, attempt_id)
+        if capability == "record.resource_status":
+            return self.resource_status(task_id, attempt_id)
         if capability == "record.events":
             return self.store.events(task_id, attempt_id, after_seq=params.get("after_seq", 0), limit=params.get("limit", 100), max_bytes=params.get("max_bytes", 524288))
         if capability == "record.artifact":
@@ -136,6 +138,38 @@ class ScriptRecords:
                     job["stop"].set()
             return result
         raise ValueError("record_operation_unknown")
+
+    def resource_status(self, task_id, attempt_id):
+        """Fresh stop proof for an explicit Web isolation review, never a verdict rewrite."""
+        from mino_scout.runtime.process_retirement import foreign_runtime_processes, process_started_at
+        from mino_scout.service import run_lock_held
+        with self.lock:
+            summary = self.store.status(task_id, attempt_id)
+            meta = self.store.metadata(task_id, attempt_id)
+            generation = self.core.binding_guard.process_generation
+            active = attempt_id in self.jobs
+            same_process = (meta.get("scout_process_generation") == generation
+                            and summary.get("execution_stopped") is True
+                            and summary.get("browser_closed") is True)
+            started = process_started_at()
+            finished = meta.get("finished_at")
+            # Historical records have no stop receipt. Retirement must be proved
+            # by the running service, including absence of orphan runtime children.
+            if not finished and summary.get("finished_at"):
+                from datetime import datetime
+                finished = datetime.fromisoformat(summary["finished_at"]).timestamp()
+            retired = (not same_process and type(finished) in (int, float)
+                       and started > finished + 120 and run_lock_held()
+                       and foreign_runtime_processes(summary["sn"]) == 0)
+            confirmed = (summary["platform"] == "web" and summary["sealed"]
+                         and not active and (same_process or retired))
+            return {**summary, "resource_stop": {
+                "contract": "script_resource_stop.v1", "stop_confirmed": bool(confirmed),
+                "worker_active": active, "browser_closed": bool(confirmed),
+                "mode": "same_process" if same_process else "retired_generation" if retired else "unconfirmed",
+                "scout_process_generation": generation, "process_started_at": started,
+                "reason_code": "web_lane_stopped" if confirmed else "stop_evidence_required",
+            }}
 
     def submit(self, req):
         from mino_scout.server_comm.script_dispatch import _payload
@@ -150,7 +184,8 @@ class ScriptRecords:
         immutable = {"script": asdict(payload), "device_hint": dict(req.device_hint or {})}
         digest = hashlib.sha256(json.dumps(immutable, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         metadata = {**asdict(payload), "node_id": self.core.node_id,
-                    "environment": dict(req.device_hint or {}), "execution_started": "no"}
+                    "environment": dict(req.device_hint or {}), "execution_started": "no",
+                    "scout_process_generation": self.core.binding_guard.process_generation}
         with self.lock:
             if self.closed:
                 raise ValueError("record_unavailable")
@@ -221,6 +256,10 @@ class ScriptRecords:
                         _terminate(process)
                         break
             process.join(timeout=2)
+            if process.is_alive():
+                _terminate(process)
+            if process.is_alive():
+                raise RuntimeError("worker_stop_unconfirmed")
             if outcome is None and pipe.poll():
                 try:
                     message = pipe.recv()
@@ -235,6 +274,7 @@ class ScriptRecords:
                            "resource_isolated": True, "failure_stage": "execution"}
                 if job["stop"].is_set() and not timed_out:
                     outcome.update(status="cancelled", reason_code="cancelled")
+            outcome["execution_stopped"] = True
             self.store.finish(job["task_id"], job["attempt_id"], outcome)
         except Exception as exc:
             _terminate(process)
@@ -274,6 +314,16 @@ class ScriptRecords:
 def _terminate(process):
     if not process.is_alive():
         return
+    # Capture identities while the worker still owns its children. Reparented
+    # browsers must not survive a timeout/cancel after the worker exits first.
+    children = []
+    try:
+        import psutil
+        children = psutil.Process(process.pid).children(recursive=True)
+        for child in children:
+            child.create_time()
+    except Exception:
+        pass
     if os.name != "nt":
         try:
             if os.getpgid(process.pid) == process.pid:
@@ -288,6 +338,13 @@ def _terminate(process):
     if process.is_alive():
         process.kill()
         process.join(timeout=1)
+    for child in reversed(children):
+        try:
+            if child.is_running():
+                child.kill()
+                child.wait(timeout=1)
+        except Exception:
+            pass  # No browser-closed receipt is invented for forced cleanup.
 
 
 def _worker(store_root, payload_raw, request_raw, pipe, stop, connected):
@@ -352,9 +409,14 @@ def _worker(store_root, payload_raw, request_raw, pipe, stop, connected):
         if payload.platform == "web":
             try:
                 from mino_scout.platform.web.playwright_hub import get_hub
-                get_hub().shutdown_thread()
+                closed = get_hub().shutdown_thread()
+                if outcome is not None:
+                    outcome["browser_closed"] = closed is True
+                    if closed is not True:
+                        outcome["resource_isolated"] = True
             except Exception:
-                pass
+                if outcome is not None:
+                    outcome.update(browser_closed=False, resource_isolated=True)
         try:
             pipe.send({"kind": "result", "outcome": outcome or {"status": "blocked", "reason_code": "worker_interrupted", "summary": "执行未完成"}})
         finally:

@@ -305,10 +305,9 @@ class PlaywrightHub:
         browser = browsers.get(key)
         if browser is not None:
             if modes.get(key) != head:
-                try:
-                    browser.close()
-                except Exception:
-                    pass
+                browser.close()
+                if browser.is_connected():
+                    raise RuntimeError("browser_close_unconfirmed")
                 browsers.pop(key, None)
                 browser = None
             else:
@@ -412,31 +411,9 @@ class PlaywrightHub:
                 for key in [k for k in self._sessions if k.endswith(suffix)]:
                     self._sessions.pop(key, None)
 
-    def release_this_lane(self) -> None:
+    def release_this_lane(self) -> bool:
         """只关本线程启动的浏览器。别的线程上的页面不动。"""
-        ident = threading.get_ident()
-        with self._lock:
-            for key in [
-                k
-                for k, row in self._sessions.items()
-                if int(row.get("owner_thread") or 0) == ident
-            ]:
-                self._sessions.pop(key, None)
-        browsers: dict = getattr(self._local, "browsers", None) or {}
-        for browser in list(browsers.values()):
-            try:
-                browser.close()
-            except Exception:
-                pass
-        self._local.browsers = {}
-        self._local.browser_headed = {}
-        pw = getattr(self._local, "pw", None)
-        if pw is not None:
-            try:
-                pw.stop()
-            except Exception:
-                pass
-            self._local.pw = None
+        return self.shutdown_thread()
 
     def _lane_open(self, run_id: str) -> bool:
         rid = str(run_id or "")
@@ -702,13 +679,17 @@ class PlaywrightHub:
         self._local.browser_headed = modes
         keys = [k for k in browsers if k == sn_key or k.startswith(sn_key + "::")]
         for key in keys:
-            browser = browsers.pop(key, None)
-            modes.pop(key, None)
+            browser = browsers.get(key)
             if browser is None:
                 continue
             try:
                 browser.close()
+                if not browser.is_connected():
+                    browsers.pop(key, None)
+                    modes.pop(key, None)
             except Exception:
+                # Retain the handle for final shutdown/review; losing it would
+                # make a later cleanup falsely report that no browser remains.
                 pass
 
     def release_run(self, run_id: str) -> None:
@@ -723,9 +704,11 @@ class PlaywrightHub:
             sn_part = key.split("::", 1)[0]
             self.close_case(sn_part, run_id=rid)
 
-    def shutdown_thread(self) -> None:
+    def shutdown_thread(self) -> bool:
+        closed = True
         with self._lock:
-            keys = list(self._sessions.keys())
+            keys = [key for key, row in self._sessions.items()
+                    if int(row.get("owner_thread") or 0) == threading.get_ident()]
         for key in keys:
             if "::" in key:
                 sn_part, rid = key.split("::", 1)
@@ -733,21 +716,29 @@ class PlaywrightHub:
             else:
                 self.close_case(key)
         browsers: dict = getattr(self._local, "browsers", None) or {}
+        remaining = {}
         for sn, browser in list(browsers.items()):
             try:
-                browser.close()
+                if browser.is_connected():
+                    browser.close()
+                if browser.is_connected():
+                    remaining[sn] = browser
+                    closed = False
             except Exception:
-                pass
-        self._local.browsers = {}
-        self._local.browser_headed = {}
+                remaining[sn] = browser
+                closed = False
+        self._local.browsers = remaining
+        self._local.browser_headed = {key: value for key, value in
+            (getattr(self._local, "browser_headed", None) or {}).items() if key in remaining}
         pw = getattr(self._local, "pw", None)
         if pw is not None:
             try:
                 pw.stop()
+                self._local.pw = None
             except Exception:
-                pass
-            self._local.pw = None
+                closed = False
             SLog.i(TAG, f"playwright stopped thread={threading.get_ident()}")
+        return closed
 
 
 _HUB: Optional[PlaywrightHub] = None

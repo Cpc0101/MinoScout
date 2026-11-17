@@ -714,7 +714,7 @@ class PlaywrightExecutor:
             page.wait_for_load_state(state, timeout=timeout)
             return self._ok(event, started_at, t0, f"页面 {state}", execution_started="no")
         except Exception as exc:
-            return self._fail(event, started_at, t0, f"等待就绪超时: {exc}")
+            return self._fail(event, started_at, t0, f"等待就绪超时: {exc}", execution_started="no")
 
     def _fallback_xy(self, params, page):
         """Nexus 已经算好的点。锚点没命中时直接执行，不再替 Nexus 做策略判断。"""
@@ -755,7 +755,7 @@ class PlaywrightExecutor:
     def _tap_node(self, event, page, started_at, t0, params):
         """锚点命中则点击。没命中返回 None，由调用方按 Nexus 给的坐标执行。"""
         if params.get("node_ref"):
-            execution_started = False
+            handle = None
             try:
                 handle = page.evaluate_handle("""p => {
                     const state=window.__minoObservation;
@@ -769,29 +769,69 @@ class PlaywrightExecutor:
                     raise ValueError("stale_node_ref")
                 # Trial uses Playwright actionability without sending the click.
                 element.click(trial=True, timeout=2000)
-                execution_started = True
+            except Exception as exc:
+                return self._fail(
+                    event, started_at, t0, f"观察节点预检失败: {type(exc).__name__}",
+                    execution_started="no",
+                )
+            finally:
+                if handle is not None:
+                    try:
+                        handle.dispose()
+                    except Exception:
+                        pass
+            try:
                 element.click(timeout=4000)
                 self._settle_page(page)
                 return self._ok(event, started_at, t0, "点击当前观察节点", execution_started="yes")
             except Exception as exc:
-                if execution_started:
-                    return make_event_result(event, status=EventStatus.BLOCKED, executor_used=self.id,
-                        started_at=started_at, elapsed_ms=int((time.time()-t0)*1000),
-                        summary="节点点击结果不确定，先观察确认",
-                        error=str(exc), raw_response={"execution_started": True,
-                            "error_kind": "write_outcome_unknown"})
-                return None
+                return make_event_result(
+                    event, status=EventStatus.BLOCKED, executor_used=self.id,
+                    started_at=started_at, elapsed_ms=int((time.time() - t0) * 1000),
+                    summary="节点点击结果不确定，先观察确认", error=str(exc),
+                    raw_response={"execution": {
+                        "execution_started": "unknown", "phase": "executor",
+                        "reason_code": "write_outcome_unknown", "source": "playwright.native.v1",
+                    }, "execution_control": {
+                        "stop_run": True, "reason_code": "write_outcome_unknown",
+                        "resource_isolated": True, "stop_confirmed": False,
+                    }},
+                )
         name = _anchor_name(params)
         if not name:
             return None
         loc, count = unique_exact_text(page, name)
         if count > 1:
-            return self._fail(event, started_at, t0, f"文案「{name[:40]}」命中 {count} 处，无法唯一点击")
+            return self._fail(
+                event, started_at, t0, f"文案「{name[:40]}」命中 {count} 处，无法唯一点击",
+                execution_started="no",
+            )
         if loc is None:
             return None
-        loc.click()
-        self._settle_page(page)
-        return self._ok(event, started_at, t0, f"点击「{name[:40]}」", execution_started="yes")
+        try:
+            loc.click(trial=True, timeout=2000)
+        except Exception as exc:
+            return self._fail(
+                event, started_at, t0, f"文案「{name[:40]}」预检失败: {type(exc).__name__}",
+                execution_started="no",
+            )
+        try:
+            loc.click(timeout=4000)
+            self._settle_page(page)
+            return self._ok(event, started_at, t0, f"点击「{name[:40]}」", execution_started="yes")
+        except Exception as exc:
+            return make_event_result(
+                event, status=EventStatus.BLOCKED, executor_used=self.id,
+                started_at=started_at, elapsed_ms=int((time.time() - t0) * 1000),
+                summary="文案点击结果不确定，先观察确认", error=str(exc),
+                raw_response={"execution": {
+                    "execution_started": "unknown", "phase": "executor",
+                    "reason_code": "write_outcome_unknown", "source": "playwright.native.v1",
+                }, "execution_control": {
+                    "stop_run": True, "reason_code": "write_outcome_unknown",
+                    "resource_isolated": True, "stop_confirmed": False,
+                }},
+            )
 
     def _long_press(self, event: PlanEvent, page, started_at: str, t0: float) -> EventResult:
         params = event.params or {}
@@ -867,11 +907,23 @@ class PlaywrightExecutor:
                 except Exception:
                     loc = None
             if loc is not None:
-                if loc.evaluate("e => e.type === 'password'"):
-                    remember(text)
-                    event.params["sensitive"] = True
-                loc.fill(text)
-                return self._ok(event, started_at, t0, f"输入({tag})「{name[:40]}」", execution_started="yes")
+                try:
+                    loc.wait_for(state="visible", timeout=2000)
+                    if not loc.is_enabled():
+                        raise ValueError("not_enabled")
+                    if loc.evaluate("e => e.type === 'password'"):
+                        remember(text)
+                        event.params["sensitive"] = True
+                except Exception as exc:
+                    return self._fail(
+                        event, started_at, t0, f"输入({tag})「{name[:40]}」预检失败: {type(exc).__name__}",
+                        execution_started="no",
+                    )
+                try:
+                    loc.fill(text)
+                    return self._ok(event, started_at, t0, f"输入({tag})「{name[:40]}」", execution_started="yes")
+                except Exception as exc:
+                    return self._write_unknown(event, started_at, t0, exc)
         focus_ref = str(params.get("focus_ref") or "")
         if str(params.get("target_mode") or "") == "current_focus":
             if not ctx.run_id or not focus_ref.startswith(f"focus:{ctx.run_id}:") or not focus_ref.rsplit(":", 1)[-1].isdigit():
@@ -883,7 +935,7 @@ class PlaywrightExecutor:
         try:
             x, y = resolve_viewport_xy(params, page)
         except ValueError:
-            return self._fail(event, started_at, t0, f"Web 输入({tag}) 需要坐标 x/y")
+            return self._fail(event, started_at, t0, f"Web 输入({tag}) 需要坐标 x/y", execution_started="no")
         target = locate_editable_at(
             page, x, y, field=login_field, allow_near=policy != "coordinate"
         )
@@ -893,11 +945,12 @@ class PlaywrightExecutor:
                 started_at,
                 t0,
                 f"输入({tag})@({x},{y}) {_input_summary_snippet(text)}（焦点未确认）",
+                execution_started="no",
             )
         if target.evaluate("e => e.type === 'password'"):
             remember(text)
             event.params["sensitive"] = True
-        landed = self._commit_input_value(
+        landed, write_started = self._commit_input_value(
             page, target, text, x=x, y=y, field=login_field
         )
         if landed:
@@ -908,11 +961,14 @@ class PlaywrightExecutor:
                 f"输入({tag})@({x},{y}) {_input_summary_snippet(text)}",
                 execution_started="yes",
             )
+        if write_started:
+            return self._write_unknown(event, started_at, t0, RuntimeError("input_verification_failed"))
         return self._fail(
             event,
             started_at,
             t0,
             f"输入({tag})@({x},{y}) {_input_summary_snippet(text)}（焦点未确认）",
+            execution_started="no",
         )
 
     def _input_focused(self, event, page, started_at, t0, text: str, tag: str, params: dict) -> EventResult:
@@ -952,7 +1008,7 @@ class PlaywrightExecutor:
                 page.keyboard.press("ControlOrMeta+A")
             page.keyboard.insert_text(text)
         except Exception as exc:
-            return self._fail(event, started_at, t0, f"输入({tag}) 写入当前焦点失败：{type(exc).__name__}")
+            return self._write_unknown(event, started_at, t0, exc)
         return self._ok(event, started_at, t0, f"输入({tag}) 已写入当前焦点", execution_started="yes")
 
     @staticmethod
@@ -987,15 +1043,21 @@ class PlaywrightExecutor:
         x: int,
         y: int,
         field: str,
-    ) -> bool:
+    ) -> tuple[bool, bool]:
         """把字写进定位到的控件本身。成功只认框里包含完整文本。"""
         expected = str(text or "")
         from mino_scout.runtime.secret_redaction import remember
-        if field in {"password", "otp"} or target.evaluate("e => e.type === 'password'"):
+        try:
+            password_field = bool(target.evaluate("e => e.type === 'password'"))
+        except Exception:
+            password_field = False
+        if field in {"password", "otp"} or password_field:
             remember(expected)
         if not expected.strip():
-            return False
+            return False, False
+        write_started = False
         try:
+            write_started = True
             target.fill(expected, timeout=2000)
         except Exception:
             try:
@@ -1004,7 +1066,7 @@ class PlaywrightExecutor:
                 try:
                     target.focus()
                 except Exception:
-                    return False
+                    return False, write_started
             try:
                 page.keyboard.press("Control+a")
             except Exception:
@@ -1020,14 +1082,28 @@ class PlaywrightExecutor:
             try:
                 page.keyboard.type(expected, delay=15)
             except Exception:
-                return False
+                return False, write_started
         self._settle_page(page, ms=80)
         if self._value_has_expected(self._read_editable_value(target), expected):
-            return True
+            return True, write_started
         fresh = locate_editable_at(page, x, y, field=field)
         if fresh is None:
-            return False
-        return self._value_has_expected(self._read_editable_value(fresh), expected)
+            return False, write_started
+        return self._value_has_expected(self._read_editable_value(fresh), expected), write_started
+
+    def _write_unknown(self, event, started_at, t0, exc: Exception) -> EventResult:
+        return make_event_result(
+            event, status=EventStatus.BLOCKED, executor_used=self.id,
+            started_at=started_at, elapsed_ms=int((time.time() - t0) * 1000),
+            summary="写动作结果未核验，已停止后备执行并保留资源隔离", error=str(exc),
+            raw_response={"sensitive": bool(event.params.get("sensitive")), "execution": {
+                "execution_started": "unknown", "phase": "executor",
+                "reason_code": "write_outcome_unknown", "source": "playwright.native.v1",
+            }, "execution_control": {
+                "stop_run": True, "reason_code": "write_outcome_unknown",
+                "resource_isolated": True, "stop_confirmed": False,
+            }},
+        )
 
     @staticmethod
     def _settle_page(page, ms: int = 300) -> None:

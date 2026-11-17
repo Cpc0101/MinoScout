@@ -78,6 +78,7 @@ def on_page(case, page_key: str):
     page = {**page, "_live_nodes": _locator_nodes(fields)}
     matched = _anchors_match(page, _visible_text(fields))
     case.case._assert("on_page", "pass" if matched else "fail", expected=page_key,
+                     actual={"matched": matched, "observed": _visible_text(fields)[:1000]},
                      observation_id=case._observation_id, app=case.key, reason_code="" if matched else "page_mismatch")
     if not matched:
         raise ScriptAbort("页面锚点未对上", reason_code="page_mismatch")
@@ -92,7 +93,7 @@ def note(app, text: str, **fields) -> None:
     app.case.nexus.note(text, **fields)
 
 
-def expect(app, *, page: str = "", prompt: str = "", verdict: str = "pass") -> str:
+def expect(app, *, page: str = "", prompt: str = "", verdict: str = "pass", allow_model: bool = False) -> str:
     """Page identity and business expectations are separate assertions.
 
     Only an inconclusive text observation may fall back to a fresh image.
@@ -102,6 +103,11 @@ def expect(app, *, page: str = "", prompt: str = "", verdict: str = "pass") -> s
     app._guard()
     text = str(prompt or "").strip()
     key = str(page or "").strip()
+    if text and not allow_model:
+        error = ScriptAbort("自然语言预期需要显式 allow_model=True 和 MODEL_POLICY；固定文字、状态、数量、值请使用确定性断言",
+                            reason_code="model_policy_denied", status="blocked")
+        app.case._assert("policy", "unknown", expected=text, message=str(error), reason_code=error.reason_code)
+        raise error
     if key:
         app.on_page(key)
         if not text:

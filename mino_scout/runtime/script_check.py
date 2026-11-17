@@ -72,6 +72,8 @@ def check_repo(root: Path, *, require_cases: bool = False) -> list[Hint]:
     hints.extend(Hint(*row) for row in validate_sources(root, trees, require_cases=require_cases))
     from mino_scout.runtime.case_isolation import validate_case_isolation
     hints.extend(Hint(*row) for row in validate_case_isolation(root, trees))
+    from mino_scout.runtime.model_policy import validate_model_usage
+    hints.extend(Hint(*row) for row in validate_model_usage(root, trees))
     return hints
 
 

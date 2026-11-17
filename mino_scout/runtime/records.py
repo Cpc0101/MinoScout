@@ -173,7 +173,9 @@ class RecordStore:
                 "detail_availability": "available", "failure_stage": meta.get("failure_stage", ""),
                 "elapsed_ms": int(max(0, (row["finished_at"] or time.time()) - (row["started_at"] or row["created_at"])) * 1000),
                 "execution_started": meta.get("execution_started", "no"),
+                **{key: meta[key] for key in ("execution_stopped", "browser_closed", "scout_process_generation") if key in meta},
                 "source_hash": meta.get("source_hash", ""), "source_coverage": meta.get("source_coverage", {}),
+                **({"test_report": meta["test_report"]} if "test_report" in meta else {}),
                 "cancel_requested": bool(row["cancel_requested"]),
                 "sync_state": "acked" if row["acked_version"] >= row["summary_version"] else "pending",
                 "record_ref": {"task_id": task_id, "attempt_id": row["attempt_id"], "node_id": meta.get("node_id", "")}}
@@ -231,7 +233,11 @@ class RecordStore:
             if row["state"] in TERMINAL:
                 return self._summary(db, task_id, row)
             metadata = json.loads(row["metadata"])
-            metadata.update({key: outcome[key] for key in ("failure_stage", "execution_started", "source_coverage") if key in outcome})
+            metadata.update({key: outcome[key] for key in ("failure_stage", "execution_started", "source_coverage", "execution_stopped", "browser_closed") if key in outcome})
+            from mino_scout.runtime.business_report import build_report
+            events = [(seq, kind, json.loads(data)) for seq, kind, data in db.execute(
+                "SELECT seq,type,data FROM events WHERE attempt_id=? ORDER BY seq", (attempt_id,))]
+            metadata["test_report"] = scrub(build_report(metadata, outcome, events))
             db.execute("UPDATE attempts SET metadata=? WHERE attempt_id=?", (_json(metadata), attempt_id))
             self._append(db, attempt_id, "run/finished", outcome)
             db.execute("UPDATE attempts SET state=?,reason_code=?,summary=?,finished_at=?,resource_isolated=? WHERE attempt_id=?",

@@ -29,6 +29,12 @@ def to_viewport_xy(x: Any, y: Any, page: Any) -> tuple[int, int]:
 def resolve_viewport_xy(params: dict[str, Any] | None, page: Any) -> tuple[int, int]:
     """从 params.x/y 或 fallback_xy 解析为视口像素坐标。"""
     p = dict(params or {})
+    if p.get("coordinate_space") == "viewport_pixels":
+        w, h = viewport_wh(page)
+        x, y = int(p["x"]), int(p["y"])
+        if not (0 <= x < w and 0 <= y < h):
+            raise ValueError("OCR 坐标超出当前视口")
+        return x, y
     if p.get("x") is not None and p.get("y") is not None:
         return to_viewport_xy(p["x"], p["y"], page)
     raw = p.get("fallback_xy")

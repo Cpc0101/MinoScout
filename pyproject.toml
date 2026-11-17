@@ -39,4 +39,4 @@ include = ["mino_scout*"]
 version = {file = "mino_scout/VERSION"}
 
 [tool.setuptools.package-data]
-mino_scout = ["VERSION", "dom_collect.js"]
+mino_scout = ["VERSION", "dom_collect.js", "platform/ocr_vision.swift"]

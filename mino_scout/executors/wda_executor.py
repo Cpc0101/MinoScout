@@ -238,6 +238,8 @@ class WdaExecutor:
                         max(0.05, int(params.get("duration_ms") or 400) / 1000))
             return {"summary": "已拖拽"}
         if cap == "input_text":
+            if params.get("ocr_observation_id") and params.get("x") is not None and params.get("y") is not None:
+                client.tap_xy(int(params["x"]), int(params["y"]))
             client.keys(str(params.get("text") or ""))
             return {"summary": "已输入"}
         if cap == "press_key":

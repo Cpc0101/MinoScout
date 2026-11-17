@@ -100,6 +100,7 @@ class _Scope:
             raise ScriptAbort("source_ref 的原文类型与步骤不符", reason_code="source_ref_role_mismatch", status="blocked")
         self._previous = (self._case._step, self._case._role, self._case._source_ref, self._case._step_id)
         self._start_assertions = len(self._case._assertions)
+        self._start_error = self._case._latched_error
         self._step_id = "step_" + uuid.uuid4().hex
         self._case._step = self._number
         self._case._role = self._role
@@ -109,16 +110,23 @@ class _Scope:
         return self._case
 
     def __exit__(self, exc_type, exc, tb) -> bool:
-        empty = exc_type is None and self._role == "check" and len(self._case._assertions) == self._start_assertions
-        failed = exc_type is not None or empty
+        latched = self._case._latched_error is not self._start_error
+        empty = exc_type is None and not latched and self._role == "check" and len(self._case._assertions) == self._start_assertions
+        assertions = self._case._assertions[self._start_assertions:]
+        failed = exc_type is not None or empty or latched or any(row["status"] != "pass" for row in assertions)
         if failed:
             self._case._failure_role = self._case._failure_role or self._role
+            self._case._failure_ref = self._case._failure_ref or self._source_ref
+            self._case._failure_title = self._case._failure_title or str(self._number)
         if exc_type is not None and isinstance(exc, Exception):
             self._case._latched_error = self._case._latched_error or (
                 exc if isinstance(exc, ScriptAbort) else ScriptAbort(str(exc), reason_code="script_failed"))
         try:
+            error = self._case._latched_error if latched else exc
             self._case._callback("script.callback", self._body(action="leave", failed=failed,
-                reason_code="check_empty" if empty else str(getattr(exc, "reason_code", "") or "")), 15)
+                status="blocked" if empty or any(row["status"] == "unknown" for row in assertions) else
+                       str(getattr(error, "status", "fail")) if failed else "pass",
+                reason_code="check_empty" if empty else str(getattr(error, "reason_code", "") or "")), 15)
             if not failed and self._source_ref:
                 self._case._covered.add(self._source_ref)
             if empty:
@@ -215,15 +223,22 @@ def _run_locked(core, payload, root: Path, *, deadline: float, stop) -> dict[str
 
 
 def _failure(exc: BaseException, case: Case | None) -> dict[str, Any]:
+    details = getattr(exc, "details", {}) if isinstance(getattr(exc, "details", {}), dict) else {}
+    explicit_started = str(details.get("execution_started") or "")
+    execution_started = explicit_started if explicit_started in {"yes", "no", "unknown"} else (
+        "yes" if case and case.touched else "no"
+    )
     return {
         "status": str(getattr(exc, "status", "") or ("cancelled" if getattr(exc, "reason_code", "") == "cancelled" else "fail")),
         "summary": str(exc)[:300],
         "error": str(exc)[:400],
         "reason_code": str(getattr(exc, "reason_code", "") or "script_failed"),
-        "touched": bool(case and case.touched),
-        "execution_started": "yes" if case and case.touched else "no",
+        "touched": execution_started != "no",
+        "execution_started": execution_started,
         "failure_stage": str((case._failure_role or case._role) if case else "admission"),
-        "resource_isolated": bool(getattr(exc, "details", {}).get("resource_isolated")),
+        "failure_source_ref": case._failure_ref if case else "",
+        "failure_title": case._failure_title if case else "",
+        "resource_isolated": bool(details.get("resource_isolated")),
         "source_coverage": case._coverage() if case else {},
     }
 
@@ -464,6 +479,8 @@ class Case:
         self._assertions: list[dict] = []
         self._latched_error: ScriptAbort | None = None
         self._failure_role = ""
+        self._failure_ref = ""
+        self._failure_title = ""
         self._covered: set[str] = set()
         sidecar = (root / payload.script_path).with_suffix(".yaml")
         from mino_scout.runtime.script_source import load_source
@@ -504,6 +521,11 @@ class Case:
         if external is not None:
             immutable["source"] = {key: value for key, value in immutable["source"].items() if key != "fetched_at"}
         self._source_hash = hashlib.sha256(json.dumps(immutable, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest() if self._source_snapshot else ""
+        from mino_scout.runtime.model_policy import ModelGate
+        try:
+            self._model_gate = ModelGate(self, root / payload.script_path)
+        except ValueError as exc:
+            raise ScriptAbort(str(exc), reason_code="model_policy_invalid", status="blocked") from None
         if self._recorder:
             from mino_scout.runtime.records import scrub
             config_doc = parse_yaml((root / "config.yaml").read_text(encoding="utf-8")) if (root / "config.yaml").is_file() else {}
@@ -513,7 +535,8 @@ class Case:
             files = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
             self._recorder.store.update_metadata(self._recorder.task_id, self._recorder.attempt_id,
                 {"source_snapshot": self._source_snapshot, "source_hash": self._source_hash, "config_snapshot": config_snapshot,
-                 "file_hashes": files, "revision": str(getattr(payload, "revision", "")), "script_path": payload.script_path})
+                 "file_hashes": files, "revision": str(getattr(payload, "revision", "")), "script_path": payload.script_path,
+                 "run_purpose": self._model_gate.run_purpose, "model_policy": self._model_gate.policy})
 
     def _coverage(self):
         return {"expected": len(self._source_clauses), "covered": sorted(self._covered),
@@ -521,7 +544,9 @@ class Case:
 
     def _assert(self, checker: str, status: str, **evidence):
         row = {"assertion_id": "assert_" + uuid.uuid4().hex, "checker": checker, "status": status,
-               "source_ref": self._source_ref, "source_hash": self._source_hash, "step_id": self._step_id, **evidence}
+               "source_ref": self._source_ref, "source_hash": self._source_hash, "step_id": self._step_id,
+               "title": str(self._step or ""), "role": self._role,
+               "assertion_kind": "page_identity" if checker == "on_page" else "business", **evidence}
         self._assertions.append(row)
         if self._recorder:
             self._recorder.append("assertion/result", row)
@@ -731,6 +756,11 @@ class App:
 
     def input(self, control: str, text: str, index: Optional[int] = None) -> ActionResult:
         params = self._locate(str(control or ""), "input", index=index)
+        if self._platform in {"mac", "win"} and params.get("ocr_observation_id"):
+            focus_ref = f"focus:{self.run_id}:{self._seq + 1}"
+            self._device("tap_element", {**params, "focus_ref": focus_ref})
+            self.screenshot(full_page=False, screenshot_params={"compress_ratio": 1.0})
+            params = {"target_mode": "current_focus", "focus_ref": focus_ref, "mode": "replace"}
         params["text"] = str(text or "")
         if self._platform == "web":
             return self._web("input", params, text=str(text or ""))
@@ -837,10 +867,20 @@ class App:
         self._begin_action("hierarchy", {})
         self.touched = True
         status, fields = self.core._hierarchy_fields(self._device_ref(), run_id=self.run_id)
-        text = _visible_text(fields)
+        from mino_scout.runtime.native_nodes import native_nodes
+        normalized = native_nodes(fields, self._platform)
+        if normalized is not None:
+            fields = {**fields, "nodes": normalized}
+        text = _visible_text({"nodes": normalized}) if normalized is not None else _visible_text(fields)
         ok = str(getattr(status, "value", status)) == "pass"
         nodes = _locator_nodes(fields)
-        data: dict[str, Any] = {"text": text[:4000]}
+        raw_nodes = normalized or []
+        contract = fields.get("observation") or (fields.get("extra") or {}).get("observation") or {}
+        data: dict[str, Any] = {"text": text[:4000], "truncated": bool(contract.get("truncated")) or
+                               len(raw_nodes) > 160 or normalized is None and len(text) > 4000 or any(
+                                   len(str(node.get(k) or "")) > 160 for node in raw_nodes if isinstance(node, dict)
+                                   for k in ("text", "content_desc", "value")),
+                               "structured": normalized is not None}
         if nodes:
             data["nodes"] = nodes
         result = ActionResult(ok=ok, summary="已读取界面结构" if ok else str(fields.get("error") or "没有读到界面结构"),
@@ -858,14 +898,41 @@ class App:
 
         return on_page(self, page_key)
 
-    def expect(self, page: str = "", prompt: str = "", verdict: str = "pass") -> str:
+    def expect(self, page: str = "", prompt: str = "", verdict: str = "pass", *, allow_model: bool = False) -> str:
         """分别验证页面身份和业务预期；文字证据不确定时取新截图判断。
 
         页面成立不能代替业务预期成立；明确失败直接终止本次断言。
         """
         from mino_scout.platform.scout.run import expect as _expect
 
-        return _expect(self, page=page, prompt=prompt, verdict=verdict)
+        return _expect(self, page=page, prompt=prompt, verdict=verdict, allow_model=allow_model)
+
+    def expect_text(self, text: str, *, control: str = "", present: bool = True, timeout_ms: int = 0,
+                    ocr: bool = False, region=None):
+        from mino_scout.runtime.deterministic import verify
+        return verify(self, "text", text, control=control, wanted=present, timeout_ms=timeout_ms, ocr=ocr, region=region)
+
+    def expect_state(self, control: str, state: str, expected: bool = True, *, timeout_ms: int = 0):
+        from mino_scout.runtime.deterministic import verify
+        return verify(self, "state", state, control=control, wanted=expected, timeout_ms=timeout_ms)
+
+    def expect_count(self, control: str, expected: int, *, timeout_ms: int = 0):
+        from mino_scout.runtime.deterministic import verify
+        return verify(self, "count", "", control=control, wanted=expected, timeout_ms=timeout_ms)
+
+    def expect_value(self, control: str, expected, *, timeout_ms: int = 0):
+        from mino_scout.runtime.deterministic import verify
+        return verify(self, "value", "", control=control, wanted=expected, timeout_ms=timeout_ms)
+
+    def wait_for(self, *, control: str = "", text: str = "", state: str = "", expected: bool = True,
+                 timeout_ms: int = 5000, ocr: bool = False, region=None):
+        from mino_scout.runtime.deterministic import verify
+        return verify(self, "state" if state else "text", state or text, control=control, wanted=expected,
+                      timeout_ms=timeout_ms, ocr=ocr, region=region)
+
+    def ocr(self, *, region=None, language: str = "", timeout_ms: int = 10000):
+        from mino_scout.platform.ocr import observe
+        return observe(self, region=region, language=language, timeout_ms=timeout_ms)
 
     def vlm(self, prompt: str, verdict: str = "") -> str:
         from mino_scout.server_comm.callbacks import vlm
@@ -891,8 +958,10 @@ class App:
         executor = self._require_channel()
         if not executor.supports(capability):
             raise ScriptAbort(f"{self._platform} 渠道不支持 {capability}", reason_code="declined")
-        self.touched = True
+        from mino_scout.runtime.execution_boundary import ui_write
         self._begin_action(capability, params)
+        if ui_write(capability):
+            self.touched = True
         event = PlanEvent(seq=self._seq, capability_id=capability, event_kind=capability, params=dict(params),
                            executor_order=[_EXECUTOR[self._platform]], selected_impl={"executor": _EXECUTOR[self._platform]})
         started = time.perf_counter()
@@ -918,9 +987,9 @@ class App:
         return action
 
     def _begin_action(self, capability: str, params: dict):
-        from mino_scout.runtime.execution_boundary import READS
+        from mino_scout.runtime.execution_boundary import ui_write
         self._seq += 1
-        writing = capability not in READS
+        writing = ui_write(capability)
         if writing:
             connection = getattr(self.core, "_record_connection", None)
             if connection is not None and not connection.is_set():
@@ -961,6 +1030,11 @@ class App:
             raise ScriptAbort("locator_missing", reason_code="locator_missing")
         selector = cell.get("selector") if isinstance(cell.get("selector"), dict) else {}
         kind = str(selector.get("kind") or "")
+        if kind == "ocr_text":
+            if index is not None:
+                raise ScriptAbort("OCR 定位必须唯一，不支持 index", reason_code="locator_ambiguous", status="blocked")
+            from mino_scout.platform.ocr import locate
+            return locate(self, selector)
         value = str(selector.get("value") or "")
         name = str(selector.get("name") or "")
         # 一个控件可以同时带多把选择器：按顺序喂给解析器，命中哪把算哪把。
@@ -1163,7 +1237,8 @@ def _anchors_match(page: dict, text: str) -> bool:
     return False
 
 
-_LOCATOR_KEYS = ("resource_id", "text", "content_desc", "class", "role", "clickable", "editable")
+_LOCATOR_KEYS = ("resource_id", "text", "content_desc", "class", "role", "clickable", "editable",
+                 "enabled", "visible", "checked", "checked_known", "selected", "focused", "value", "sensitive")
 
 def _locator_nodes(fields: dict) -> list[dict[str, Any]]:
     """界面树里写页面定位要用的字段。沿用本次 hierarchy 已经读到的节点，不另采一份。
@@ -1182,15 +1257,21 @@ def _locator_nodes(fields: dict) -> list[dict[str, Any]]:
             continue
         row: dict[str, Any] = {}
         for key in _LOCATOR_KEYS:
+            if key == "value" and (node.get("sensitive") or node.get("secret_value")):
+                continue
             value = node.get(key)
-            if isinstance(value, bool):
+            if key == "value" and isinstance(value, str):
+                row[key] = value[:160]
+            elif isinstance(value, bool):
                 row[key] = value
             elif isinstance(value, str) and value.strip():
                 row[key] = value.strip()[:160]
+            elif key == "value" and type(value) in {int, float}:
+                row[key] = value
         bounds = node.get("bounds")
         if isinstance(bounds, (list, tuple)) and len(bounds) == 4 and all(isinstance(n, (int, float)) for n in bounds):
             row["bounds"] = [int(n) for n in bounds]
-        labeled = bool(row.get("resource_id") or row.get("text") or row.get("content_desc"))
+        labeled = bool(row.get("resource_id") or row.get("text") or row.get("content_desc") or row.get("class"))
         if labeled or row.get("clickable") or row.get("editable"):
             nodes.append(row)
         if len(nodes) >= 160:

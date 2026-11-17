@@ -269,6 +269,9 @@ class ScriptRun:
 SCRIPT_RUN_CAPABILITY = "script.run"
 SCRIPT_SUBMIT_CAPABILITY = "script.submit"
 RECORD_API_VERSION = 1
+RECORD_RESOURCE_STATUS_CAPABILITY = "record.resource_status"
+RECORD_RESOURCE_STOP_CONTRACT = "script_resource_stop.v1"
+RECORD_REPORT_VERSION = 1  # Optional bounded business projection in record.sync.
 SCRIPT_RUN_FIELDS = ("run_id", "session_id", "case_id", "sn", "platform", "repo_url", "branch", "revision", "script_path",
                      "task_id", "attempt_id", "owner_user_id", "execution_timeout_sec")
 _SCRIPT_RUN_FIELDS = SCRIPT_RUN_FIELDS

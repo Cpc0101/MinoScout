@@ -1160,6 +1160,8 @@ REGISTER / HEARTBEAT 增加 `record_api_version`（缺省 0；支持此节的节
 
 摘要字段：task_id、run_id、session_id、attempt_id、case_id、owner_user_id、node_id、sn、platform、revision、script_path、state、status、summary、reason_code、failure_stage、elapsed_ms、execution_started、started_at、finished_at、summary_version、last_event_seq、sealed、detail_availability、assertions，可带 source_coverage/source_hash。state 为 accepted/running/completed/interrupted/cancel_requested；status 保留 queued/running/pass/fail/blocked/declined/skipped/cancelled。
 
+assertions 的规范计数为 total/pass/fail/unknown；接收端兼容旧 assertions/passed/failed/inconclusive，不能过滤掉规范计数。摘要可带 test_report（version=1）：run_purpose=authoring|verification|regression、按原文预期聚合的 counts(total/pass/fail/unknown/not_run)、有界 items(source_ref/title/status/expected/actual/checker/event_seq/artifact_id/reason_code/attribution)、items_truncated、总归因与 reason_code、可选 failure(source_ref/title/actual/event_seq)、model_usage(calls/llm_calls/vlm_calls/elapsed_ms/total_tokens/usage_complete)。缺 token 用量为 null；断言数量不等于预期或用例数量。suspected_product 只表示业务差异待归因。索引最多 100 项，Scout 当前最多展开 50 项；完整事件仍在执行节点。没有该字段的历史记录保留原有读取，不凭已加载的一页推断完整结论。
+
 ### 摘要确认与恢复
 
 Scout 通过新的 EXECUTE `record.sync` 发送摘要（params 直接为摘要）。Nexus 校验已持久化的任务/attempt/节点/用户归属，持久更新后返回 data `{attempt_id, ack_version}`。summary_version 单调递增，旧版本不能覆盖新版本，终态之后仍接受合法补报。执行终态和待补报消息在本地同一事务落盘；Scout 重连使用新信封补报，不能把旧连接 RESULT 直接重放。ACK 仅表示索引已保存，不表示明细已备份上云。
@@ -1177,8 +1179,11 @@ Scout 通过新的 EXECUTE `record.sync` 发送摘要（params 直接为摘要�
 | record.events | after_seq=0、limit=100（最多200）、max_bytes=524288（最多1048576） | items、next_seq、high_watermark、has_more、sealed、record_source=scout |
 | record.artifact | artifact_id、offset=0、length=262144（最多524288） | artifact_id、mime_type、total_size、offset、bytes_read、eof、data_base64、sha256 |
 | record.cancel | — | 持久取消请求后的摘要；仅 worker 停止后算 cancelled |
+| record.resource_status | — | 原始封存摘要及最新 resource_stop 停止证明；只读，不改原结论 |
 
 事件为 `{seq, ts, type, payload}`；seq 在单次执行内单调递增。类型沿用 node/enter、node/leave、tool/call、tool/result、script/note，增加 assertion/result。payload 保留 source_ref/source_hash/step_id/app/capability_id/status/reason_code/observation_id/artifact_id 等关联字段。大结构或图片按 artifact 引用；敏感输入不写归档。artifact 是有界范围读取，每次响应是完整 JSON，并非传输分片。
+
+model/call 与 model/result 是诊断事件，记录 request_id/kind/purpose/run_purpose/source_ref/step_id/reason、预算与 elapsed_ms/status/reason_code、服务返回 usage 及 usage_reported；不保存模型密钥、请求原图或秘密输入。模型调用经 Scout 当前用例的字面量 MODEL_POLICY，缺省关闭；仅声明了当前原文引用、用途、理由、次数及总耗时预算的请求可发出。OCR 作为显式本地观察/选择器记录 tool/result，不隐式切换到模型。node/leave 保留 failed 并显式给 status，已失败断言不能被后续成功覆盖。
 
 错误码：record_not_found、artifact_not_found、artifact_expired、record_owner_mismatch、record_unavailable。网关将节点离线转为 evidence_temporarily_unavailable；不能用空数组伪装成功。删除记录保留过期标记；未完成、未同步或结果未知的记录不被普通清理删除。
 
@@ -1198,3 +1203,14 @@ Scout 通过新的 EXECUTE `record.sync` 发送摘要（params 直接为摘要�
 account(requirements=None, prefer=None) 通过原 script.callback op=account 明确传递 requirements。all/prefer 采用 `[{facet, op, value}]`；无参保留既有服务器用例条件。环境、归属、健康与占用仍校验；动态业务标签用于排序，不作为当前状态证明。未知前置保留待验证，不把 prep 标题当作事实或租号参数。
 
 执行摘要的 `resource_isolated` 是布尔值：取消确认只证明 worker 已停止；若最后设备动作结果不明，仍为 true，Nexus 必须保留设备和账号隔离。`started_at` / `finished_at` 使用 ISO 8601 UTC。
+
+
+### Web 资源结算与显式恢复（2026-11-17）
+
+摘要可带 `execution_stopped`、`browser_closed`（bool）及 `scout_process_generation`。Scout 只在执行子进程退出后封存终态，浏览器清理失败或无法核实停止保持隔离。`wait_screen_ready` 是只读操作，其超时带明确 `execution_started=no`；定位、可见性、启用与 trial 检查失败不代表已发出点击。实际写入发出后的异常仍为 unknown。终态的结论和已保存的执行边界/清理事实不可改写。
+
+`record.resource_status` 的 `resource_stop` 合同为 `script_resource_stop.v1`，包含 stop_confirmed、worker_active、browser_closed、mode、scout_process_generation、process_started_at、reason_code。同进程要求原 attempt 的进程代际匹配、执行已退出、浏览器已关闭、记录封存且无活动 worker。历史退役要求当前单实例锁、进程启动晚于完成至少 120 秒、安装目录不存在外来运行时进程；源码模式或事实不明不确认。该证明不验证历史写入的业务结果。
+
+任务 owner 可调用 `POST /case-runner/tasks/{task_id}/resources/reconcile` 显式核验已结束 Web 任务。Nexus 经原认证节点获取每个已接单 attempt 的新证明，核对身份、摘要版本和当前租约代次；同一事务保存 resource_resolution 并释放设备槽位、账号租约与准入。Python 对应释放 execution resource、device lease、reservation 和账号租约。重复调用幂等；迟到摘要不会重隔离已恢复任务，也不会释放新持有者。实体设备仍需应用基线恢复。原始 Scout 结论、reason_code 和 execution_started 保留。
+
+正常结束从持久封存结果原子结算；后台补偿处理中断在索引/任务投影/释放之间的故障。明确从未派发的终态用例无需 Scout 停止证据；已派发但结果未知不能按取消、超时、节点重启或 TTL 自动释放。device_list 提供 active_run_count、running_run_count、isolated_run_count、Web 的 web_parallel_max 和 blocking_tasks；占满且有隔离时 blocking_code=isolation。
