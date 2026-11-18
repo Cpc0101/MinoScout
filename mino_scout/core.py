@@ -155,7 +155,7 @@ class ScoutCore:
     # ---------------- EXECUTE（唯一 dispatch） ----------------
 
     def execute(self, req: P.Execute) -> EventResult:
-        if req.capability_id == "script.submit" or req.capability_id.startswith("record."):
+        if req.capability_id == "script.submit" or req.capability_id.startswith(("record.", "debug.")):
             from mino_scout.server_comm.script_records import dispatch
             return dispatch(self, req)
         # Management messages have no product mode. Bound device execution does.

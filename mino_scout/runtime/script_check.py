@@ -19,7 +19,7 @@ _REUSE = {
     "openai": "use case.scout.llm() / app.vlm() for model calls",
     "anthropic": "use case.scout.llm() / app.vlm() for model calls",
 }
-_CASE_ATTRS = {"config", "env", "app_id", "app_key", "init", "scout", "nexus", "data"}
+_CASE_ATTRS = {"config", "env", "app_id", "app_key", "init", "scout", "nexus", "data", "workspace", "output_dir"}
 _STEP_CALLS = {"prep", "do", "check"}
 _EMPTY_PREP = {"无", "无前置", "无需前置", "不需要", "不需要前置", "无操作", "none", "n/a", "na"}
 _SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules"}

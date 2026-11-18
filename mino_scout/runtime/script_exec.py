@@ -111,7 +111,7 @@ class _Scope:
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         latched = self._case._latched_error is not self._start_error
-        empty = exc_type is None and not latched and self._role == "check" and len(self._case._assertions) == self._start_assertions
+        empty = not self._case._debug and exc_type is None and not latched and self._role == "check" and len(self._case._assertions) == self._start_assertions
         assertions = self._case._assertions[self._start_assertions:]
         failed = exc_type is not None or empty or latched or any(row["status"] != "pass" for row in assertions)
         if failed:
@@ -212,6 +212,19 @@ def run(core, payload, root: Path, *, deadline: float, stop) -> dict[str, Any]:
 def _run_locked(core, payload, root: Path, *, deadline: float, stop) -> dict[str, Any]:
     case = None
     try:
+        origin = getattr(payload, "debug_origin", {})
+        if origin:
+            from mino_scout.runtime.workspaces import source_snapshot
+            _, hashes, digest = source_snapshot(root)
+            matched = (payload.script_path == origin["script_path"] and digest == origin["workspace_hash"]
+                       and hashes.get(payload.script_path) == origin["script_hash"])
+            recorder = getattr(core, "_recording", None)
+            if recorder:
+                recorder.append("debug/origin", {**origin, "revision": payload.revision, "matched": matched, "actual_workspace_hash": digest})
+                recorder.store.update_metadata(recorder.task_id, recorder.attempt_id,
+                    {"debug_origin": origin, "debug_origin_matched": matched})
+            if not matched:
+                raise ScriptAbort("正式源码与已验证调试版本不一致", reason_code="debug_version_mismatch", status="blocked")
         if str(payload.platform) == "web":
             from mino_scout.platform.web.playwright_hub import get_hub
             get_hub().note_lane(str(payload.run_id or ""))
@@ -250,7 +263,7 @@ def _failure(exc: BaseException, case: Case | None) -> dict[str, Any]:
         "reason_code": str(getattr(exc, "reason_code", "") or "script_failed"),
         "touched": execution_started != "no",
         "execution_started": execution_started,
-        "failure_stage": str((case._failure_role or case._role) if case else "admission"),
+        "failure_stage": str(details.get("phase") or ((case._failure_role or case._role) if case else "admission")),
         "failure_source_ref": case._failure_ref if case else "",
         "failure_title": case._failure_title if case else "",
         "resource_isolated": bool(details.get("resource_isolated")),
@@ -485,8 +498,12 @@ class _Nexus:
 class Case:
     """一次运行的共享上下文。设备动作在 case.init(...) 返回的 App 上。"""
 
-    def __init__(self, core, payload, root: Path, *, deadline: float, stop):
+    def __init__(self, core, payload, root: Path, *, deadline: float, stop, debug_source: str | None = None):
         self.core = core
+        self.workspace = root
+        self.output_dir = Path.cwd()
+        self._debug = debug_source is not None
+        self._debug_write_error = None
         self.run_id = str(payload.run_id)
         self.session_id = str(payload.session_id)
         self._source_context = dict(getattr(payload, "source_context", {}) or {})
@@ -525,13 +542,13 @@ class Case:
         from mino_scout.runtime.script_source import load_source
         self._guard()
         try:
-            external = load_source(root / payload.script_path, core.node_id)
+            external = None if self._debug else load_source(root / payload.script_path, core.node_id)
         except ValueError as exc:
             raise ScriptAbort(str(exc), reason_code="source_read_failed", status="blocked") from None
         except Exception:
             raise ScriptAbort("用例来源读取失败，请检查来源配置、飞书授权及访问权限", reason_code="source_read_failed", status="blocked") from None
         self._guard()
-        self._source_snapshot = external if external is not None else parse_yaml(sidecar.read_text(encoding="utf-8")) if sidecar.is_file() else {}
+        self._source_snapshot = {} if self._debug else external if external is not None else parse_yaml(sidecar.read_text(encoding="utf-8")) if sidecar.is_file() else {}
         if not isinstance(self._source_snapshot, dict):
             raise ScriptAbort("用例原文快照不是对象", reason_code="source_invalid", status="blocked")
         if self._source_snapshot:
@@ -562,7 +579,7 @@ class Case:
         self._source_hash = hashlib.sha256(json.dumps(immutable, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest() if self._source_snapshot else ""
         from mino_scout.runtime.model_policy import ModelGate
         try:
-            self._model_gate = ModelGate(self, root / payload.script_path)
+            self._model_gate = ModelGate(self, root / payload.script_path, source=debug_source)
         except ValueError as exc:
             raise ScriptAbort(str(exc), reason_code="model_policy_invalid", status="blocked") from None
         if self._recorder:
@@ -570,8 +587,8 @@ class Case:
             config_doc = parse_yaml((root / "config.yaml").read_text(encoding="utf-8")) if (root / "config.yaml").is_file() else {}
             # Register OTP/password values before any free text is persisted.
             config_snapshot = scrub(config_doc)
-            paths = [p for p in root.rglob("*") if p.is_file() and not p.is_symlink() and p.suffix in {".py", ".yaml", ".yml"}]
-            files = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
+            from mino_scout.runtime.workspaces import source_snapshot
+            _, files, _ = source_snapshot(root)
             self._recorder.store.update_metadata(self._recorder.task_id, self._recorder.attempt_id,
                 {"source_snapshot": self._source_snapshot, "source_hash": self._source_hash, "config_snapshot": config_snapshot,
                  "file_hashes": files, "revision": str(getattr(payload, "revision", "")), "script_path": payload.script_path,
@@ -608,7 +625,7 @@ class Case:
     def __getattr__(self, name: str):
         if name.startswith("_"):
             raise AttributeError(name)
-        raise _unknown("case", name, ["config", "env", "app_id", "app_key", "init", "scout", "nexus", "data"],
+        raise _unknown("case", name, ["config", "env", "app_id", "app_key", "init", "scout", "nexus", "data", "workspace", "output_dir"],
                        "。设备动作写在 app = case.init(case.config.<KEY>) 返回的 app 上")
 
     def init(self, ref: AppRef, *, web_resolution: str = "") -> "App":
@@ -1016,8 +1033,11 @@ class App:
                     raise ScriptAbort("动态对象有多个候选" if nodes else "动态对象未找到", reason_code="locator_ambiguous" if nodes else "locator_missing", status="blocked")
             return params
         except ScriptAbort as exc:
-            if exc.reason_code in {"locator_missing", "control_unknown"}:
-                self._report(kind, ActionResult(ok=False, summary=exc.reason_code, status="fail"), "script", 0)
+            exc.details.update(phase="locator", action_execution_started="no")
+            if self._case._recorder:
+                self._case._recorder.append("locator/result", {"status": "fail", "phase": "locator", "execution_started": "no",
+                    "control": control, "capability_id": kind, "reason_code": exc.reason_code, "summary": str(exc),
+                    "app": self.key, "action_seq": self._seq + 1, "details": exc.details})
             raise
 
     def _device(self, capability: str, params: dict[str, Any], extra: dict[str, Any] | None = None) -> ActionResult:
@@ -1048,7 +1068,8 @@ class App:
             control = raw.get("execution_control") if isinstance(raw.get("execution_control"), dict) else {}
             reason = str(execution.get("reason_code") or raw.get("reason_code") or raw.get("error_kind") or "action_failed")
             error = ScriptAbort(action.summary or "设备动作失败", reason_code=reason,
-                                status=status if status in {"fail", "blocked", "declined", "skipped"} else "fail", details=control)
+                                status=status if status in {"fail", "blocked", "declined", "skipped"} else "fail",
+                                details={**control, "phase": "device", "execution_started": execution.get("execution_started", "unknown")})
             self._case._latched_error = self._case._latched_error or error
             raise error
         return action
@@ -1061,6 +1082,8 @@ class App:
             connection = getattr(self.core, "_record_connection", None)
             if connection is not None and not connection.is_set():
                 raise ScriptAbort("节点已断线，暂停新增设备写操作", reason_code="node_disconnected", status="blocked")
+            if self._case._debug_write_error:
+                raise self._case._debug_write_error
             if self._case._latched_error:
                 raise self._case._latched_error
             self._shot = None
@@ -1142,8 +1165,8 @@ class App:
             elif self._platform == "win":
                 from mino_scout.platform.win.script import locator_params
                 params = locator_params(selector)
-        except ValueError:
-            raise ScriptAbort("locator_missing", reason_code="locator_missing") from None
+        except ValueError as exc:
+            raise ScriptAbort("定位参数解析失败", reason_code="locator_invalid", details={"parser_error": str(exc)}) from None
         if not params:
             raise ScriptAbort("locator_missing", reason_code="locator_missing")
         if cell.get("require_unique"):

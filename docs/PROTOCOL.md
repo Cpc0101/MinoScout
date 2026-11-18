@@ -1242,3 +1242,39 @@ account(requirements=None, prefer=None, data_need=None, data_requirements=None) 
 记录摘要可带 run_purpose；脚本用途读取前为 unclassified，prepare 任务的报告用途为 preparation。接收端核对 report.context 与当前摘要身份、用途、event_seq 水位和断言计数。pass 不得含失败/未知断言、未执行预期或缺失来源覆盖。封存的报告、来源、断言、水位、时间不得被高版本改写；重复/旧版本只 ACK。
 
 started_at/finished_at 来自 Scout 实际执行，带时区，缺失保留 null。execution_started 仍是设备写回执，不能替代脚本执行事实。elapsed_ms 保留毫秒精度；任务收口和状态同步时间不能补作执行时间。任务 API 提供 statistics 分组与 timing，定义见 Nexus《执行统计与报告口径》。
+
+### 本机编写调试与执行工作区（2026-11-18）
+
+正式 `case_run` 与本机 `debug_case` 共用持久准入、租约、执行 API 和 record.* 证据。调试不拉仓、不把每段包装成独立正式任务。首期仅支持本机编写、本机调试：调用方通过本机 CLI 核对 node_id，Nexus 要求显式 node_id 与设备归属一致；远端节点仅用于正式执行。
+
+`ScriptRun` 增加 `execution_kind`（case/debug，缺省 case）与 `workspace`。case 禁止传 workspace；debug 必须传本机已有编写目录的绝对路径，repo_url/branch/revision 必须为空。script.submit 仍先持久接单，再启动独立进程；debug worker 持有应用与 Python 上下文，片段结束不封存会话。execution_timeout_sec 不作为调试会话总期限，每段 timeout_sec 默认 60、范围 1–3600 秒。
+
+| MCP | HTTP | Scout RPC |
+|---|---|---|
+| debug_case | POST /case-runner/debug | debug.prepare，随后 script.submit |
+| debug_case_execute | POST /case-runner/debug/{session_id}/execute | debug.execute |
+| debug_case_status | POST /case-runner/debug/{session_id}/status | debug.status |
+| debug_case_cancel | POST /case-runner/debug/{session_id}/cancel | debug.cancel |
+| debug_case_reset | POST /case-runner/debug/{session_id}/reset | debug.reset |
+| debug_case_close | POST /case-runner/debug/{session_id}/close | record.cancel |
+
+启动必填 app_id、app_key、sn、node_id、workspace、client_request_id，可选 project_id/env_profile/env_surface。环境在建任务前校验。debug.prepare 只读核验工作区与应用配置，带 owner_user_id，返回 debug_api_version=1、workspace_hash 与文件数量。后续 debug.* 使用与 record.* 相同的 task/session/attempt/owner 核验。
+
+execute 必填请求 ID，code/script_path 二选一；支持直接使用 case/app 或定义 run(case)。可以传 workspace_hash 拒绝意外变化。请求在原 task 的 records.sqlite3 持久化，相同 ID 与参数返回原记录，不重复执行；不同参数拒绝。同一会话同时只允许一个在途片段。status 可按 client_request_id 查记录。cancel 取消指定片段；可协作停止时保留现场。reset 显式关闭并启动绑定应用、清除片段变量，保留租约与证据，不清缓存。close 持久记录结束意图，Scout 确认停止后才释放。
+
+每段捕获 pages 和本地 Python 源字节，重新载入模块，刷新已导入函数；旧模块实例需重建。config 改动要求重建会话。项目/用例 pretest/posttest 不自动运行。`debug/queued`、`debug/started`、`debug/finished` 与 tool/call、tool/result、assertion/result 共用事件序列；started 记录 workspace_hash、文件哈希、code_hash、request_id、动作范围。片段 observed 仅说明完成，assertions_passed 只证明本段实际断言；调试固定归 authoring，不进入正式通过率。
+
+普通错误结束片段，保留会话。write_outcome_unknown 后保持 write_stopped，允许读证据，拒绝写和 reset。断线拒绝新增写；重启或强杀不构成释放证明。结束由原 worker 停止确认，Web 同时确认浏览器关闭；未知时仍隔离。
+
+编写工作区由本机 Agent 编辑，不会被拉仓覆盖。新的执行工作区在 `<Scout配置目录>/accounts/<profile>/workspaces/execution/<task_id>/`，包含 records.sqlite3、artifacts/<attempt_id>、attempts/<attempt_id>/source（正式 Git 副本）和 output（进程工作目录）。正式副本结束后保留；调试直接使用编写目录，其生成文件仍写本任务 output。`case.workspace` 指向源码，`case.output_dir` 指向生成数据；实际路径由 session_record 返回。旧 accounts/<profile>/records 继续兼容读取。
+
+
+#### 检查点、阶段进度与正式版本关联
+
+`debug_case_checkpoint` 对应 POST `/case-runner/debug/{session_id}/checkpoint` 与 Scout `debug.checkpoint`。参数是 client_request_id、script_path、stage（draft/implemented/path_validated），可选 workspace_hash、evidence_request_id、timeout_sec；以片段队列串行保存检查点，不执行设备动作。draft 登记用例路径和版本；implemented 对捕获源码运行现有静态检查，必须有直接业务编排、原文绑定和 check，不能把仅 abort 的文件算完整；path_validated 还要求 evidence_request_id 指向同一 session、路径和 workspace_hash 的成功脚本执行，包含动作和有效断言且没有未知写。检查点 immutable，修改后用新请求 ID。
+
+`debug_case_status.authoring_progress` 按用例路径返回最新检查点、draft/implemented/path_validated 累计阶段数量及 stale 数量；以最近捕获的工作区版本比较，尚未再次读取的编辑不冒充已验证。formal_runs 单独返回同 owner、关联该 session 的正式任务及真实统计，最多展示最近 200 项并返回 total/truncated。Agent 调查预算仍使用 agent_workflow；检查点不是调查预算或正式通过率。
+
+正式 `case_run` 可传 `debug_origin: {session_id, checkpoint_id}`，同时要求固定完整 40 位 commit SHA、同应用/环境和相同用例路径，调试会话已确认停止且未隔离。Nexus 从原 Scout 读取 path_validated 检查点，不信任客户端自填哈希；目标 Scout 必须声明 `debug.capabilities.formal_origin_verification=true`。ScriptRun.debug_origin 固化 session_id/checkpoint_id/script_path/workspace_hash/script_hash/stage；正式执行在任何设备动作前比较检出内容，差异以 blocked/debug_version_mismatch 结束。debug/origin 事件及 debug_origin_matched 摘要保存核对结果；版本一致本身不等于正式通过。当前一次引用对应一个用例，可在多个设备独立正式执行。
+
+定位失败写 `locator/result`，保存 control、app、原因、解析异常、phase=locator 与该动作 execution_started=no；设备结果保留 device 阶段与明确回执。片段记录 snapshot/load_code/static_check/execution/device/locator 阶段；动作未执行不能抹掉同一用例之前已发生的操作。

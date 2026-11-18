@@ -59,9 +59,11 @@ def declarations(tree):
 
 
 class ModelGate:
-    def __init__(self, case, path):
+    def __init__(self, case, path, *, source=None):
         self.case = case
-        self.run_purpose, self.policy = declarations(ast.parse(path.read_text(encoding="utf-8")))
+        self.run_purpose, self.policy = declarations(ast.parse(path.read_text(encoding="utf-8") if source is None else source))
+        if source is not None:
+            self.run_purpose = "authoring"
         self.calls, self.elapsed_ms = 0, 0
         self.by_rule = {}
 

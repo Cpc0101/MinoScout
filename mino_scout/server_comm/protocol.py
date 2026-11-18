@@ -264,8 +264,11 @@ class ScriptRun:
     attempt_id: str = ""
     owner_user_id: str = ""
     execution_timeout_sec: float = 600.0
+    execution_kind: str = "case"
+    workspace: str = ""
     inputs: dict[str, Any] = field(default_factory=dict)
     source_context: dict[str, Any] = field(default_factory=dict)
+    debug_origin: dict[str, Any] = field(default_factory=dict)
 
 
 SCRIPT_RUN_CAPABILITY = "script.run"
@@ -275,7 +278,7 @@ RECORD_RESOURCE_STATUS_CAPABILITY = "record.resource_status"
 RECORD_RESOURCE_STOP_CONTRACT = "script_resource_stop.v1"
 RECORD_REPORT_VERSION = 1  # Optional bounded business projection in record.sync.
 SCRIPT_RUN_FIELDS = ("run_id", "session_id", "case_id", "sn", "platform", "repo_url", "branch", "revision", "script_path",
-                     "task_id", "attempt_id", "owner_user_id", "execution_timeout_sec", "inputs", "source_context")
+                     "task_id", "attempt_id", "owner_user_id", "execution_timeout_sec", "inputs", "source_context", "execution_kind", "workspace", "debug_origin")
 _SCRIPT_RUN_FIELDS = SCRIPT_RUN_FIELDS
 
 
@@ -363,7 +366,15 @@ def load_script_run(raw: dict[str, Any]) -> ScriptRun:
     from urllib.parse import urlsplit
     import math
 
-    for key in ("run_id", "session_id", "case_id", "sn", "platform", "repo_url"):
+    if body.execution_kind not in {"case", "debug"}:
+        raise ValueError("execution_kind_invalid")
+    if not isinstance(body.workspace, str) or len(body.workspace) > 4096 or any(ord(c) < 32 for c in body.workspace):
+        raise ValueError("workspace_invalid")
+    if body.execution_kind == "debug" and (not body.workspace or body.repo_url or body.branch or body.revision):
+        raise ValueError("debug_workspace_required")
+    if body.execution_kind == "case" and body.workspace:
+        raise ValueError("formal_workspace_managed")
+    for key in ("run_id", "session_id", "case_id", "sn", "platform") + (("repo_url",) if body.execution_kind == "case" else ()):
         value = getattr(body, key)
         if not isinstance(value, str) or not value.strip() or any(ord(c) < 32 for c in value):
             raise ValueError("script_run_incomplete")
@@ -395,7 +406,21 @@ def load_script_run(raw: dict[str, Any]) -> ScriptRun:
     body.execution_timeout_sec = budget
     body.inputs = validate_runtime_data(body.inputs)
     body.source_context = validate_source_context(body.source_context)
+    body.debug_origin = validate_debug_origin(body.debug_origin)
     return body
+
+
+def validate_debug_origin(value: Any) -> dict[str, Any]:
+    import re
+    if value == {} or value is None:
+        return {}
+    if not isinstance(value, dict) or set(value) != {"session_id", "checkpoint_id", "script_path", "workspace_hash", "script_hash", "stage"}:
+        raise ValueError("debug_origin_invalid")
+    if any(not isinstance(v, str) or not v or len(v) > 4096 or any(ord(c) < 32 for c in v) for v in value.values()):
+        raise ValueError("debug_origin_invalid")
+    if value["stage"] != "path_validated" or any(not re.fullmatch(r"[0-9a-f]{64}", value[k]) for k in ("workspace_hash", "script_hash")):
+        raise ValueError("debug_origin_unverified")
+    return dict(value)
 
 
 PAYLOAD_BY_TYPE: dict[MsgType, type] = {
@@ -435,7 +460,7 @@ def _encode(value: Any) -> Any:
         out = {}
         for f in fields(value):
             raw = getattr(value, f.name)
-            if f.name in ("data", "inputs", "source_context") and not raw:
+            if f.name in ("data", "inputs", "source_context", "debug_origin") and not raw:
                 continue
             if f.name in ("device_id", "platform", "node_id", "node_token") and not raw and not (isinstance(value, Register) and f.name == "platform"):
                 continue

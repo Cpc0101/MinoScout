@@ -29,8 +29,8 @@ class RepoError(ValueError):
         super().__init__(message)
 
 
-def checkout(repo_url: str, branch: str = "", revision: str = "") -> tuple[Path, str]:
-    """返回（副本目录, 实际提交）。revision 为空取分支最新；调用方用完删除目录。"""
+def checkout(repo_url: str, branch: str = "", revision: str = "", *, destination: Path | None = None) -> tuple[Path, str]:
+    """返回（副本目录, 实际提交）。revision 为空取分支最新；目录保留策略由调用方决定。"""
     url = str(repo_url or "").strip()
     if not url or url.startswith("-"):
         raise RepoError("script_repo_missing", "没有脚本仓库地址")
@@ -44,7 +44,9 @@ def checkout(repo_url: str, branch: str = "", revision: str = "") -> tuple[Path,
         _sync(url, cache)
         sha = _resolve(cache, branch, revision)
         data = _archive(cache, sha)
-    root = Path(tempfile.mkdtemp(prefix="mino-script-"))
+    root = Path(destination) if destination is not None else Path(tempfile.mkdtemp(prefix="mino-script-"))
+    if destination is not None:
+        root.mkdir(parents=True, exist_ok=False, mode=0o700)
     try:
         _extract(data, root)
     except Exception:

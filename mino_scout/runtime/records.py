@@ -75,16 +75,26 @@ def _timestamp(value):
 
 
 class RecordStore:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, legacy_root: Path | None = None):
+        self.legacy_root = Path(legacy_root).resolve() if legacy_root else None
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     def _folder(self, task_id: str) -> Path:
         # Keep wire ids opaque; ':' in legacy session/task ids is not a Windows path character.
         folder = self.root / quote(identifier(task_id), safe="-_.")
+        if not folder.exists() and self.legacy_root is not None:
+            legacy = self.legacy_root / folder.name
+            if (legacy / "records.sqlite3").is_file():
+                folder = legacy
         if folder.is_symlink():
             raise ValueError("record_path_invalid")
         return folder
+
+    def _folders(self):
+        folders = {p.name: p for p in self.legacy_root.iterdir()} if self.legacy_root and self.legacy_root.is_dir() else {}
+        folders.update({p.name: p for p in self.root.iterdir()})
+        return sorted(folders.values(), key=lambda p: unquote(p.name))
 
     def _db(self, task_id: str, *, create: bool = False):
         folder = self._folder(task_id)
@@ -122,6 +132,17 @@ class RecordStore:
                 );
             ''')
         return db
+
+    def existing(self, task_id: str, attempt_id: str, payload_hash: str):
+        """Return a durable receipt before revalidating mutable external inputs."""
+        try:
+            with self._db(task_id) as db:
+                row = self._row(db, attempt_id)
+                if row["payload_hash"] != payload_hash:
+                    raise ValueError("attempt_parameters_conflict")
+                return self._summary(db, task_id, row)
+        except FileNotFoundError:
+            return None
 
     def create(self, task_id: str, attempt_id: str, metadata: dict, payload_hash: str) -> tuple[dict, bool]:
         identifier(attempt_id)
@@ -173,6 +194,7 @@ class RecordStore:
                 "detail_availability": "available", "failure_stage": meta.get("failure_stage", ""),
                 "elapsed_ms": int(max(0, (row["finished_at"] or time.time()) - row["started_at"]) * 1000) if row["started_at"] else 0,
                 "run_purpose": meta.get("run_purpose", "unclassified"),
+                **{k: meta[k] for k in ("execution_kind", "workspace", "execution_workspace", "source_workspace", "output_workspace", "debug_state", "debug_last_command", "workspace_hash", "debug_origin", "debug_origin_matched") if k in meta},
                 "execution_started": meta.get("execution_started", "no"),
                 **{key: meta[key] for key in ("execution_stopped", "browser_closed", "scout_process_generation") if key in meta},
                 "data_outputs": meta.get("data_outputs", {}), "data_missing": meta.get("data_missing", []),
@@ -361,7 +383,7 @@ class RecordStore:
         limit = max(1, int(limit))
         items, wrapped = [], []
         cursor = tuple(after) if after else None
-        for folder in sorted(self.root.iterdir(), key=lambda item: unquote(item.name)):
+        for folder in self._folders():
             task_id = unquote(folder.name)
             if not folder.is_dir() or folder.is_symlink() or not _ID.fullmatch(task_id):
                 continue
@@ -390,7 +412,7 @@ class RecordStore:
             db.execute("DELETE FROM outbox WHERE attempt_id=? AND version<=?", (attempt_id, version))
 
     def recover(self):
-        for folder in self.root.iterdir():
+        for folder in self._folders():
             task_id = unquote(folder.name)
             if not folder.is_dir() or folder.is_symlink() or not _ID.fullmatch(task_id) or not (folder / "records.sqlite3").is_file():
                 continue
@@ -408,8 +430,16 @@ class RecordStore:
                         active.add(key)
                     elif row["type"] == "tool/result":
                         active.discard(key)
+                debug = self.metadata(task_id, attempt_id).get("execution_kind") == "debug"
+                if debug:
+                    from mino_scout.runtime import debug_commands
+                    command = debug_commands.current(self, task_id, attempt_id)
+                    if command and command["state"] in {"queued", "running"}:
+                        debug_commands.finish(self, task_id, attempt_id, command["request_id"], {"status": "interrupted", "reason_code": "scout_restarted"})
+                    self.update_metadata(task_id, attempt_id, {"debug_state": "interrupted"})
                 self.finish(task_id, attempt_id, {"status": "interrupted", "reason_code": "scout_restarted",
-                    "summary": "Scout 已重启，未自动重放；最后动作需核验", "resource_isolated": bool(active)})
+                    "summary": "Scout 已重启，未自动重放；最后动作需核验", "resource_isolated": debug or bool(active),
+                    **({"execution_started": "unknown", "execution_stopped": False} if debug else {})})
 
 
 class Recorder:

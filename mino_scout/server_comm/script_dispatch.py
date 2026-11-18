@@ -76,7 +76,7 @@ def _payload(req: P.Execute) -> P.ScriptRun:
         payload = P.load_script_run(raw)
     except ValueError as exc:
         raise ValueError("脚本运行载荷无效") from exc
-    for name in ("run_id", "session_id", "case_id", "sn", "repo_url"):
+    for name in ("run_id", "session_id", "case_id", "sn") + (("repo_url",) if payload.execution_kind == "case" else ()):
         if not str(getattr(payload, name) or "").strip():
             raise ValueError("脚本运行载荷无效")
     try:

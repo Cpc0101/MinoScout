@@ -31,7 +31,8 @@ def bind(core, owner: str, origin: str):
     if old:
         old.close()
     from mino_scout.config import config_dir
-    manager = ScriptRecords(core, RecordStore(config_dir() / "accounts" / profile / "records"), owner, profile)
+    manager = ScriptRecords(core, RecordStore(config_dir() / "accounts" / profile / "workspaces" / "execution",
+        legacy_root=config_dir() / "accounts" / profile / "records"), owner, profile)
     core._script_records = manager
     return manager
 
@@ -47,7 +48,7 @@ def dispatch(core, req):
         data = manager.submit(req) if req.capability_id == "script.submit" else manager.read(req.capability_id, dict(req.params or {}))
         return make_event_result(event, status=EventStatus.PASS, executor_used="scout", started_at=now_iso(), elapsed_ms=0,
                                  summary=str(data.get("summary") or data.get("state") or "ok"), raw_response=data)
-    except (OSError, ValueError, PermissionError) as exc:
+    except (OSError, ValueError, PermissionError, SyntaxError) as exc:
         code = str(exc)
         if isinstance(exc, FileNotFoundError):
             code = "artifact_not_found" if req.capability_id == "record.artifact" else "record_not_found"
@@ -116,12 +117,36 @@ class ScriptRecords:
 
     def read(self, capability, params):
         self._owner(params.get("owner_user_id"))
+        if capability == "debug.capabilities":
+            return {"debug_api_version": 1, "checkpoint_api_version": 1, "formal_origin_verification": True}
+        if capability == "debug.prepare":
+            return self.prepare_debug(params)
         if capability == "record.manifest":
             result = self.store.manifest(identifier(params.get("task_id")))
             if any(row["owner_user_id"] != self.owner for row in result["attempts"]):
                 raise PermissionError("record_owner_mismatch")
             return result
         task_id, attempt_id = self._resolve(params)
+        if capability.startswith("debug."):
+            from mino_scout.runtime import debug_commands
+            if self.store.metadata(task_id, attempt_id).get("execution_kind") != "debug":
+                raise ValueError("debug_session_required")
+            if capability == "debug.status":
+                from mino_scout.runtime.debug_checkpoints import progress
+                return {**self.store.status(task_id, attempt_id), "authoring_progress": progress(self.store, task_id, attempt_id), "command": debug_commands.current(self.store, task_id, attempt_id, params.get("client_request_id", ""))}
+            if capability == "debug.checkpoint_get":
+                from mino_scout.runtime.debug_checkpoints import get
+                return get(self.store, task_id, attempt_id, params.get("checkpoint_id", ""))
+            if capability == "debug.cancel":
+                return debug_commands.cancel(self.store, task_id, attempt_id, params.get("client_request_id"))
+            if capability in {"debug.execute", "debug.reset", "debug.checkpoint"}:
+                with self.lock:
+                    return debug_commands.submit(self.store, task_id, attempt_id,
+                        {**params, "kind": capability.split(".")[1]},
+                        accept_new=attempt_id in self.jobs and not self.closed)
+            if capability == "debug.close":
+                return self.read("record.cancel", params)
+            raise ValueError("debug_operation_unknown")
         if capability == "record.status":
             return self.store.status(task_id, attempt_id)
         if capability == "record.resource_status":
@@ -138,6 +163,20 @@ class ScriptRecords:
                     job["stop"].set()
             return result
         raise ValueError("record_operation_unknown")
+
+    def prepare_debug(self, params):
+        from mino_scout.runtime.workspaces import authoring_workspace, source_snapshot
+        from mino_scout.runtime.script_exec import _load_apps, _Config
+        root = authoring_workspace(params.get("workspace", ""), self.store.root)
+        apps, problem = _load_apps(root)
+        key = str(params.get("app_key") or "")
+        if problem or not apps or key not in apps:
+            raise ValueError("debug_app_key_missing")
+        config = _Config(apps, str(params.get("env_profile") or ""), problem)
+        if getattr(config, key).platform != params.get("platform"):
+            raise ValueError("platform_mismatch")
+        _, hashes, digest = source_snapshot(root)
+        return {"debug_api_version": 1, "workspace": str(root), "workspace_hash": digest, "file_count": len(hashes), "node_id": self.core.node_id}
 
     def resource_status(self, task_id, attempt_id):
         """Fresh stop proof for an explicit Web isolation review, never a verdict rewrite."""
@@ -185,10 +224,16 @@ class ScriptRecords:
         digest = hashlib.sha256(json.dumps(immutable, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         metadata = {**asdict(payload), "node_id": self.core.node_id,
                     "environment": dict(req.device_hint or {}), "execution_started": "no",
-                    "scout_process_generation": self.core.binding_guard.process_generation}
+                    "scout_process_generation": self.core.binding_guard.process_generation,
+                    **({"run_purpose": "authoring"} if payload.execution_kind == "debug" else {})}
         with self.lock:
             if self.closed:
                 raise ValueError("record_unavailable")
+            existing = self.store.existing(payload.task_id, payload.attempt_id, digest)
+            if existing is not None:
+                return existing
+            if payload.execution_kind == "debug":
+                self.prepare_debug({"workspace": payload.workspace, "app_key": (req.device_hint or {}).get("app_key"), "platform": payload.platform, "env_profile": (req.device_hint or {}).get("env", "")})
             summary, created = self.store.create(payload.task_id, payload.attempt_id, metadata, digest)
             if not created:
                 return summary
@@ -198,7 +243,8 @@ class ScriptRecords:
             if guarded:
                 with guarded.lock:
                     existing_writes = [row for row in guarded.requests.values() if row.get("worker_active") and row["content"].get("sn") == payload.sn]
-            if getattr(self.core, "_update_busy", False) or conflicts and (payload.platform != "web" or len(conflicts) >= 4) or existing_writes:
+            exclusive = payload.execution_kind == "debug" or any(job.get("execution_kind") == "debug" for job in conflicts)
+            if getattr(self.core, "_update_busy", False) or conflicts and (exclusive or payload.platform != "web" or len(conflicts) >= 4) or existing_writes:
                 return self.store.finish(payload.task_id, payload.attempt_id, {"status": "blocked", "reason_code": "resource_busy",
                     "summary": "目标设备已有执行或节点正在更新", "execution_started": "no", "failure_stage": "admission"})
             ctx = multiprocessing.get_context("spawn")
@@ -209,7 +255,7 @@ class ScriptRecords:
             process = ctx.Process(target=_worker, args=(str(self.store.root), asdict(payload), asdict(req), child_pipe, stop, connected), daemon=True,
                                   name="scout-script-" + payload.attempt_id[:16])
             job = {"task_id": payload.task_id, "attempt_id": payload.attempt_id, "run_id": payload.run_id,
-                   "sn": payload.sn, "platform": payload.platform, "stop": stop, "connected": connected, "process": process}
+                   "sn": payload.sn, "platform": payload.platform, "execution_kind": payload.execution_kind, "stop": stop, "connected": connected, "process": process}
             self.jobs[payload.attempt_id] = job
             try:
                 process.start()
@@ -227,7 +273,9 @@ class ScriptRecords:
 
     def _monitor(self, job, pipe, timeout):
         process = job["process"]
-        deadline = time.monotonic() + timeout
+        debugging = job.get("execution_kind") == "debug"
+        deadline = float("inf") if debugging else time.monotonic() + timeout
+        fragment_stopping = None
         stopping = None
         outcome = None
         try:
@@ -249,6 +297,18 @@ class ScriptRecords:
                                 pipe.send({"reply": None})
                             except (BrokenPipeError, OSError):
                                 pass
+                if debugging:
+                    from mino_scout.runtime import debug_commands
+                    command = debug_commands.current(self.store, job["task_id"], job["attempt_id"])
+                    overdue = command and command["state"] == "running" and time.time() >= command["started_at"] + command["timeout_sec"]
+                    cancelled = command and command["state"] == "running" and command["cancel_requested"]
+                    if overdue or cancelled:
+                        fragment_stopping = fragment_stopping or time.monotonic()
+                        if time.monotonic() - fragment_stopping >= 2:
+                            _terminate(process)
+                            break
+                    else:
+                        fragment_stopping = None
                 if self.closed or job["stop"].is_set() or time.monotonic() >= deadline:
                     job["stop"].set()
                     stopping = stopping or time.monotonic()
@@ -274,6 +334,14 @@ class ScriptRecords:
                            "resource_isolated": True, "failure_stage": "execution"}
                 if job["stop"].is_set() and not timed_out:
                     outcome.update(status="cancelled", reason_code="cancelled")
+            if debugging:
+                from mino_scout.runtime import debug_commands
+                command = debug_commands.current(self.store, job["task_id"], job["attempt_id"])
+                if command and command["state"] in {"queued", "running"}:
+                    receipt = debug_commands.finish(self.store, job["task_id"], job["attempt_id"], command["request_id"],
+                        {"status": "interrupted", "reason_code": "worker_interrupted", "write_stopped": True})
+                    self.store.update_metadata(job["task_id"], job["attempt_id"], {"debug_last_command": receipt})
+                self.store.update_metadata(job["task_id"], job["attempt_id"], {"debug_state": "closed"})
             outcome["execution_stopped"] = True
             self.store.finish(job["task_id"], job["attempt_id"], outcome)
         except Exception as exc:
@@ -349,7 +417,6 @@ def _terminate(process):
 
 def _worker(store_root, payload_raw, request_raw, pipe, stop, connected):
     """Spawn entry point: module-level for frozen Windows/macOS launchers."""
-    import shutil
     from mino_scout.cli import build_core
     from mino_scout.runtime import script_repo, script_exec
     from mino_scout.server_comm.script_dispatch import _lease, _missing
@@ -371,6 +438,7 @@ def _worker(store_root, payload_raw, request_raw, pipe, stop, connected):
     root = None
     outcome = None
     core = None
+    entered_execution = False
     try:
         if not store.start(payload.task_id, payload.attempt_id):
             return
@@ -395,17 +463,28 @@ def _worker(store_root, payload_raw, request_raw, pipe, stop, connected):
             outcome = {"status": "declined", "reason_code": "channel_missing", "summary": f"缺 {missing}",
                        "execution_started": "no", "failure_stage": "admission"}
             return
-        root, payload.revision = script_repo.checkout(payload.repo_url, payload.branch, payload.revision)
+        if payload.execution_kind == "debug":
+            from mino_scout.runtime.debug_session import run as run_debug
+            entered_execution = True
+            outcome = run_debug(core, payload, store, stop)
+            return
+        from mino_scout.runtime.workspaces import attempt_workspace
+        work = attempt_workspace(store, payload.task_id, payload.attempt_id)
+        root, payload.revision = script_repo.checkout(payload.repo_url, payload.branch, payload.revision, destination=work / "source")
+        output = work / "output"
+        output.mkdir(exist_ok=True)
+        os.chdir(output)
+        store.update_metadata(payload.task_id, payload.attempt_id, {"execution_workspace": str(work), "source_workspace": str(root), "output_workspace": str(output), "revision": payload.revision})
         payload.script_path = script_repo.locate_script(root, payload.case_id, payload.script_path)
         payload.device_hint = dict(req.device_hint or {})
+        entered_execution = True
         outcome = script_exec.run(core, payload, root, deadline=time.monotonic() + payload.execution_timeout_sec, stop=stop)
     except BaseException as exc:
         outcome = {"status": str(getattr(exc, "status", "declined" if isinstance(exc, ValueError) else "fail")),
                    "reason_code": str(getattr(exc, "code", "") or getattr(exc, "reason_code", "") or "worker_failed"),
-                   "summary": str(scrub(str(exc)))[:2000], "execution_started": "no", "failure_stage": "admission"}
+                   "summary": str(scrub(str(exc)))[:2000], "execution_started": "unknown" if entered_execution else "no",
+                   "resource_isolated": entered_execution, "failure_stage": "execution" if entered_execution else "admission"}
     finally:
-        if root is not None:
-            shutil.rmtree(root, ignore_errors=True)
         if payload.platform == "web":
             try:
                 from mino_scout.platform.web.playwright_hub import get_hub

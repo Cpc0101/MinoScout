@@ -661,7 +661,7 @@ class NodeTransport:
                 return self.core.execute(req)
             finally:
                 timing["core_ms"] = (time.perf_counter() - entered) * 1000
-        if req.capability_id in {"cancel_run", "write_stop_status", "script.submit"} or req.capability_id.startswith("record."):
+        if req.capability_id in {"cancel_run", "write_stop_status", "script.submit"} or req.capability_id.startswith(("record.", "debug.")):
             result = await asyncio.to_thread(execute)
         else:
             context = contextvars.copy_context()
