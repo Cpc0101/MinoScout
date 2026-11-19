@@ -400,47 +400,9 @@ def otp_request_smoke():
     print("PASS: OTP request boundary, account/session isolation, single use, expiry, mailbox reset/reconnect, fixed-code compatibility and legacy redaction")
 
 
-def official_endpoint_smoke(base):
-    import hashlib
-    import json
-    from unittest.mock import patch
-    from mino_scout.config import nexus_service_identity
-    from mino_scout.plugins.state import verify_local_owner
-    from mino_scout.server_comm import script_records
-
-    old = "wss://nexus.minocc.top"
-    new = "wss://nexus.minocc.top:8443/node"
-    config = {"plugin_owner_user_id": "fixture", "plugin_owner_nexus": old,
-              "plugin_storage_version": 2}
-    assert nexus_service_identity(old) == nexus_service_identity(new)
-    for unrelated in ("ws://nexus.minocc.top:8443", "wss://nexus.minocc.top:8444",
-                      "wss://other.invalid:8443", "wss://localhost:8443"):
-        assert nexus_service_identity(unrelated) != nexus_service_identity(old)
-    assert nexus_service_identity("wss://example.invalid") != nexus_service_identity("wss://example.invalid:8443")
-    with patch("mino_scout.config.load_config", return_value=config), patch("mino_scout.config.save_config") as save:
-        verify_local_owner("fixture", new)
-        save.assert_not_called()
-        for owner, target in (("other", new), ("fixture", "wss://nexus.minocc.top:8444")):
-            try:
-                verify_local_owner(owner, target)
-            except PermissionError:
-                pass
-            else:
-                raise AssertionError("Unrelated plugin identity was accepted")
-        with patch("mino_scout.config.config_dir", return_value=base / "endpoint"):
-            core = SimpleNamespace()
-            manager = script_records.bind(core, "fixture", new)
-            expected = hashlib.sha256(json.dumps([old + "/node", "fixture"]).encode()).hexdigest()
-            assert manager.profile == expected
-            assert script_records.bind(core, "fixture", old + "/node") is manager
-            manager.close()
-    print("PASS official endpoint aliases preserve owner, plugin config and evidence paths")
-
-
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="scout-lifecycle-") as directory:
         runtime_smoke(Path(directory))
         mail_smoke()
         checkpoint_progress_smoke()
         otp_request_smoke()
-        official_endpoint_smoke(Path(directory))

@@ -24,14 +24,6 @@ def bind(core, owner: str, origin: str):
     owner = str(owner or "").strip()
     if not owner:
         raise PermissionError("record_owner_mismatch")
-    from mino_scout.config import load_config, nexus_service_identity, nexus_ws_url
-    config = load_config()
-    stored_origin = str(config.get("plugin_owner_nexus") or "")
-    if (config.get("plugin_owner_user_id") == owner and stored_origin
-            and nexus_service_identity(stored_origin) == nexus_service_identity(origin)):
-        # Keep existing evidence paths when the same production service uses
-        # its alternate TLS entry point. REGISTERED still supplies the owner.
-        origin = nexus_ws_url(stored_origin)
     profile = hashlib.sha256(json.dumps([origin, owner]).encode()).hexdigest()
     old = getattr(core, "_script_records", None)
     if old and old.profile == profile:

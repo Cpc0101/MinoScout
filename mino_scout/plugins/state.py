@@ -387,7 +387,7 @@ def clear_plugin_secrets(node_id: str, kind: str, plugin_id: str) -> None:
 
 def verify_local_owner(user_id: str, nexus_url: str) -> None:
     """首次确认账号时启用独立空存储，不继承无归属旧配置及消息。"""
-    from mino_scout.config import load_config, save_config, nexus_service_identity
+    from mino_scout.config import load_config, save_config
     from urllib.parse import urlsplit
     uid = str(user_id or "").strip()
     parts = urlsplit(nexus_url)
@@ -398,7 +398,14 @@ def verify_local_owner(user_id: str, nexus_url: str) -> None:
     previous = str(cfg.get("plugin_owner_user_id") or "")
     previous_origin = str(cfg.get("plugin_owner_nexus") or "")
     if previous:
-        if previous != uid or nexus_service_identity(previous_origin) != nexus_service_identity(origin):
+        def identity(value: str) -> tuple:
+            parsed = urlsplit(value)
+            host = (parsed.hostname or "").lower()
+            if host in {"localhost", "127.0.0.1", "::1"}:
+                host = "loopback"
+            scheme = {"http": "ws", "https": "wss"}.get(parsed.scheme, parsed.scheme)
+            return scheme, host, parsed.port or (443 if scheme == "wss" else 80)
+        if previous != uid or identity(previous_origin) != identity(origin):
             raise PermissionError("本地插件属于其他账号或服务，禁止继承；需先隔离旧配置")
         return
     cfg["plugin_owner_user_id"] = uid

@@ -97,19 +97,6 @@ def set_nexus_url(url: str, path: Path | None = None) -> Path:
     return save_config(cfg, path)
 
 
-def nexus_service_identity(value: str) -> tuple:
-    """Identity of a service, including the official production TLS aliases."""
-    parsed = urlsplit(value)
-    host = (parsed.hostname or "").lower()
-    if host in {"localhost", "127.0.0.1", "::1"}:
-        host = "loopback"
-    scheme = {"http": "ws", "https": "wss"}.get(parsed.scheme, parsed.scheme)
-    port = parsed.port or (443 if scheme == "wss" else 80)
-    if scheme == "wss" and host == "nexus.minocc.top" and port in {443, 8443}:
-        port = 443
-    return scheme, host, port
-
-
 def save_config(data: dict[str, Any], path: Path | None = None) -> Path:
     if path is None or path.resolve() == config_path():
         claim_environment()
