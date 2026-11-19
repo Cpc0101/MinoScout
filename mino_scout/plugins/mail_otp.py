@@ -16,6 +16,15 @@ from html.parser import HTMLParser
 from typing import Any, Optional
 
 OTP_BODY_RE = re.compile(r"(?<!\d)(\d{4,8})(?!\d)")
+_OTP_HINT_RE = re.compile(
+    r"\b(?:code|otp|pin|one[ -]?time password)\b|验证码|校验码|动态口令|一次性密码|認証コード|確認コード",
+    re.IGNORECASE,
+)
+_OTP_CONTEXT_RE = re.compile(
+    r"(?:\b(?:code|otp|pin|one[ -]?time password)\b|验证码|校验码|动态口令|一次性密码|認証コード|確認コード)"
+    r"\s*(?:(?:is|为|是)\s*)?[:：=\-\s]*[\"'“‘]?(\d{4,8})(?!\d)",
+    re.IGNORECASE,
+)
 # 过滤只用得到这些头；命中过滤条件的邮件才取正文。
 _HEADER_FIELDS = "DATE FROM SUBJECT TO DELIVERED-TO X-ORIGINAL-TO ENVELOPE-TO"
 _SCAN_LIMIT = 40
@@ -101,13 +110,28 @@ def _announce_client(mail) -> None:
         pass  # 服务器不接受这条声明：不影响已完成的登录，后续命令照常
 
 
-def extract_otp_from_text(text: str) -> str:
+def extract_otp_from_text(text: str, *, subject: str = "") -> str:
     body = str(text or "")
     if not body.strip():
         return ""
     codes = set(OTP_BODY_RE.findall(body))
-    # Multiple distinct numbers are ambiguous; never submit the first by accident.
-    return next(iter(codes)) if len(codes) == 1 else ""
+    subject_codes = set(OTP_BODY_RE.findall(str(subject or "")))
+    if _OTP_HINT_RE.search(str(subject or "")) and subject_codes:
+        # A unique subject code must also occur in the visible body. Conflicting
+        # subject/body values must not fall back to another body candidate.
+        if len(subject_codes) == 1:
+            code = next(iter(subject_codes))
+            return code if code in codes else ""
+        return ""
+    contextual = set(_OTP_CONTEXT_RE.findall(body))
+    # Without a confirming subject, keep distinct body numbers ambiguous.
+    # A lone number still needs a code label: a copyright year is not an OTP.
+    if len(codes) == 1 and contextual == codes:
+        return next(iter(codes))
+    if not contextual and _OTP_HINT_RE.search(str(subject or "")) and len(codes) == 1:
+        code = next(iter(codes))
+        return "" if len(code) == 4 and 1900 <= int(code) <= 2099 else code
+    return ""
 
 
 class _MailText(HTMLParser):
@@ -414,7 +438,10 @@ def _poll_inbox(
         fingerprint = hashlib.sha256(body).hexdigest()
         if consumed_messages is not None and fingerprint in consumed_messages:
             continue
-        code = extract_otp_from_text(_collect_text_parts(email.message_from_bytes(body)))
+        full_message = email.message_from_bytes(body)
+        code = extract_otp_from_text(
+            _collect_text_parts(full_message), subject=_decode_mime_header(full_message.get("Subject") or ""),
+        )
         if code:
             if consumed_messages is not None:
                 consumed_messages.add(fingerprint)

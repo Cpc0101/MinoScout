@@ -201,6 +201,22 @@ def mail_smoke():
     assert extract_otp_from_text(_collect_text_parts(message)) == "654321"
     assert extract_otp_from_text("Code 654321; repeat 654321") == "654321"
     assert extract_otp_from_text("Reference 123456; code 654321") == ""
+    body_with_year = "Your code is 654321; repeat 654321. Copyright 2026"
+    assert extract_otp_from_text(body_with_year, subject="654321 is your verification code") == "654321"
+    assert extract_otp_from_text(body_with_year) == ""
+    assert extract_otp_from_text("Copyright 2026") == ""
+    assert extract_otp_from_text("Copyright 2026", subject="Your verification code") == ""
+    assert extract_otp_from_text("Your code is 2026") == "2026", "Labeled four-digit OTPs remain supported"
+    assert extract_otp_from_text("654321", subject="Your verification code") == "654321"
+    assert extract_otp_from_text(body_with_year, subject="123456 is your verification code") == ""
+    assert extract_otp_from_text(body_with_year, subject="Codes 123456 and 654321") == ""
+    assert extract_otp_from_text("Reference 123456") == ""
+    message["Subject"] = "654321 是你的验证码"
+    message.set_content(body_with_year)
+    assert poll() == "654321", "The IMAP path must decode the subject and pass it to the parser"
+    assert poll() == "", "Subject disambiguation must retain consumed-message protection"
+    del message["Subject"]
+    message.set_content('<html><body><p>Your code is <b>654321</b></p></body></html>', subtype="html")
     message.add_attachment(b"reference 987654", maintype="text", subtype="plain", filename="reference.txt")
     assert extract_otp_from_text(_collect_text_parts(message)) == "654321"
 
@@ -228,7 +244,7 @@ def mail_smoke():
         refresh=False, guard=lambda mail: None, stats={}) for _ in range(3)]
     assert codes == ["", "", "654321"], codes
     assert max(map(len, inbox.batches)) <= 40
-    print("PASS: OTP deduplication, HTML content, ambiguous numbers, attachments, shared-inbox pagination")
+    print("PASS: OTP subject/body confirmation, year rejection, deduplication, MIME/HTML, ambiguity, attachments, pagination")
 
 
 def checkpoint_progress_smoke():
