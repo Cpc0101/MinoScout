@@ -30,7 +30,8 @@ build 的绑定产物、不能单独换 —— 于是每次发版都得重推 45
 2. **依赖发现要自己接上。** mino_scout 退出分析范围后，PyInstaller 不再顺着它的
    `import adbutils` 去发现第三方包，连它用的**标准库**模块也会漏。
    `scan_external_imports()` 用 ast 把 mino_scout 里所有外部 import 扒出来当
-   hiddenimports 顶上 —— 覆盖第三方和 stdlib 两者。mino_scout 内**没有**动态
+   hiddenimports 顶上 —— 覆盖第三方和 stdlib 两者。扫描保留完整模块名
+   （例如 `html.parser`，不能只留顶层 `html`）。mino_scout 内**没有**动态
    import（`importlib` / `__import__` 全仓零引用，grep 验证过），所以 ast 扫描是完备的。
 
 ## 已知的坑（都来自上游 MiniOrangeServer/build.py 的经验）
@@ -148,10 +149,11 @@ sys.exit(_cli.main())
 
 
 def scan_external_imports(pkg: str) -> list[str]:
-    """用 ast 扒出 pkg 里所有**外部** import 的顶层模块名。
+    """用 ast 扒出 pkg 里所有**外部** import 的完整模块名。
 
     这些要当 hiddenimports 交给 PyInstaller —— pkg 本身被 --exclude-module 排掉了，
-    分析器不会再顺着它去发现依赖，连 stdlib 都会漏。相对 import 与 pkg 自身跳过。
+    分析器不会再顺着它去发现依赖，连 stdlib 都会漏。必须保留完整模块名：
+    只记 `html` 不会自动收集 `html.parser`。相对 import 与 pkg 自身跳过。
     """
     found: set[str] = set()
     base = ROOT / pkg
@@ -165,13 +167,13 @@ def scan_external_imports(pkg: str) -> list[str]:
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    found.add(alias.name.split(".")[0])
+                    found.add(alias.name)
             elif isinstance(node, ast.ImportFrom):
                 if node.level:          # from . import x —— 包内相对
                     continue
                 if node.module:
-                    found.add(node.module.split(".")[0])
-    found.discard(pkg)
+                    found.add(node.module)
+    found = {name for name in found if name != pkg and not name.startswith(pkg + ".")}
     return sorted(found)
 
 

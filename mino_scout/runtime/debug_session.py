@@ -144,10 +144,11 @@ def run(core, payload, store, stop):
             path = command["script_path"]
             if path:
                 from mino_scout.runtime.script_repo import locate_script
+                from mino_scout.runtime.script_source import source_sidecar_path
                 path = locate_script(root, "", path)
                 code = files[path].decode("utf-8")
                 outcome["phase"] = "source"
-                case._bind_source(root / path, source=code, sidecar=files.get(str(Path(path).with_suffix(".yaml"))))
+                case._bind_source(root / path, source=code, sidecar=files.get(source_sidecar_path(path)))
             else:
                 path, code = ".mino-debug-" + request + ".py", command["code"]
                 case._source_snapshot, case._source_clauses, case._source_roles = {}, {}, {}

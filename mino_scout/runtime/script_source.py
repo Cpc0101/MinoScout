@@ -14,6 +14,11 @@ from mino_scout.case_sources import _bounded_range, _column_index, read_sheets
 GROUPS = {"preconditions": "P", "steps": "S", "expectations": "E"}
 
 
+def source_sidecar_path(path: str | Path) -> str:
+    """Snapshot keys always use POSIX separators, including on Windows."""
+    return Path(path).with_suffix(".yaml").as_posix()
+
+
 def source_binding(tree: ast.Module) -> dict | None:
     bindings = []
     for node in tree.body:

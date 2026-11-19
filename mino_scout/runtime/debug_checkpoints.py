@@ -20,8 +20,9 @@ def save(store, task, attempt, command, files, hashes, workspace_hash, work):
     findings = []
     if stage != "draft":
         tree = ast.parse(files[path], filename=path)
-        from mino_scout.runtime.script_source import source_binding
-        if source_binding(tree) is None and str(Path(path).with_suffix(".yaml")) not in files:
+        from mino_scout.runtime.script_source import source_binding, source_sidecar_path
+        sidecar = source_sidecar_path(path)
+        if source_binding(tree) is None and sidecar not in files:
             raise ValueError("checkpoint_source_required")
         run = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run"), None)
         if run is None or not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
@@ -35,7 +36,7 @@ def save(store, task, attempt, command, files, hashes, workspace_hash, work):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(data)
             findings = [asdict(h) for h in check_repo(snapshot, require_cases=True)
-                        if not h.path.startswith("tests/") or h.path in {path, str(Path(path).with_suffix(".yaml"))}]
+                        if not h.path.startswith("tests/") or h.path in {path, sidecar}]
         if any(h["severity"] != "info" for h in findings):
             return {"status": "failed", "reason_code": "checkpoint_static_check_failed", "findings": findings[:100]}
     evidence = None
