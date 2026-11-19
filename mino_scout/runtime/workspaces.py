@@ -32,7 +32,7 @@ def authoring_workspace(value: str, execution_root: Path) -> Path:
 
 
 def source_snapshot(root: Path) -> tuple[dict[str, bytes], dict[str, str], str]:
-    """Capture local Python/page/config inputs without walking .git or environments."""
+    """Capture code/config and supported data inputs; generated output lives elsewhere."""
     files: dict[str, bytes] = {}
     size = 0
     for directory, children, names in os.walk(root, followlinks=False):
@@ -41,7 +41,7 @@ def source_snapshot(root: Path) -> tuple[dict[str, bytes], dict[str, str], str]:
                              and not (Path(directory) / name).is_symlink())
         for name in sorted(names):
             path = Path(directory) / name
-            if path.suffix not in {".py", ".yaml", ".yml"} or path.is_symlink():
+            if path.suffix.lower() not in {".py", ".yaml", ".yml", ".json", ".csv", ".tsv", ".txt"} or path.is_symlink():
                 continue
             data = path.read_bytes()
             size += len(data)

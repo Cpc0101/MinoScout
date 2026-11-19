@@ -77,7 +77,7 @@ apps:
 | 对象 | 内容 |
 |---|---|
 | `app`（`case.init` 返回） | 启停、点击输入、滑动拖拽、按键、剪贴板、截图、界面树、`on_page`、`vlm`/`vlm_frame`/`sample`、`exec`，以及按渠道的专有方法 |
-| `case.scout` | `wait` `otp(account)` `llm` |
+| `case.scout` | `wait` `otp_request(account)` `otp(account, request=...)` `llm` |
 | `case.nexus` | `prep` `do` `check`（文字标题）、`account` `note` `fail` |
 
 - 每条 `tool/result` 带 `app`（应用 key）；`exec` 另带 `script_sha256`、`script_length`；
@@ -149,3 +149,19 @@ Nexus 不读脚本仓库（可能是私有的），所以“这个项目的仓�
 - 脚本子进程隔离与强杀；
 - Workbench：项目配置里包名 / URL 改只读；`cases[].status` 新值展示；
 - 存量老脚本（`case.tap` 写法）需迁移。
+
+## 动态邮箱验证码的请求关联
+
+本版本动态邮箱取码必须在产品发码前建立请求，不再通过整个用例开始时间回捞邮件。用现有 Scout 页面控件操作发码：
+
+```python
+account = case.nexus.account()
+request = case.scout.otp_request(account)
+# 此处执行已有的 app 页面控件操作，发送验证码。
+code = case.scout.otp(account, request=request)
+# 将 code 交给已有的输入控件；不要写日志。
+```
+
+`otp_request` 只读邮箱 UIDVALIDITY/UIDNEXT，不发送验证码。请求绑定当前执行、账号、收件邮箱及策略，90 秒内一次取码（含有界重连）；重新发码前重新准备。请求不可跨整例重跑、reset 或 Scout 重启使用。没有请求、已消费、过期、跨账号、收件邮箱或策略变化均 blocked；邮箱代际变化要求重新准备。固定验证码允许原 `otp(account)` 写法，`otp_request(account)` 对固定码返回 None 且不访问邮箱。
+
+旧 `otp_mail` 写法也必须先调用 `otp_request()`，再在发码后调用 `otp_mail(request=request)`；需要已有明确收件人。接口返回前统一登记验证码脱敏。准备之前已存在但未消费的旧邮件被排除；准备后延迟到达的上一次邮件仍需产品请求标识才能与本次发码严格区分。

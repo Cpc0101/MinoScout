@@ -146,8 +146,12 @@ def run(core, payload, store, stop):
                 from mino_scout.runtime.script_repo import locate_script
                 path = locate_script(root, "", path)
                 code = files[path].decode("utf-8")
+                outcome["phase"] = "source"
+                case._bind_source(root / path, source=code, sidecar=files.get(str(Path(path).with_suffix(".yaml"))))
             else:
                 path, code = ".mino-debug-" + request + ".py", command["code"]
+                case._source_snapshot, case._source_clauses, case._source_roles = {}, {}, {}
+                case._source_hash, case._covered = "", set()
             code_hash = hashlib.sha256(code.encode()).hexdigest()
             # Every local import uses this fragment's captured bytes, never stale pyc.
             local = {name: module for name, module in list(sys.modules.items())
@@ -168,6 +172,7 @@ def run(core, payload, store, stop):
             case._model_gate = ModelGate(case, root / path, source=code)
             outcome.update(workspace_hash=workspace_hash, code_hash=code_hash)
             fragment = {"request_id": request, "workspace_hash": workspace_hash, "file_hashes": hashes,
+                        "source_snapshot": case._source_snapshot, "source_hash": case._source_hash,
                         "code_hash": code_hash, "script_path": command["script_path"], "first_action_seq": action_start + 1}
             recorder.append("debug/started", fragment)
             store.update_metadata(payload.task_id, payload.attempt_id, {
@@ -182,15 +187,24 @@ def run(core, payload, store, stop):
             outcome["execution_started"] = "yes"
             if command["kind"] == "reset":
                 # Reset is a recorded device operation, not a way around unknown writes.
+                case._otp_requests.clear()
                 app = namespace["app"]
                 app.close()
                 app.launch()
                 namespace = {"case": case, "app": app, "__name__": "__mino_debug__"}
             else:
-                tree = ast.parse(code, filename=str(root / path))
-                exec(compile(tree, str(root / path), "exec"), namespace)
-                if any(isinstance(node, ast.FunctionDef) and node.name == "run" for node in tree.body):
-                    namespace["run"](case)
+                if command["script_path"]:
+                    from mino_scout.runtime.case_data import CaseData
+                    case._otp_requests.clear()
+                    case.data = CaseData(case, getattr(payload, "inputs", {}))
+                    runtime._execute_hooks(root, path, case, source_files=files)
+                    runtime._validate_case(case, assertion_start)
+                    outcome.update(case_lifecycle_completed=True, source_coverage=case._coverage(), source_hash=case._source_hash)
+                else:
+                    tree = ast.parse(code, filename=str(root / path))
+                    exec(compile(tree, str(root / path), "exec"), namespace)
+                    if any(isinstance(node, ast.FunctionDef) and node.name == "run" for node in tree.body):
+                        namespace["run"](case)
             case._guard()
             if case._latched_error:
                 raise case._latched_error
@@ -199,7 +213,7 @@ def run(core, payload, store, stop):
             reason = str(getattr(exc, "reason_code", "") or (str(exc) if isinstance(exc, ValueError) else "script_failed"))
             if isinstance(exc, runtime.ScriptHalt):
                 reason = "cancelled" if case.stop.is_set() else "script_timeout"
-            outcome.update(status="cancelled" if reason == "cancelled" else "failed", reason_code=reason,
+            outcome.update(status="cancelled" if reason == "cancelled" else "blocked" if getattr(exc, "status", "") == "blocked" else "failed", reason_code=reason,
                            summary=str(scrub(str(exc)))[:2000], traceback=str(scrub(traceback.format_exc()))[-8000:])
             details = getattr(exc, "details", {})
             if details.get("phase"):

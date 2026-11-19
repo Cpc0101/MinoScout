@@ -113,10 +113,10 @@ def fetch_source(binding: dict, node_id: str, script_id: str) -> dict:
     return snapshot
 
 
-def load_source(path: Path, node_id: str) -> dict | None:
-    binding = source_binding(ast.parse(path.read_text(encoding="utf-8")))
+def load_source(path: Path, node_id: str, *, source=None, sidecar=None) -> dict | None:
+    binding = source_binding(ast.parse(path.read_text(encoding="utf-8") if source is None else source))
     if binding is None:
         return None
-    if path.with_suffix(".yaml").is_file():
+    if sidecar is not None or source is None and path.with_suffix(".yaml").is_file():
         raise ValueError("CASE_SOURCE and a same-name YAML snapshot cannot coexist; remove the duplicate source snapshot")
     return fetch_source(binding, node_id, path.stem)

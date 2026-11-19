@@ -1226,7 +1226,7 @@ account(requirements=None, prefer=None, data_need=None, data_requirements=None) 
 
 ### Agent 数据准备与运行时对象（2026-11-17）
 
-`case_run` 接受 `case_inputs`：按本次 case_id 或 script_path 索引的业务字典，同项路径优先，每例 16KiB、总量 64KiB、深度最多 8，JSON 可序列化且不含凭据。未知目标拒绝。Python 与 Cloudflare 将选中输入冻结到 ScriptRun.inputs；传输恢复仍使用同一载荷。
+`case_run` 接受 `case_inputs`：按本次 case_id 或 script_path 索引的业务字典，同项路径优先，每例 16KiB、总量 64KiB、深度最多 8，JSON 可序列化且不含凭据。未知目标拒绝。Nexus 将选中输入冻结到 ScriptRun.inputs；传输恢复仍使用同一载荷。
 
 `source_context` 只允许 `parent_task_id`（≤255 字）、`purpose`（prepare/resume）和可选 `data_need`（≤2000 字）。父任务须属于同一发起用户、项目与运行环境；任务摘要暴露该关系。prepare 是独立任务，不计入正式用例通过/失败；resume 创建原用例的新任务，从脚本起点执行，保留原结论。Nexus 不作缺数据构造或 UI 决策。
 
@@ -1278,3 +1278,17 @@ execute 必填请求 ID，code/script_path 二选一；支持直接使用 case/a
 正式 `case_run` 可传 `debug_origin: {session_id, checkpoint_id}`，同时要求固定完整 40 位 commit SHA、同应用/环境和相同用例路径，调试会话已确认停止且未隔离。Nexus 从原 Scout 读取 path_validated 检查点，不信任客户端自填哈希；目标 Scout 必须声明 `debug.capabilities.formal_origin_verification=true`。ScriptRun.debug_origin 固化 session_id/checkpoint_id/script_path/workspace_hash/script_hash/stage；正式执行在任何设备动作前比较检出内容，差异以 blocked/debug_version_mismatch 结束。debug/origin 事件及 debug_origin_matched 摘要保存核对结果；版本一致本身不等于正式通过。当前一次引用对应一个用例，可在多个设备独立正式执行。
 
 定位失败写 `locator/result`，保存 control、app、原因、解析异常、phase=locator 与该动作 execution_started=no；设备结果保留 device 阶段与明确回执。片段记录 snapshot/load_code/static_check/execution/device/locator 阶段；动作未执行不能抹掉同一用例之前已发生的操作。
+
+### 执行契约修正（2026-11-19）
+
+`debug.execute` 的 `code` 仍为保留现场的片段；`script_path` 执行整例时从捕获版本绑定原文，并运行项目 pretest、用例 pretest、run、用例 posttest、项目 posttest。空 check、零断言和原文漏覆盖均阻塞整例验证。清理各自执行、各自留 `cleanup/error`，保留原始失败。调试保持 authoring，不产生正式通过结论。
+
+整例成功的 debug/finished 包含 `case_lifecycle_completed=true`、source_hash 与 source_coverage，debug/started 保留当次 source_snapshot。新 path_validated 检查点需整例生命周期和覆盖验证，返回 `validation_contract=case_lifecycle.v1`；旧检查点仍可查看，但缺少 `case_lifecycle.v1` 的 path_validated 检查点在阶段进度中标为 stale，不计入有效阶段数量；作为正式来源读取时以 `debug_checkpoint_validation_required` 拒绝，需重新验证。
+
+workspace_hash 覆盖非隐藏、非环境目录中的 Python、YAML、JSON、CSV、TSV、TXT 文件；忽略软链接，沿用 32MiB/10000 文件上限。它不证明外部路径、远程业务数据或其他格式资源一致。新增数据文件或修改内容同样使正式来源核对失配。
+
+Nexus 不可达或回调拒绝在 Scout 记为 blocked，原因分别为 nexus_unreachable / nexus_rejected；具体上游原因经脱敏保留，不将其计作失败断言。账号/取码环境缺失同样为 blocked。邮件取码在同一执行/调试会话中按邮箱与收件人排除已经成功消费的邮件，避免等待新码时返回上一次邮件；固定码策略不变。
+
+脚本邮箱 OTP 的本地请求契约：先调用 `case.scout.otp_request(account)` 只读捕获邮箱 UIDVALIDITY/UIDNEXT，产品发码后调用 `case.scout.otp(account, request=...)`。请求绑定当前 Case、账号、收件邮箱及登录策略，一次消费且最长 90 秒；同收件人重新准备、整例重跑、reset 或进程重启使旧请求失效。缺请求 `otp_request_required`，未知/已用请求 `otp_request_invalid`，范围变化 `otp_request_mismatch`，过期 `otp_request_expired`，均 blocked。取码及重连核对 UIDVALIDITY，只接受 UIDNEXT 边界之后的邮件；邮箱代际变化以 `otp_environment_unavailable` / `otp_mailbox_changed` 阻塞。固定码兼容旧 API，`otp_mail(request=...)` 使用同一门禁和脱敏。请求、邮箱凭据和 UID 边界仅保存在 Scout 内存，不新增 Nexus wire 字段。边界不等于产品发码请求 ID，无法区分准备后才延迟到达的旧请求邮件。
+
+Nexus 账号回调返回已缓存凭据前必须检查账号租约仍由当前 run/case/device 持有且未过期，失效返回 `resource_account_missing`，不能仅凭 ctx.picked_account 返回凭据或静默换号。

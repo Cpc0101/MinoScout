@@ -111,7 +111,7 @@ class _Scope:
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         latched = self._case._latched_error is not self._start_error
-        empty = not self._case._debug and exc_type is None and not latched and self._role == "check" and len(self._case._assertions) == self._start_assertions
+        empty = exc_type is None and not latched and self._role == "check" and len(self._case._assertions) == self._start_assertions
         assertions = self._case._assertions[self._start_assertions:]
         failed = exc_type is not None or empty or latched or any(row["status"] != "pass" for row in assertions)
         if failed:
@@ -232,14 +232,7 @@ def _run_locked(core, payload, root: Path, *, deadline: float, stop) -> dict[str
         if getattr(payload, "revision", ""):
             case._report("checkout", ActionResult(ok=True, summary=f"脚本仓库提交 {payload.revision}", status="pass"), "scout", 0)
         _execute_hooks(root, payload.script_path, case)
-        case._guard()
-        if case._latched_error is not None:
-            raise case._latched_error
-        if not case._assertions:
-            raise ScriptAbort("脚本没有有效断言；观察记录已保留", reason_code="assertion_missing", status="blocked")
-        missing = sorted(set(case._source_clauses) - case._covered)
-        if missing:
-            raise ScriptAbort("原文条目未覆盖：" + ", ".join(missing), reason_code="source_coverage_missing", status="blocked")
+        _validate_case(case)
         return _report_outcome(case, {"status": "pass", "summary": "脚本执行完成且断言通过", "error": "", "reason_code": "", "touched": bool(case.touched),
                 "execution_started": "yes" if case.touched else "no", "source_coverage": case._coverage(), **case.data.snapshot()})
     except ScriptHalt as exc:
@@ -268,6 +261,7 @@ def _failure(exc: BaseException, case: Case | None) -> dict[str, Any]:
         "failure_title": case._failure_title if case else "",
         "resource_isolated": bool(details.get("resource_isolated")),
         "source_coverage": case._coverage() if case else {},
+        **({"nexus_error": details["nexus_error"]} if isinstance(details.get("nexus_error"), dict) else {}),
         **(case.data.snapshot() if case and hasattr(case, "data") else {}),
     })
 
@@ -292,17 +286,44 @@ def _report_outcome(case, outcome):
     return outcome
 
 
-def _execute_hooks(root: Path, script_path: str, case: "Case") -> None:
+def _validate_case(case, assertion_start=0):
+    case._guard()
+    if case._latched_error is not None:
+        raise case._latched_error
+    if not case._assertions[assertion_start:]:
+        raise ScriptAbort("脚本没有有效断言；观察记录已保留", reason_code="assertion_missing", status="blocked")
+    missing = sorted(set(case._source_clauses) - case._covered)
+    if missing:
+        raise ScriptAbort("原文条目未覆盖：" + ", ".join(missing), reason_code="source_coverage_missing", status="blocked")
+
+
+def _execute_hooks(root: Path, script_path: str, case: "Case", *, source_files=None) -> None:
     inserted = str(root) not in sys.path
     if inserted:
         sys.path.insert(0, str(root))
     blocker = _BlockImports(root)
     sys.meta_path.insert(0, blocker)
     loaded: list[str] = []
+    def load(path, name, hook=""):
+        if source_files is None:
+            return _load_hook(path, hook, name, loaded) if hook else _load(path, name, loaded)
+        raw = source_files.get(path.relative_to(root).as_posix())
+        if raw is None and hook:
+            return None
+        tree = ast.parse(raw, filename=str(path))
+        if hook and not any(isinstance(node, ast.FunctionDef) and node.name == hook for node in tree.body):
+            return None
+        from types import ModuleType
+        module = ModuleType(name)
+        module.__file__ = str(path)
+        sys.modules[name] = module
+        loaded.append(name)
+        exec(compile(tree, str(path), "exec"), module.__dict__)
+        return getattr(module, hook, None) if hook else module
     try:
-        project_pre = _load_hook(root / "pretest.py", "pretest", "mino_project_pretest", loaded)
-        project_post = _load_hook(root / "posttest.py", "posttest", "mino_project_posttest", loaded)
-        module = _load(root / script_path, "mino_case_run", loaded)
+        project_pre = load(root / "pretest.py", "mino_project_pretest", "pretest")
+        project_post = load(root / "posttest.py", "mino_project_posttest", "posttest")
+        module = load(root / script_path, "mino_case_run")
         run_fn = getattr(module, "run", None)
         if not callable(run_fn):
             raise ScriptAbort("用例没有 run(case)", reason_code="script_failed")
@@ -320,13 +341,16 @@ def _execute_hooks(root: Path, script_path: str, case: "Case") -> None:
             raise
         finally:
             post_error: BaseException | None = None
-            try:
-                if callable(case_post):
-                    case_post(case)
-                if callable(project_post):
-                    project_post(case)
-            except BaseException as exc:
-                post_error = exc
+            for name, hook in (("case_posttest", case_post), ("project_posttest", project_post)):
+                try:
+                    if callable(hook):
+                        hook(case)
+                except BaseException as exc:
+                    post_error = post_error or exc
+                    if case._recorder:
+                        from mino_scout.runtime.records import scrub
+                        case._recorder.append("cleanup/error", {"hook": name, "summary": scrub(str(exc))[:300],
+                            "reason_code": str(getattr(exc, "reason_code", "") or type(exc).__name__)})
             if post_error is not None and run_error is None:
                 raise post_error
     finally:
@@ -434,16 +458,22 @@ class _Scout:
 
         return wait(self._case, ms)
 
-    def otp(self, account) -> str:
+    def otp_request(self, account=None):
+        """发码前捕获邮箱边界；固定验证码无需邮箱，返回 None。"""
+        from mino_scout.server_comm.callbacks import otp_request
+
+        return otp_request(self._case, account)
+
+    def otp(self, account, *, request=None) -> str:
         """取验证码：账号自带码 → Nexus 登录策略 → 旧脚本仓固定码 → 人工。"""
         from mino_scout.server_comm.callbacks import otp
 
-        return otp(self._case, account)
+        return otp(self._case, account, request=request)
 
-    def otp_mail(self) -> str:
+    def otp_mail(self, *, request=None) -> str:
         from mino_scout.server_comm.callbacks import otp_mail
 
-        return otp_mail(self._case)
+        return otp_mail(self._case, request=request)
 
     def llm(self, prompt: str, text: str = "", schema: dict | None = None) -> Any:
         from mino_scout.server_comm.callbacks import llm
@@ -526,6 +556,8 @@ class Case:
         self._role = ""
         self._started = time.time()
         self._mail_to = ""
+        self._otp_messages: dict[tuple[str, str, str], set[str]] = {}
+        self._otp_requests: dict[str, dict] = {}
         self._apps: dict[str, App] = {}
         self._recorder = getattr(core, "_recording", None)
         self._source_ref = ""
@@ -538,22 +570,46 @@ class Case:
         self._covered: set[str] = set()
         from mino_scout.runtime.case_data import CaseData
         self.data = CaseData(self, getattr(payload, "inputs", {}))
-        sidecar = (root / payload.script_path).with_suffix(".yaml")
+        self._source_snapshot, self._source_clauses, self._source_roles = {}, {}, {}
+        self._source_hash = ""
+        if not self._debug:
+            sidecar = (root / payload.script_path).with_suffix(".yaml")
+            self._bind_source(root / payload.script_path,
+                              sidecar=sidecar.read_bytes() if sidecar.is_file() else None)
+        from mino_scout.runtime.model_policy import ModelGate
+        try:
+            self._model_gate = ModelGate(self, root / payload.script_path, source=debug_source)
+        except ValueError as exc:
+            raise ScriptAbort(str(exc), reason_code="model_policy_invalid", status="blocked") from None
+        if self._recorder:
+            from mino_scout.runtime.records import scrub
+            config_doc = parse_yaml((root / "config.yaml").read_text(encoding="utf-8")) if (root / "config.yaml").is_file() else {}
+            # Register OTP/password values before any free text is persisted.
+            config_snapshot = scrub(config_doc)
+            from mino_scout.runtime.workspaces import source_snapshot
+            _, files, _ = source_snapshot(root)
+            self._recorder.store.update_metadata(self._recorder.task_id, self._recorder.attempt_id,
+                {"source_snapshot": self._source_snapshot, "source_hash": self._source_hash, "config_snapshot": config_snapshot,
+                 "file_hashes": files, "revision": str(getattr(payload, "revision", "")), "script_path": payload.script_path,
+                 "run_purpose": self._model_gate.run_purpose, "model_policy": self._model_gate.policy})
+
+    def _bind_source(self, path: Path, *, source=None, sidecar=None):
+        self._covered = set()
         from mino_scout.runtime.script_source import load_source
         self._guard()
         try:
-            external = None if self._debug else load_source(root / payload.script_path, core.node_id)
+            external = load_source(path, self.core.node_id, source=source, sidecar=sidecar)
         except ValueError as exc:
             raise ScriptAbort(str(exc), reason_code="source_read_failed", status="blocked") from None
         except Exception:
             raise ScriptAbort("用例来源读取失败，请检查来源配置、飞书授权及访问权限", reason_code="source_read_failed", status="blocked") from None
         self._guard()
-        self._source_snapshot = {} if self._debug else external if external is not None else parse_yaml(sidecar.read_text(encoding="utf-8")) if sidecar.is_file() else {}
+        self._source_snapshot = external if external is not None else parse_yaml(sidecar.decode("utf-8")) if sidecar is not None else {}
         if not isinstance(self._source_snapshot, dict):
             raise ScriptAbort("用例原文快照不是对象", reason_code="source_invalid", status="blocked")
         if self._source_snapshot:
             source = self._source_snapshot.get("source")
-            if str(self._source_snapshot.get("case_id") or "") != (root / payload.script_path).stem:
+            if str(self._source_snapshot.get("case_id") or "") != path.stem:
                 raise ScriptAbort("原文快照 case_id 与脚本不一致", reason_code="source_case_mismatch", status="blocked")
             if not isinstance(source, dict) or not str(source.get("revision") or "").strip():
                 raise ScriptAbort("原文快照缺固定版本", reason_code="source_revision_missing", status="blocked")
@@ -577,22 +633,6 @@ class Case:
         if external is not None:
             immutable["source"] = {key: value for key, value in immutable["source"].items() if key != "fetched_at"}
         self._source_hash = hashlib.sha256(json.dumps(immutable, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest() if self._source_snapshot else ""
-        from mino_scout.runtime.model_policy import ModelGate
-        try:
-            self._model_gate = ModelGate(self, root / payload.script_path, source=debug_source)
-        except ValueError as exc:
-            raise ScriptAbort(str(exc), reason_code="model_policy_invalid", status="blocked") from None
-        if self._recorder:
-            from mino_scout.runtime.records import scrub
-            config_doc = parse_yaml((root / "config.yaml").read_text(encoding="utf-8")) if (root / "config.yaml").is_file() else {}
-            # Register OTP/password values before any free text is persisted.
-            config_snapshot = scrub(config_doc)
-            from mino_scout.runtime.workspaces import source_snapshot
-            _, files, _ = source_snapshot(root)
-            self._recorder.store.update_metadata(self._recorder.task_id, self._recorder.attempt_id,
-                {"source_snapshot": self._source_snapshot, "source_hash": self._source_hash, "config_snapshot": config_snapshot,
-                 "file_hashes": files, "revision": str(getattr(payload, "revision", "")), "script_path": payload.script_path,
-                 "run_purpose": self._model_gate.run_purpose, "model_policy": self._model_gate.policy})
 
     def _coverage(self):
         return {"expected": len(self._source_clauses), "covered": sorted(self._covered),

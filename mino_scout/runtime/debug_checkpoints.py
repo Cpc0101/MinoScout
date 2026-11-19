@@ -46,12 +46,16 @@ def save(store, task, attempt, command, files, hashes, workspace_hash, work):
                 or result.get("script_path") != path or result.get("workspace_hash") != workspace_hash
                 or result.get("last_action_seq", 0) < result.get("first_action_seq", 1)
                 or result.get("assertions", 0) < 1
+                or result.get("case_lifecycle_completed") is not True
+                or result.get("source_coverage", {}).get("missing")
                 or result.get("write_stopped")):
             raise ValueError("checkpoint_matching_execution_required")
     receipt = {"checkpoint_id": command["request_id"], "task_id": task, "session_id": attempt,
                "script_path": path, "stage": stage, "workspace_hash": workspace_hash,
                "script_hash": hashes[path], "evidence_request_id": command["evidence_request_id"],
                "findings": findings[:100]}
+    if stage == "path_validated":
+        receipt["validation_contract"] = "case_lifecycle.v1"
     if evidence:
         receipt["first_action_seq"] = evidence["result"]["first_action_seq"]
         receipt["last_action_seq"] = evidence["result"]["last_action_seq"]
@@ -68,7 +72,9 @@ def progress(store, task, attempt):
         if receipt:
             latest[receipt["script_path"]] = receipt
     current = store.metadata(task, attempt).get("workspace_hash", "")
-    items = [{**item, "stale": item["workspace_hash"] != current} for item in latest.values()]
+    items = [{**item, "stale": item["workspace_hash"] != current or (
+        item.get("stage") == "path_validated" and item.get("validation_contract") != "case_lifecycle.v1")}
+        for item in latest.values()]
     return {"unit": "case_path", "items": items,
             "counts": {stage: sum(not i["stale"] and STAGES.index(i["stage"]) >= STAGES.index(stage) for i in items) for stage in STAGES},
             "stale": sum(i["stale"] for i in items)}
@@ -79,4 +85,6 @@ def get(store, task, attempt, request):
     receipt = (row or {}).get("result", {}).get("checkpoint")
     if not receipt:
         raise ValueError("debug_checkpoint_not_found")
+    if receipt.get("stage") == "path_validated" and receipt.get("validation_contract") != "case_lifecycle.v1":
+        raise ValueError("debug_checkpoint_validation_required")
     return receipt

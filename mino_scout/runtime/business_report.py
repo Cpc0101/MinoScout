@@ -53,7 +53,7 @@ def _describe(row):
 
 
 def attribution(status, reason):
-    if reason in {"data_missing", "prerequisite_unavailable", "resource_account_missing", "resource_busy", "otp_requires_human", "otp_environment_unavailable"}:
+    if reason in {"data_missing", "prerequisite_unavailable", "resource_account_missing", "resource_busy", "otp_requires_human", "otp_environment_unavailable", "nexus_rejected", "nexus_unreachable"}:
         return "blocked"
     if reason in _AUTOMATION:
         return "automation"

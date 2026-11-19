@@ -52,7 +52,7 @@ def account(case, requirements=None, prefer=None, data_need=None, data_requireme
         remember(data.get(key))
     identity = str(data.get("id") or data.get("account_id") or "").strip()
     if not identity:
-        raise ScriptAbort("这条用例没有租到账号", reason_code="resource_account_missing")
+        raise ScriptAbort("这条用例没有租到账号", reason_code="resource_account_missing", status="blocked")
     case._mail_to = str(data.get("email") or "")
     return SimpleNamespace(
         id=identity,
@@ -70,29 +70,24 @@ def account(case, requirements=None, prefer=None, data_need=None, data_requireme
     )
 
 
-def _gmail_code(case, policy=None) -> str:
+def _gmail_code(case, policy=None, *, to_address=None, account_id="", request=None) -> str:
     import time
 
     from mino_scout.plugins.mail_otp import MailOtpError, fetch_otp_via_imap
-    from mino_scout.plugins.state import plain_value, secret_value
+    from mino_scout.server_comm.mail_requests import consume
     from mino_scout.runtime.script_exec import ScriptAbort
 
     case._guard()
     policy = policy if isinstance(policy, dict) else {}
-    node_id = str(getattr(case.core, "node_id", "") or "")
-    inbox = str(policy.get("otp_inbox_address") or "").strip() or plain_value("mail", "gmail", "inbox_address")
-    imap_host = plain_value("mail", "gmail", "imap_server")
-    password = secret_value(node_id, "mail", "gmail", "app_password")
-    if not inbox or not password:
-        raise ScriptAbort("这个账号没有可用的 Nexus 验证码策略，这台节点也没配收信邮箱",
-                          reason_code="otp_environment_unavailable")
-    started = float(getattr(case, "_started", 0) or 0)
+    recipient = str(getattr(case, "_mail_to", "") if to_address is None else to_address).strip()
+    config, window = consume(case, policy, recipient, account_id, request)
     # 等待窗口以 Nexus 登录策略为准；上限与 plugin.gmail.fetch_otp 一致，并受用例截止时间约束。
     remain_ms = min(int(policy.get("otp_max_wait_ms") or _OTP_WAIT_DEFAULT_MS), _OTP_WAIT_CEILING_MS)
+    remain_ms = max(0, min(remain_ms, int((window["expires"] - time.monotonic()) * 1000)))
     if case.deadline:
         remain_ms = max(0, min(remain_ms, int((case.deadline - time.monotonic()) * 1000)))
     if remain_ms <= 0:
-        raise ScriptAbort("没有取到验证码", reason_code="otp_environment_unavailable")
+        raise ScriptAbort("没有取到验证码", reason_code="otp_environment_unavailable", status="blocked")
 
     def stopped() -> bool:
         case._guard()
@@ -103,11 +98,9 @@ def _gmail_code(case, policy=None) -> str:
     t0 = time.monotonic()
     try:
         code = fetch_otp_via_imap(
-            inbox_address=inbox,
-            imap_host=imap_host,
-            app_password=password,
-            to_address=str(getattr(case, "_mail_to", "") or ""),
-            since_ts=started or None,
+            **config,
+            since_ts=window["started"],
+            mailbox_boundary=window["boundary"],
             from_allowlist=list(policy.get("otp_from_allowlist") or []),
             subject_contains=str(policy.get("otp_subject_contains") or ""),
             poll_interval_ms=int(policy.get("otp_poll_interval_ms") or 200),
@@ -115,14 +108,16 @@ def _gmail_code(case, policy=None) -> str:
             should_stop=stopped,
             diagnostics=diagnostics,
             progress=progress,
+            consumed_messages=case._otp_messages.setdefault(tuple(config[key].lower() for key in
+                ("imap_host", "inbox_address", "to_address")), set()),
         )
     except MailOtpError as exc:
         _record_gmail_wait(case, t0, remain_ms, diagnostics, progress, error=str(exc))
-        raise ScriptAbort(str(exc), reason_code="otp_environment_unavailable") from exc
+        raise ScriptAbort(str(exc), reason_code="otp_environment_unavailable", status="blocked") from exc
     code = str(code or "").strip()
     if not code:
         _record_gmail_wait(case, t0, remain_ms, diagnostics, progress, error="没有取到验证码")
-        raise ScriptAbort("没有取到验证码", reason_code="otp_environment_unavailable")
+        raise ScriptAbort("没有取到验证码", reason_code="otp_environment_unavailable", status="blocked")
     _record_gmail_wait(case, t0, remain_ms, diagnostics, progress)
     return code
 
@@ -148,11 +143,11 @@ def _record_gmail_wait(case, started: float, wait_ms: int, diagnostics: dict, pr
             data[key] = progress[key]
     if error:
         data["reason_code"] = "otp_environment_unavailable"
-    result = ActionResult(ok=not error, summary=error or "已取到验证码", status="fail" if error else "pass", data=data)
+    result = ActionResult(ok=not error, summary=error or "已取到验证码", status="blocked" if error else "pass", data=data)
     report("otp", result, "core", int((time.monotonic() - started) * 1000))
 
 
-def otp(case, account=None) -> str:
+def _otp_source(case, account):
     """取验证码：账号自带码 → Nexus 登录策略 → 旧脚本仓固定码 → 人工。
 
     Nexus 策略支持固定码、邮箱收信和人工。脚本仓 otp.code 只保留为旧仓库兼容兜底，
@@ -163,22 +158,19 @@ def otp(case, account=None) -> str:
     case._guard()
     code = str(getattr(account, "otp", "") or "").strip()
     if code:
-        from mino_scout.runtime.secret_redaction import remember
-        remember(code)
-        return code
+        return "fixed", code
 
     policy = getattr(account, "otp_policy", None)
     policy = policy if isinstance(policy, dict) else {}
     mode = str(policy.get("otp_mode") or "").strip().lower()
     fixed = str(policy.get("otp_fixed") or "").strip()
     if fixed and mode in {"fixed", "auto"}:
-        from mino_scout.runtime.secret_redaction import remember
-        remember(fixed)
-        return fixed
+        return "fixed", fixed
     if mode == "hitl":
         raise ScriptAbort(
             "Nexus 登录策略要求人工提供本次验证码",
             reason_code="otp_requires_human",
+            status="blocked",
         )
     if mode in {"gmail", "auto"}:
         from mino_scout.plugins.state import plain_value, secret_value
@@ -186,28 +178,49 @@ def otp(case, account=None) -> str:
         inbox = str(policy.get("otp_inbox_address") or "").strip() or plain_value("mail", "gmail", "inbox_address")
         password = secret_value(node_id, "mail", "gmail", "app_password")
         if inbox and password:
-            code = _gmail_code(case, policy)
-            from mino_scout.runtime.secret_redaction import remember
-            remember(code)
-            return code
+            return "mail", policy
 
     fixed = ""
     getter = getattr(case, "repo_otp_code", None)
     if callable(getter):
         fixed = str(getter() or "").strip()
     if fixed:
-        from mino_scout.runtime.secret_redaction import remember
-        remember(fixed)
-        return fixed
+        return "fixed", fixed
     raise ScriptAbort(
         "账号没有自带验证码，Nexus 登录策略也没有可用的固定码或邮箱收信：请在 Nexus 项目环境配置验证码策略，或向人要本次验证码",
         reason_code="otp_requires_human",
+        status="blocked",
     )
 
 
-def otp_mail(case) -> str:
+def otp_request(case, account=None):
+    from mino_scout.server_comm.mail_requests import prepare
+
+    if account is None:
+        return prepare(case, {}, getattr(case, "_mail_to", ""))
+    mode, source = _otp_source(case, account)
+    if mode == "fixed":
+        return None
+    return prepare(case, source, getattr(account, "email", ""), getattr(account, "id", ""))
+
+
+def otp(case, account=None, *, request=None) -> str:
+    from mino_scout.runtime.secret_redaction import remember
+
+    mode, source = _otp_source(case, account)
+    code = source if mode == "fixed" else _gmail_code(case, source, to_address=getattr(account, "email", ""),
+                                                      account_id=getattr(account, "id", ""), request=request)
+    remember(code)
+    return code
+
+
+def otp_mail(case, *, request=None) -> str:
     """兼容旧脚本：使用节点配置的 IMAP 邮箱收信。"""
-    return _gmail_code(case, {})
+    from mino_scout.runtime.secret_redaction import remember
+
+    code = _gmail_code(case, {}, request=request)
+    remember(code)
+    return code
 
 
 def llm(case, prompt: str, text: str = "", schema: dict | None = None) -> Any:

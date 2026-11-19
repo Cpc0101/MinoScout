@@ -10,7 +10,7 @@ def call(case, capability: str, params: dict[str, Any], timeout: float) -> dict[
 
     ask = getattr(case.core, "nexus_call", None)
     if not callable(ask):
-        raise ScriptAbort("无法回调 Nexus", reason_code="nexus_unreachable")
+        raise ScriptAbort("无法回调 Nexus", reason_code="nexus_unreachable", status="blocked")
     reply = ask(P.Execute(
         run_id=case.run_id, step_idx=-1, sn=case._sn, capability_id=capability, platform=case._platform,
         params={"session_id": case.session_id, "node_id": getattr(case.core, "node_id", ""),
@@ -19,8 +19,15 @@ def call(case, capability: str, params: dict[str, Any], timeout: float) -> dict[
     ), timeout)
     status = str(getattr(getattr(reply, "status", None), "value", getattr(reply, "status", "")) or "")
     if reply is None or status != "pass":
-        reason = str(getattr(reply, "error", "") or getattr(reply, "summary", "") or "Nexus 没有接受这次回调")
-        raise ScriptAbort(reason[:300], reason_code="nexus_rejected")
+        from mino_scout.runtime.secret_redaction import sanitize
+
+        reason = str(getattr(reply, "summary", "") or getattr(reply, "error", "") or "Nexus 没有接受这次回调")
+        diagnostic = sanitize({
+            "capability_id": capability,
+            "operation": str(params.get("op") or "")[:80],
+            "code": str(getattr(reply, "error", "") or "")[:80],
+        })
+        raise ScriptAbort(sanitize(reason)[:300], reason_code="nexus_rejected", status="blocked", details={"nexus_error": diagnostic})
     data = dict(getattr(reply, "data", None) or {})
     extra = getattr(reply, "extra", None)
     if isinstance(extra, dict):

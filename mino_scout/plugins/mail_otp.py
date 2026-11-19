@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import email
+import hashlib
 import imaplib
 import errno
 import socket
@@ -11,6 +12,7 @@ import time
 from datetime import datetime, timezone
 from email.header import decode_header
 from email.utils import parsedate_to_datetime, getaddresses
+from html.parser import HTMLParser
 from typing import Any, Optional
 
 OTP_BODY_RE = re.compile(r"(?<!\d)(\d{4,8})(?!\d)")
@@ -103,11 +105,42 @@ def extract_otp_from_text(text: str) -> str:
     body = str(text or "")
     if not body.strip():
         return ""
-    for match in OTP_BODY_RE.finditer(body):
-        code = match.group(1)
-        if code:
-            return code
-    return ""
+    codes = set(OTP_BODY_RE.findall(body))
+    # Multiple distinct numbers are ambiguous; never submit the first by accident.
+    return next(iter(codes)) if len(codes) == 1 else ""
+
+
+class _MailText(HTMLParser):
+    """Read text content, excluding markup and non-body code/styles."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.hidden = []
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"head", "style", "script", "template"}:
+            self.hidden.append(tag)
+        elif not self.hidden and tag in {"br", "p", "div", "td", "tr", "li"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self.hidden:
+            self.hidden = self.hidden[:self.hidden.index(tag)]
+        elif not self.hidden and tag in {"p", "div", "td", "tr", "li"}:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.parts.append(data)
+
+
+def _visible_mail_text(text: str, content_type: str) -> str:
+    if content_type != "text/html":
+        return text
+    parser = _MailText()
+    parser.feed(text)
+    parser.close()
+    return "".join(parser.parts)
 
 
 def _decode_mime_header(value: str) -> str:
@@ -175,24 +208,26 @@ def _collect_text_parts(msg: email.message.Message) -> str:
     if msg.is_multipart():
         for part in msg.walk():
             ctype = str(part.get_content_type() or "").lower()
-            if ctype not in ("text/plain", "text/html"):
+            if ctype not in ("text/plain", "text/html") or part.get_content_disposition() == "attachment":
                 continue
             payload = part.get_payload(decode=True)
             if not payload:
                 continue
             charset = part.get_content_charset() or "utf-8"
             try:
-                chunks.append(payload.decode(charset, errors="replace"))
+                text = payload.decode(charset, errors="replace")
             except LookupError:
-                chunks.append(payload.decode("utf-8", errors="replace"))
+                text = payload.decode("utf-8", errors="replace")
+            chunks.append(_visible_mail_text(text, ctype))
     else:
         payload = msg.get_payload(decode=True)
         if payload:
             charset = msg.get_content_charset() or "utf-8"
             try:
-                chunks.append(payload.decode(charset, errors="replace"))
+                text = payload.decode(charset, errors="replace")
             except LookupError:
-                chunks.append(payload.decode("utf-8", errors="replace"))
+                text = payload.decode("utf-8", errors="replace")
+            chunks.append(_visible_mail_text(text, msg.get_content_type()))
     return "\n".join(chunks)
 
 
@@ -264,6 +299,48 @@ def _single_literal(rows, uid: bytes) -> Optional[bytes]:
     return literals[0] if len(literals) == 1 else None
 
 
+def _mailbox_number(mail, field: str) -> int:
+    _, values = mail.response(field)
+    if not values or not isinstance(values[0], bytes) or not values[0].isdigit() or int(values[0]) < 1:
+        raise MailOtpError("otp_mailbox_boundary_unavailable")
+    return int(values[0])
+
+
+def capture_otp_boundary(*, inbox_address: str, imap_host: str, app_password: str,
+                         should_stop=None, max_wait_ms: int = 15000) -> dict:
+    """Read UIDVALIDITY/UIDNEXT before the script requests a new code. Never sends mail."""
+    end = time.monotonic() + max(0, max_wait_ms) / 1000
+    stats = {}
+    mail = None
+    def check():
+        if should_stop and should_stop():
+            raise MailOtpError("otp_wait_stopped")
+        if time.monotonic() >= end:
+            raise MailOtpError("otp_prepare_timeout")
+    def timeout():
+        check()
+        return max(0.001, min(_IO_TIMEOUT_S, end - time.monotonic()))
+    def guard(client):
+        check()
+        if client.sock is not None:
+            client.sock.settimeout(timeout())
+    try:
+        host, port = parse_imap_host(imap_host or DEFAULT_IMAP_HOST)
+        check()
+        mail = _open_inbox(host, port, inbox_address, normalize_app_password(app_password),
+                           guard=guard, io_timeout=timeout, stats=stats)
+        result = {"uid_validity": _mailbox_number(mail, "UIDVALIDITY"),
+                  "min_uid": _mailbox_number(mail, "UIDNEXT")}
+        check()
+        return result
+    except ValueError:
+        raise MailOtpError("otp_imap_host_invalid") from None
+    except (imaplib.IMAP4.error, OSError) as exc:
+        raise MailOtpError(_transport_error(exc, stats.get("phase", "connect"))[0]) from None
+    finally:
+        _close(mail)
+
+
 def _poll_inbox(
     mail,
     *,
@@ -277,6 +354,8 @@ def _poll_inbox(
     refresh: bool,
     guard,
     stats: dict,
+    consumed_messages: Optional[set[str]] = None,
+    min_uid: int = 1,
 ) -> str:
     """在已打开的连接上看一遍新邮件。
 
@@ -289,11 +368,13 @@ def _poll_inbox(
     if refresh:
         mail.noop()
         guard(mail)
-    typ, data = mail.uid("SEARCH", f"(SINCE {_imap_since_date(since_ts)})")
+    typ, data = mail.uid("SEARCH", f"(UID {min_uid}:* SINCE {_imap_since_date(since_ts)})")
     stats["polls"] = stats.get("polls", 0) + 1
     if typ != "OK" or not data or not data[0]:
         return ""
-    fresh = [uid for uid in data[0].split()[-_SCAN_LIMIT:] if uid not in seen]
+    # Bound each batch, not the entire search window. Later polls continue past
+    # already classified mail, including messages for other shared-inbox users.
+    fresh = sorted((uid for uid in data[0].split() if uid not in seen and int(uid) >= min_uid), key=int, reverse=True)[:_SCAN_LIMIT]
     if not fresh:
         return ""
     guard(mail)
@@ -330,8 +411,13 @@ def _poll_inbox(
         if not body:
             continue  # 正文没取回来：不下结论，下一轮再取
         seen.add(uid)
+        fingerprint = hashlib.sha256(body).hexdigest()
+        if consumed_messages is not None and fingerprint in consumed_messages:
+            continue
         code = extract_otp_from_text(_collect_text_parts(email.message_from_bytes(body)))
         if code:
+            if consumed_messages is not None:
+                consumed_messages.add(fingerprint)
             return code
     return ""
 
@@ -351,6 +437,8 @@ def fetch_otp_via_imap(
     deadline_ts: Optional[float] = None,
     diagnostics: Optional[dict] = None,
     progress: Optional[dict] = None,
+    consumed_messages: Optional[set[str]] = None,
+    mailbox_boundary: Optional[dict] = None,
 ) -> str:
     """在等待窗口内从收件箱取验证码。`imap_host` 是 `主机` 或 `主机:端口`，留空用 Gmail，只走隐式 TLS。
 
@@ -361,6 +449,9 @@ def fetch_otp_via_imap(
     `progress` 是本机诊断用的计数（polls / messages / matched），不进协议载荷。
     """
     allow = [str(x).strip() for x in (from_allowlist or []) if str(x).strip()]
+    if mailbox_boundary is not None and (not isinstance(mailbox_boundary, dict) or any(
+            type(mailbox_boundary.get(key)) is not int or mailbox_boundary[key] < 1 for key in ("uid_validity", "min_uid"))):
+        raise MailOtpError("otp_mailbox_boundary_invalid")
     interval = max(0.2, int(poll_interval_ms or 200) / 1000.0)
     deadline = time.time() + max(0.0, int(max_wait_ms) / 1000.0)
     if deadline_ts:
@@ -408,6 +499,8 @@ def fetch_otp_via_imap(
                     diagnostics['connection_attempts'] += 1
                     mail = _open_inbox(host, port, inbox_address, password,
                                        guard=guard, io_timeout=io_timeout, stats=stats)
+                    if mailbox_boundary is not None and _mailbox_number(mail, "UIDVALIDITY") != mailbox_boundary["uid_validity"]:
+                        raise MailOtpError("otp_mailbox_changed")
                 code = _poll_inbox(
                     mail,
                     to_address=to_address,
@@ -416,6 +509,8 @@ def fetch_otp_via_imap(
                     subject_contains=subject_contains,
                     seen=seen, in_window=in_window, matched=matched,
                     refresh=refresh, guard=guard, stats=stats,
+                    consumed_messages=consumed_messages,
+                    min_uid=mailbox_boundary["min_uid"] if mailbox_boundary else 1,
                 )
                 if code:
                     if should_stop and should_stop():

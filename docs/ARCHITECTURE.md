@@ -18,6 +18,8 @@
 
 **UI 只跟 Nexus 说话。** Scout 不对 UI 暴露任何接口。
 
+脚本回调 Nexus 被拒绝时，失败摘要优先保留 Nexus 的具体拒绝信息，状态为 `blocked`，原因保留 `nexus_rejected`；无连接为 `blocked/nexus_unreachable`，不计入断言失败。完整 `run/finished` 事件包含 `nexus_error`（能力、操作、上游错误代码），经过出口脱敏且不附回调参数或账号凭据；仅有异常类型时才显示 `ValueError` 等类型名称。
+
 ## 2. 四层套娃里 Scout 占哪两层
 
 上游 MiniOrangeServer 的执行是四层：
@@ -112,9 +114,17 @@ adb / ios_wda / playwright 三种设备通道，加上 macOS / Windows 原生通
 |---|---|---|
 | 设备句柄 / 浏览器 lane | 进程内存（executor 与 playwright_hub 持有） | 重建 |
 | 连通性探测结果 | 进程内存 + 短 TTL | 重探 |
-| `(run_id, step_idx) → RESULT` 幂等记录 | 进程内存（`runtime/request_guard.py`） | 丢失（Nexus 重发会重新执行，可接受） |
+| `(run_id, step_idx) → RESULT` 幂等记录 | 进程内存（`runtime/request_guard.py`） | 内存缓存丢失；持久 attempt、写意图及代际校验阻止跨重启自动重放 |
 | 停止闩 `run_id → write_stopped` | 进程内存，取消/超时后单调保持 | 丢失；重启后按新进程代际处理 |
 | 截图原图 | 临时文件，用后即删 | — |
 | **任何业务数据** | **不存**，全在 Nexus | — |
 
-**Scout 可以随时被 kill 并重启**，代价上限是"当前那一步重跑一次"。这是硬要求，不要引入需要优雅关闭才能保住的状态。
+**Scout 重启不会自动重放设备动作。** 已接单任务的持久记录用于恢复状态；遗留执行标为 interrupted，写入结果未知时保持资源隔离，等待停止和资源处置证据。
+
+## 执行生命周期回归
+
+代码片段保留调试上下文；`script_path` 整例执行从捕获版本加载原文及前后置，复用正式执行的断言/覆盖门禁。空 check 在两条路径都阻塞。用例后置失败仍尝试项目后置，`cleanup/error` 保留各清理失败，主失败优先。
+
+`python -B scripts/check_case_lifecycle.py` 在临时源码与记录目录运行正式执行及真实调试队列，验证生命周期、覆盖、清理、回调分类、数据摘要和重复取码；CI 与打包前运行，不接真实设备或邮箱。取码会话只在内存保存已消费邮件的摘要，按邮箱/收件人隔离，不保存验证码。
+
+邮箱取码先解析 HTML 正文，排除样式、脚本及附件；存在多个不同的候选数字时不猜测验证码。IMAP 每批最多读取 40 封尚未判定的邮件，后续轮询继续向前扫描，受既有截止时间约束。脚本动态邮箱取码必须先调用 `case.scout.otp_request(account)` 捕获 UIDVALIDITY/UIDNEXT，再发送验证码并用 `case.scout.otp(account, request=request)` 获取边界之后的新邮件。请求绑定当前 Case、账号、收件邮箱及策略，只能使用一次，最长 90 秒；整例重跑或调试 reset 清除请求，同收件人重新准备会使旧请求失效。邮箱代际变化及缺少请求均阻塞，不从用例起始时间回捞旧码。固定码兼容原接口。该边界排除准备前已收取的旧邮件；无法证明准备后延迟到达的邮件属于哪次业务发码，需要产品提供可匹配的请求标识才能保证这种关联。
