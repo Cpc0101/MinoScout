@@ -1202,7 +1202,9 @@ model/call 与 model/result 是诊断事件，记录 request_id/kind/purpose/run
 
 脚本可带同 stem `.yaml` 原文快照：case_id、source(url/revision)、preconditions/steps/expectations（每条 id/text）、account_requirements(all/prefer 子句列表)。source_hash 绑定原文及条款，完整快照仅归档在 Scout。prep/do/check 增加可选 source_ref，同一原文条款可被多个实现块引用；引用静态齐全不代表执行覆盖或语义正确。check 必须产生有效断言；零断言采集只留下证据，不能判正式测试通过。
 
-account(requirements=None, prefer=None, data_need=None, data_requirements=None) 通过原 script.callback op=account 明确传递 requirements，data_need 是可选的最多 2000 字的数据需求描述。Nexus 将描述与实际租到的账号及 run/session/app/case 关联保存；缺省不新增需求记录，不自动造数。账号响应附 project_id。all/prefer 采用 `[{facet, op, value}]`；无参保留既有服务器用例条件。环境、归属、健康与占用仍校验；动态业务标签用于排序，不作为当前状态证明。未知前置保留待验证，不把 prep 标题当作事实或租号参数。
+account(requirements=None, prefer=None, data_need=None, data_requirements=None, *, slot="default", app_id=None, platform=None) 通过原 script.callback op=account 明确传递 requirements、slot、app_id、platform；data_need 是可选的最多 2000 字的数据需求描述。Nexus 将描述与实际租到的账号及 run/session/app/case 关联保存；缺省不新增需求记录，不自动造数。all/prefer 采用 `[{facet, op, value}]`；无参保留既有服务器用例条件。环境、归属、健康与占用仍校验；动态业务标签用于排序，不作为当前状态证明。未知前置保留待验证，不把 prep 标题当作事实或租号参数。
+
+`slot` 是单个脚本内的账号幂等键，不限制一条用例的 slot 数量；省略或无参兼容 `slot="default"`。不同 slot 可租不同应用、平台、环境渠道和 OTP 策略，但应用必须属于当前项目。同一 slot 重复调用返回同一份有效账号；改变 app_id/platform 返回 `account_slot_scope_mismatch`，缓存或租约失效返回 `resource_account_missing`，均不得静默换号。跨项目应用、请求平台不受支持、渠道不存在或渠道选择有歧义分别阻塞。响应带 slot、app_id、platform、target_package、project_id 及对应登录策略。`picked_account` / `resource_lease` 是旧客户端兼容视图，优先指向 default，无 default 时指向最近租约；完整集合为 `leased_accounts`、`leased_account_leases` 和 `leased_account_by_slot`。
 
 执行摘要的 `resource_isolated` 是布尔值：取消确认只证明 worker 已停止；若最后设备动作结果不明，仍为 true，Nexus 必须保留设备和账号隔离。`started_at` / `finished_at` 使用 ISO 8601 UTC。
 
@@ -1291,4 +1293,4 @@ Nexus 不可达或回调拒绝在 Scout 记为 blocked，原因分别为 nexus_u
 
 脚本邮箱 OTP 的本地请求契约：先调用 `case.scout.otp_request(account)` 只读捕获邮箱 UIDVALIDITY/UIDNEXT，产品发码后调用 `case.scout.otp(account, request=...)`。请求绑定当前 Case、账号、收件邮箱及登录策略，一次消费且最长 90 秒；同收件人重新准备、整例重跑、reset 或进程重启使旧请求失效。缺请求 `otp_request_required`，未知/已用请求 `otp_request_invalid`，范围变化 `otp_request_mismatch`，过期 `otp_request_expired`，均 blocked。取码及重连核对 UIDVALIDITY，只接受 UIDNEXT 边界之后的邮件；邮箱代际变化以 `otp_environment_unavailable` / `otp_mailbox_changed` 阻塞。固定码兼容旧 API，`otp_mail(request=...)` 使用同一门禁和脱敏。请求、邮箱凭据和 UID 边界仅保存在 Scout 内存，不新增 Nexus wire 字段。边界不等于产品发码请求 ID，无法区分准备后才延迟到达的旧请求邮件。
 
-Nexus 账号回调返回已缓存凭据前必须检查账号租约仍由当前 run/case/device 持有且未过期，失效返回 `resource_account_missing`，不能仅凭 ctx.picked_account 返回凭据或静默换号。
+Nexus 账号回调按 slot 返回已缓存凭据前，必须检查该账号租约仍由当前 run/case/device 持有且未过期；失效返回 `resource_account_missing`，不能借用 `picked_account` 兼容视图或静默换号。`otp_mail(slot=...)` 只使用该 slot 已租账号且不隐式租号；无参旧路径仅当当前执行没有任何 slot 账号时走节点邮箱，已有其他 slot 但 default 未租时返回 `resource_account_missing`。旧 `otp(account)` 仍按传入账号对象取码。每个 slot 的 OTP 策略取自己的 app/env/surface，不得相互继承。

@@ -470,10 +470,10 @@ class _Scout:
 
         return otp(self._case, account, request=request)
 
-    def otp_mail(self, *, request=None) -> str:
+    def otp_mail(self, *, slot: str = "default", request=None) -> str:
         from mino_scout.server_comm.callbacks import otp_mail
 
-        return otp_mail(self._case, request=request)
+        return otp_mail(self._case, slot=slot, request=request)
 
     def llm(self, prompt: str, text: str = "", schema: dict | None = None) -> Any:
         from mino_scout.server_comm.callbacks import llm
@@ -502,10 +502,33 @@ class _Nexus:
 
         return check(self._case, number, source_ref=source_ref)
 
-    def account(self, requirements: dict | None = None, prefer: list | None = None, data_need: str | None = None, data_requirements: list | None = None) -> SimpleNamespace:
+    def account(
+        self,
+        requirements: dict | None = None,
+        prefer: list | None = None,
+        data_need: str | None = None,
+        data_requirements: list | None = None,
+        *,
+        slot: str = "default",
+        app_id: str | None = None,
+        platform: str | None = None,
+    ) -> SimpleNamespace:
         from mino_scout.server_comm.callbacks import account
 
-        return account(self._case, requirements=requirements, prefer=prefer, data_need=data_need, data_requirements=data_requirements)
+        result = account(
+            self._case,
+            requirements=requirements,
+            prefer=prefer,
+            data_need=data_need,
+            data_requirements=data_requirements,
+            slot=slot,
+            app_id=app_id,
+            platform=platform,
+        )
+        accounts = getattr(self._case, "_accounts_by_slot", None)
+        if isinstance(accounts, dict):
+            accounts[str(getattr(result, "slot", "") or slot)] = result
+        return result
 
     def assert_equal(self, actual: Any, expected: Any, message: str = "") -> None:
         self._case._guard()
@@ -556,6 +579,7 @@ class Case:
         self._role = ""
         self._started = time.time()
         self._mail_to = ""
+        self._accounts_by_slot: dict[str, SimpleNamespace] = {}
         self._otp_messages: dict[tuple[str, str, str], set[str]] = {}
         self._otp_requests: dict[str, dict] = {}
         self._apps: dict[str, App] = {}

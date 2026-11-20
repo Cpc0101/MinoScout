@@ -5,18 +5,53 @@ from typing import Any
 
 _OTP_WAIT_DEFAULT_MS = 30_000
 _OTP_WAIT_CEILING_MS = 90_000
+_DEFAULT_ACCOUNT_SLOT = "default"
 
 
-def account(case, requirements=None, prefer=None, data_need=None, data_requirements=None):
+def _account_slot(value) -> str:
+    from mino_scout.runtime.script_exec import ScriptAbort
+
+    if value is None:
+        return _DEFAULT_ACCOUNT_SLOT
+    if type(value) is not str:
+        raise ScriptAbort("slot 必须是字符串", reason_code="account_slot_invalid", status="blocked")
+    slot = value.strip()
+    if not slot:
+        return _DEFAULT_ACCOUNT_SLOT
+    if len(slot) > 80 or any(ord(char) < 32 or ord(char) == 127 for char in slot):
+        raise ScriptAbort("slot 无效", reason_code="account_slot_invalid", status="blocked")
+    return slot
+
+
+def account(
+    case,
+    requirements=None,
+    prefer=None,
+    data_need=None,
+    data_requirements=None,
+    *,
+    slot="default",
+    app_id=None,
+    platform=None,
+):
     from types import SimpleNamespace
 
     from mino_scout.runtime.script_exec import ScriptAbort
 
     case._guard()
+    wanted_slot = _account_slot(slot)
+    if app_id is not None and type(app_id) is not str:
+        raise ScriptAbort("app_id 必须是字符串", reason_code="account_app_invalid", status="blocked")
+    if platform is not None and type(platform) is not str:
+        raise ScriptAbort("platform 必须是字符串", reason_code="account_platform_not_supported", status="blocked")
     requirements = requirements if requirements is not None else case._source_snapshot.get("account_requirements")
     if requirements is not None and not isinstance(requirements, dict):
         raise ScriptAbort("requirements 必须是 all/prefer 对象", reason_code="account_requirements_invalid", status="blocked")
-    params = {"op": "account"}
+    params = {"op": "account", "slot": wanted_slot}
+    if app_id is not None:
+        params["app_id"] = app_id
+    if platform is not None:
+        params["platform"] = platform
     inputs = getattr(getattr(case, "data", None), "inputs", {})
     if "account_id" in inputs and (not isinstance(inputs["account_id"], str) or not inputs["account_id"].strip()):
         raise ScriptAbort("account_id 必须是明确的账号标识", reason_code="account_requirements_invalid", status="blocked")
@@ -46,7 +81,7 @@ def account(case, requirements=None, prefer=None, data_need=None, data_requireme
             if not isinstance(rows, list) or any(not isinstance(row, dict) or set(row) - {"facet", "op", "value"} or not row.get("facet") or not row.get("op") for row in rows):
                 raise ScriptAbort("账号筛选条件无效", reason_code="account_requirements_invalid", status="blocked")
         params["requirements"] = filters
-    data = case._callback("script.callback", params, 15)
+    data = dict(case._callback("script.callback", params, 15) or {})
     from mino_scout.runtime.secret_redaction import remember
     for key in ("password", "otp", "token"):
         remember(data.get(key))
@@ -54,9 +89,14 @@ def account(case, requirements=None, prefer=None, data_need=None, data_requireme
     if not identity:
         raise ScriptAbort("这条用例没有租到账号", reason_code="resource_account_missing", status="blocked")
     case._mail_to = str(data.get("email") or "")
-    return SimpleNamespace(
+    policy = dict(data.get("login_policy") or {})
+    result = SimpleNamespace(
         id=identity,
         project_id=str(data.get("project_id") or ""),
+        slot=str(data.get("slot") or wanted_slot),
+        app_id=str(data.get("app_id") or app_id or ""),
+        platform=str(data.get("platform") or platform or ""),
+        target_package=str(data.get("target_package") or ""),
         data_need=str(data_need or ""),
         data_matches=list(data.get("data_matches") or []),
         data_match_count=int(data.get("data_match_count") or 0),
@@ -66,8 +106,15 @@ def account(case, requirements=None, prefer=None, data_need=None, data_requireme
         password=str(data.get("password") or ""),
         otp=str(data.get("otp") or ""),
         ident=str(data.get("ident") or ""),
-        otp_policy=dict(data.get("login_policy") or {}),
+        login_policy=policy,
+        otp_policy=policy,
     )
+    accounts = getattr(case, "_accounts_by_slot", None)
+    if not isinstance(accounts, dict):
+        accounts = {}
+        case._accounts_by_slot = accounts
+    accounts[result.slot] = result
+    return result
 
 
 def _gmail_code(case, policy=None, *, to_address=None, account_id="", request=None) -> str:
@@ -214,8 +261,24 @@ def otp(case, account=None, *, request=None) -> str:
     return code
 
 
-def otp_mail(case, *, request=None) -> str:
-    """兼容旧脚本：使用节点配置的 IMAP 邮箱收信。"""
+def otp_mail(case, *, slot="default", request=None) -> str:
+    """Use an already leased slot; bare calls keep the legacy node-mailbox path."""
+    case._guard()
+    wanted_slot = _account_slot(slot)
+    accounts = getattr(case, "_accounts_by_slot", None)
+    account_obj = accounts.get(wanted_slot) if isinstance(accounts, dict) else None
+    if account_obj is not None:
+        return otp(case, account_obj, request=request)
+    if wanted_slot != _DEFAULT_ACCOUNT_SLOT or accounts:
+        from mino_scout.runtime.script_exec import ScriptAbort
+
+        raise ScriptAbort(
+            f"账号 slot={wanted_slot} 尚未租用，请先调用 case.nexus.account(slot=...)",
+            reason_code="resource_account_missing",
+            status="blocked",
+        )
+    # Old scripts called otp_mail() without leasing. Preserve that node-configured
+    # IMAP path only when no slot account exists; never lease implicitly here.
     from mino_scout.runtime.secret_redaction import remember
 
     code = _gmail_code(case, {}, request=request)

@@ -150,6 +150,19 @@ Nexus 不读脚本仓库（可能是私有的），所以“这个项目的仓�
 - Workbench：项目配置里包名 / URL 改只读；`cases[].status` 新值展示；
 - 存量老脚本（`case.tap` 写法）需迁移。
 
+## 多账号租用
+
+同一脚本可以按用途定义任意数量的账号 slot；实际数量由项目资源和准入约束决定，不再要求一条用例只能租一个账号：
+
+```python
+buyer = case.nexus.account(slot="buyer", app_id="APP_SHOP", platform="web")
+admin = case.nexus.account(slot="admin", app_id="APP_OPS", platform="web")
+mobile = case.nexus.account(slot="mobile_user", app_id="APP_SHOP", platform="android")
+code = case.scout.otp_mail(slot="buyer")
+```
+
+`slot` 是幂等键，同一 slot 重复调用返回同一份有效租约；不同 slot 可跨应用、跨平台，并使用各自的 app/env/surface 登录与 OTP 策略。无参兼容 `slot="default"`。`otp_mail(slot=...)` 只使用该 slot 已租账号，不会隐式租号。同一 slot 改变 `app_id` / `platform` 返回 `account_slot_scope_mismatch`；租约失效返回 `resource_account_missing`，不得静默换号。跨项目应用和不支持平台阻塞。`picked_account` / `resource_lease` 只是旧兼容视图；新脚本按 slot 保存并使用返回账号。
+
 ## 动态邮箱验证码的请求关联
 
 本版本动态邮箱取码必须在产品发码前建立请求，不再通过整个用例开始时间回捞邮件。用现有 Scout 页面控件操作发码：
@@ -164,4 +177,4 @@ code = case.scout.otp(account, request=request)
 
 `otp_request` 只读邮箱 UIDVALIDITY/UIDNEXT，不发送验证码。请求绑定当前执行、账号、收件邮箱及策略，90 秒内一次取码（含有界重连）；重新发码前重新准备。请求不可跨整例重跑、reset 或 Scout 重启使用。没有请求、已消费、过期、跨账号、收件邮箱或策略变化均 blocked；邮箱代际变化要求重新准备。固定验证码允许原 `otp(account)` 写法，`otp_request(account)` 对固定码返回 None 且不访问邮箱。
 
-旧 `otp_mail` 写法也必须先调用 `otp_request()`，再在发码后调用 `otp_mail(request=request)`；需要已有明确收件人。接口返回前统一登记验证码脱敏。准备之前已存在但未消费的旧邮件被排除；准备后延迟到达的上一次邮件仍需产品请求标识才能与本次发码严格区分。
+旧 `otp_mail` 写法也必须先调用 `otp_request()`，再在发码后调用 `otp_mail(request=request)`；需要已有明确收件人。无参 `otp_mail()` 只在当前执行完全没有 slot 账号时保留旧节点邮箱兼容路径；已有其他 slot 但 default 未租时返回 `resource_account_missing`，不得借用 `picked_account` 或最近租约。接口返回前统一登记验证码脱敏。准备之前已存在但未消费的旧邮件被排除；准备后延迟到达的上一次邮件仍需产品请求标识才能与本次发码严格区分。
