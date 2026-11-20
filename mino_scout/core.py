@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from dataclasses import replace
@@ -32,8 +33,16 @@ from mino_scout.schemas import CapturedScreen, EventResult, EventStatus, PlanEve
 TAG = "ScoutCore"
 
 SCOUT_VERSION = Path(__file__).with_name("VERSION").read_text(encoding="utf-8").strip()
-# 单节点 Web 槽 Playwright 并行路数（与 Nexus WEB_PLAYWRIGHT_PARALLEL_LANES 一致）
-PLAYWRIGHT_PARALLEL_LANES = 4
+
+
+def _configured_playwright_lanes() -> int:
+    from mino_scout.platform.web.web_v5 import configured_lanes
+    return configured_lanes()
+
+
+# Compatibility export. The same count is consumed by run, debug, script and v5;
+# execution labels never create a second capacity pool.
+PLAYWRIGHT_PARALLEL_LANES = _configured_playwright_lanes()
 
 # 幂等缓存保留时长。CONVENTIONS.md §5：该 run 结束或 10 分钟，取先到者。
 _IDEMPOTENT_TTL_SEC = 600.0
@@ -134,12 +143,18 @@ class ScoutCore:
         self._pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="scout-exec")
         # 已取消的 run。随后到的截图不能再把它写回在途名单，否则休眠会误判还有任务。
         self._cancelled_runs: dict[str, float] = {}
-        # Playwright sync API 绑定线程：按 run_id 分片，同 run 固定在同一条 worker；路数固定 4。
-        self._pw_shard_count = PLAYWRIGHT_PARALLEL_LANES
+        # Playwright sync API binds to its thread. One shared Web lane maps to
+        # exactly one single-worker shard; run/debug/script/v5 never get extra pools.
+        self._pw_shard_count = _configured_playwright_lanes()
         self._pw_shards = [
             ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"scout-pw-{i}")
             for i in range(self._pw_shard_count)
         ]
+        # lane index -> the external claim currently dispatched on that shard.
+        # This prevents a timed-out worker and a replacement dispatch from
+        # sharing one Playwright thread-local browser.
+        self._legacy_lane_busy: dict[int, str] = {}
+        self._legacy_cleanup: set[int] = set()
         self._pw_lock = threading.Lock()
         self._pw_worker = threading.local()
         self._adb_ime_last_check: dict[str, float] = {}
@@ -150,7 +165,7 @@ class ScoutCore:
         self._requests = RequestGuard()
         from mino_scout.runtime.execution_binding import BindingGuard
         self.binding_guard = BindingGuard()
-        self._web_v5 = WebV5Runtime()
+        self._web_v5 = WebV5Runtime(lanes=self._pw_shard_count)
 
     # ---------------- EXECUTE（唯一 dispatch） ----------------
 
@@ -331,11 +346,30 @@ class ScoutCore:
             return result
         timeout = float(req.timeout_sec or 0) or 30.0
         on_playwright = _use_playwright_thread(req)
-        pool = self._playwright_executor(req) if on_playwright else self._pool
+        lane_key = ""
+        lane_index: int | None = None
+        claim_state = ""
+        if on_playwright:
+            lane_key, lane_index, claim_state, reason = self._claim_legacy_lane(req)
+            if reason:
+                result = make_event_result(_event_from_execute(req), status=EventStatus.BLOCKED,
+                    executor_used="core", started_at=now_iso(), elapsed_ms=0, summary=reason,
+                    raw_response={"execution": {"execution_started": "no", "phase": "admission",
+                                                "reason_code": reason},
+                                  "resource": self._web_v5.capacity()})
+                self._requests.finish(req, result)
+                return result
+        pool = self._playwright_executor(lane_index) if on_playwright else self._pool
         retired = threading.Event() if on_playwright else None
         holder: dict[str, int] = {}
         if on_playwright:
-            fut = pool.submit(self._execute_playwright, req, retired, holder)
+            try:
+                fut = pool.submit(self._execute_playwright, req, retired, holder,
+                                  lane_key, lane_index)
+            except Exception:
+                if claim_state == "created" and lane_key:
+                    self._web_v5.release_external(lane_key)
+                raise
         else:
             fut = pool.submit(self._execute_body, req)
         # Only actual worker completion releases the in-flight identity. A caller
@@ -346,15 +380,19 @@ class ScoutCore:
                 if ui_write(req.capability_id) and value.status is not EventStatus.PASS and execution_started(value.raw_response) != "no":
                     self._requests.stop(req.run_id, "write_outcome_unknown", {"run_id": req.run_id, "step_idx": req.step_idx})
                 self._requests.finish(req, value)
+                if (on_playwright and value.status is not EventStatus.PASS
+                        and ui_write(req.capability_id) and execution_started(value.raw_response) != "no"):
+                    self._close_legacy_lane(lane_key, lane_index, settle_claim=True)
             except Exception:
-                pass
+                if on_playwright and lane_key:
+                    self._web_v5.quarantine_external(lane_key)
         fut.add_done_callback(completed)
         try:
             result = fut.result(timeout=timeout)
         except TimeoutError:
             if retired is not None:
                 retired.set()
-                self._retire_playwright_shard(req, holder.get("ident"))
+                self._retire_playwright_shard(req, holder.get("ident"), lane_index)
             result = _timeout_result(req, timeout, lane_reset=retired is not None)
             if ui_write(req.capability_id):
                 stop = self._requests.stop(req.run_id, "write_timeout_unknown", {"run_id": req.run_id, "step_idx": req.step_idx})
@@ -371,7 +409,8 @@ class ScoutCore:
         return result
 
     def _execute_playwright(
-        self, req: P.Execute, retired: threading.Event, holder: dict[str, int]
+        self, req: P.Execute, retired: threading.Event, holder: dict[str, int],
+        lane_key: str = "", lane_index: int | None = None,
     ) -> EventResult:
         """Playwright 同步 API 绑在这条线程上。超时后调用方会换一条线程，这里只关自己的浏览器。"""
         from mino_scout.platform.web.playwright_hub import get_hub
@@ -379,43 +418,107 @@ class ScoutCore:
         holder["ident"] = threading.get_ident()
         get_hub().note_lane(str(req.run_id or ""))
         previous_run = getattr(self._pw_worker, "run_id", None)
+        previous_lane = getattr(self._pw_worker, "lane_index", None)
         self._pw_worker.run_id = str(req.run_id or "")
+        self._pw_worker.lane_index = lane_index
+        if lane_index is not None:
+            with self._pw_lock:
+                self._legacy_lane_busy[lane_index] = lane_key
         try:
             return self._execute_body(req)
         finally:
+            close_lane = bool(
+                retired.is_set()
+                or not str(req.run_id or "").strip()
+                or self._requests.stopped(req.run_id).get("state") == "terminal"
+            )
+            if close_lane:
+                self._close_legacy_lane(lane_key, lane_index, settle_claim=True)
             self._pw_worker.run_id = previous_run
-            if retired.is_set():
-                try:
-                    get_hub().release_this_lane()
-                except Exception as exc:
-                    SLog.w(TAG, f"超时后关闭本线程浏览器: {exc}")
+            self._pw_worker.lane_index = previous_lane
+            if lane_index is not None:
+                with self._pw_lock:
+                    if self._legacy_lane_busy.get(lane_index) == lane_key:
+                        self._legacy_lane_busy.pop(lane_index, None)
 
-    def _retire_playwright_shard(self, req: P.Execute, owner: int | None) -> None:
-        """卡住的 worker 不能杀。换一个空池，后续指令不再排在它后面空等。"""
+    def _retire_playwright_shard(self, req: P.Execute, owner: int | None,
+                                 lane_index: int | None) -> None:
+        """Invalidate the page generation without creating a second capacity lane."""
         from mino_scout.platform.web.playwright_hub import get_hub
 
         rid = str(req.run_id or "").strip()
-        n = len(self._pw_shards) or 1
-        idx = (hash(rid) & 0x7FFFFFFF) % n if rid else 0
-        with self._pw_lock:
-            self._pw_shards[idx] = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix=f"scout-pw-{idx}"
-            )
         if owner:
             get_hub().retire_owner(int(owner))
         else:
             get_hub().retire_lane(rid)
         SLog.w(
             TAG,
-            f"playwright shard {idx} 超时后已换新线程 run={rid or '-'} cap={req.capability_id}",
+            f"playwright lane {lane_index} 超时后作废旧页面 run={rid or '-'} cap={req.capability_id}",
         )
 
-    def _playwright_executor(self, req: P.Execute) -> ThreadPoolExecutor:
-        rid = str(req.run_id or "").strip()
+    def _playwright_executor(self, lane_index: int | None) -> ThreadPoolExecutor:
         with self._pw_lock:
             n = len(self._pw_shards) or 1
-            idx = (hash(rid) & 0x7FFFFFFF) % n if rid else 0
+            idx = int(lane_index) if lane_index is not None else 0
+            if idx < 0 or idx >= n:
+                raise ValueError("lane_index_invalid")
             return self._pw_shards[idx]
+
+    def _claim_legacy_lane(self, req: P.Execute) -> tuple[str, int | None, str, str]:
+        """Claim the shared Web lane used by legacy run/debug/script execution."""
+        hint = req.device_hint if isinstance(req.device_hint, dict) else {}
+        inherited = str(hint.get("_scout_lane_claimed") or "").strip()
+        if inherited:
+            try:
+                lane_index = int(hint.get("_scout_lane_index"))
+            except (TypeError, ValueError):
+                return inherited, None, "inherited", "lane_index_invalid"
+            if not 0 <= lane_index < len(self._pw_shards):
+                return inherited, None, "inherited", "lane_index_invalid"
+            return inherited, lane_index, "inherited", ""
+
+        lane_key = str(req.run_id or "").strip() or f"adhoc:{uuid.uuid4().hex}"
+        claim_state = self._web_v5.claim_external_state(
+            lane_key, run_id=req.run_id, kind="legacy")
+        if claim_state == "quarantined":
+            return lane_key, None, claim_state, "lane_quarantined"
+        if claim_state != "created" and claim_state != "reused":
+            return lane_key, None, claim_state, "resource_busy"
+        lane_index = self._web_v5.lane_index(lane_key)
+        if lane_index is None:
+            if claim_state == "created":
+                self._web_v5.release_external(lane_key)
+            return lane_key, None, claim_state, "lane_index_unavailable"
+        return lane_key, lane_index, claim_state, ""
+
+    def _close_legacy_lane(self, lane_key: str, lane_index: int | None, *,
+                           settle_claim: bool) -> None:
+        """Close a legacy lane on its owning Playwright thread, then settle claim."""
+        if not lane_key or lane_index is None:
+            return
+        with self._pw_lock:
+            if lane_index in self._legacy_cleanup:
+                return
+            self._legacy_cleanup.add(lane_index)
+            shard = self._pw_shards[lane_index]
+        closed = False
+        try:
+            if getattr(self._pw_worker, "lane_index", None) == lane_index:
+                closed = _stop_playwright_hub()
+            else:
+                closed = bool(shard.submit(_stop_playwright_hub).result(timeout=12.0))
+        except Exception as exc:
+            SLog.w(TAG, f"playwright lane {lane_index} 关闭失败: {exc}")
+            closed = False
+        finally:
+            with self._pw_lock:
+                self._legacy_cleanup.discard(lane_index)
+        if not settle_claim:
+            return
+        if closed:
+            self._web_v5.release_external(lane_key)
+        else:
+            self._web_v5.quarantine_external(lane_key)
 
     def _execute_body(self, req: P.Execute) -> EventResult:
         token_run = current_run_id.set(req.run_id)
@@ -480,13 +583,45 @@ class ScoutCore:
         stop = threading.Event()
         if _use_playwright_thread(req):
             timeout = float(req.timeout_sec or 0) or 30.0
-            future = self._playwright_executor(req).submit(script_dispatch.accept, self, req, stop)
+            lane_key, lane_index, claim_state, reason = self._claim_legacy_lane(req)
+            if reason:
+                from mino_scout.executors.base import make_event_result, now_iso
+                from mino_scout.schemas import EventStatus
+                return make_event_result(_event_from_execute(req), status=EventStatus.BLOCKED,
+                    executor_used="core", started_at=now_iso(), elapsed_ms=0, summary=reason,
+                    raw_response={"execution": {"execution_started": "no", "phase": "admission",
+                                                "reason_code": reason}})
+            settle_claim = claim_state != "inherited"
+            try:
+                future = self._playwright_executor(lane_index).submit(
+                    self._execute_script_lane, req, stop, lane_key, lane_index, settle_claim
+                )
+            except Exception:
+                if claim_state == "created":
+                    self._web_v5.release_external(lane_key)
+                raise
             try:
                 return future.result(timeout=timeout)
             except TimeoutError:
                 stop.set()
                 return script_dispatch.timeout_result(req)
         return script_dispatch.accept(self, req, stop)
+
+    def _execute_script_lane(self, req: P.Execute, stop: threading.Event, lane_key: str,
+                             lane_index: int, settle_claim: bool):
+        from mino_scout.server_comm import script_dispatch
+        previous_lane = getattr(self._pw_worker, "lane_index", None)
+        self._pw_worker.lane_index = lane_index
+        with self._pw_lock:
+            self._legacy_lane_busy[lane_index] = lane_key
+        try:
+            return script_dispatch.accept(self, req, stop)
+        finally:
+            self._close_legacy_lane(lane_key, lane_index, settle_claim=settle_claim)
+            self._pw_worker.lane_index = previous_lane
+            with self._pw_lock:
+                if self._legacy_lane_busy.get(lane_index) == lane_key:
+                    self._legacy_lane_busy.pop(lane_index, None)
 
     def _list_scripts(self, req: P.Execute):
         import shutil
@@ -985,6 +1120,9 @@ class ScoutCore:
         if records:
             records.cancel_run(run_id)
         self._requests.stop(run_id, "task_cancelled", {}, terminal=True)
+        rid = str(run_id or "").strip()
+        lane_index = self._web_v5.lane_index(rid) if rid else None
+        lane_kind = self._web_v5.external_kind(rid) if rid else ""
         if self._requests.active(run_id):
             # 2026-10-23：Nexus 已宣告该 run 结束，但底层请求可能仍挂在旧 future 上。
             # 以前这里直接 return，run 会一直留在 _active_runs，节点永久 busy，
@@ -994,8 +1132,14 @@ class ScoutCore:
             with self._lock:
                 self._active_runs.discard(run_id)
                 self._run_seen.pop(run_id, None)
+            from mino_scout.executors.desktop import get_desktop_runtime
+            get_desktop_runtime().cancel(run_id)
             return
-        self._web_v5.close(run_id, time.monotonic() + 2)
+        if lane_kind == "legacy":
+            self._close_legacy_lane(rid, lane_index, settle_claim=True)
+        elif lane_kind != "script":
+            # v5 owns its process and can provide a stop receipt directly.
+            self._web_v5.close(run_id, time.monotonic() + 2)
         with self._lock:
             self._active_runs.discard(run_id)
             self._run_seen.pop(run_id, None)
@@ -1004,18 +1148,6 @@ class ScoutCore:
         SLog.i(TAG, f"cancel run={run_id}")
         from mino_scout.executors.desktop import get_desktop_runtime
         get_desktop_runtime().cancel(run_id)
-        rid = str(run_id or "").strip()
-        if rid:
-            fake = P.Execute(run_id=rid, step_idx=-1, sn="", capability_id="cancel_run", platform="web")
-            try:
-                if getattr(self._pw_worker, "run_id", None) == rid:
-                    # Already on this run's single-worker lane. Submitting to
-                    # that same lane and waiting blocks the cleanup behind us.
-                    _release_playwright_run(rid)
-                else:
-                    self._playwright_executor(fake).submit(lambda: _release_playwright_run(rid)).result(timeout=12.0)
-            except Exception as exc:
-                SLog.w(TAG, f"cancel run playwright release: {exc!r}")
         return
 
     def shutdown(self) -> None:
@@ -1027,16 +1159,34 @@ class ScoutCore:
         records = getattr(self, "_script_records", None)
         if records:
             records.close()
-        for lane in self._web_v5.lanes:
-            if lane["run"]:
+        for lane in list(self._web_v5.lanes):
+            if lane["run"] and not lane["external"]:
                 self._web_v5.close(lane["run"], time.monotonic() + 2)
+        lane_results: dict[int, bool] = {}
         try:
             with self._pw_lock:
                 shards = list(self._pw_shards)
-            for shard in shards:
-                shard.submit(_stop_playwright_hub).result(timeout=8.0)
+            for idx, shard in enumerate(shards):
+                try:
+                    lane_results[idx] = bool(shard.submit(_stop_playwright_hub).result(timeout=8.0))
+                except Exception as exc:
+                    lane_results[idx] = False
+                    SLog.w(TAG, f"playwright lane {idx} 退出清理: {exc}")
         except Exception as exc:
             SLog.w(TAG, f"playwright 退出清理: {exc}")
+        for idx, lane in enumerate(list(self._web_v5.lanes)):
+            key = str(lane.get("run") or "")
+            if not key or not lane.get("external"):
+                continue
+            if lane.get("external_kind") == "legacy":
+                if lane_results.get(idx) is True:
+                    self._web_v5.release_external(key)
+                else:
+                    self._web_v5.quarantine_external(key)
+            # script lanes are settled by ScriptRecords after its worker receipt.
+        with self._pw_lock:
+            for shard in self._pw_shards:
+                shard.shutdown(wait=False, cancel_futures=True)
         from mino_scout.executors.desktop import get_desktop_runtime
         get_desktop_runtime().shutdown()
 
@@ -1095,8 +1245,14 @@ class ScoutCore:
             running = records.active()
             active = sorted(set(active) | {job["run_id"] for job in running})
             workload.extend(P.DeviceWorkload(sn=job["sn"], run_id=job["run_id"], capability_id="script.submit") for job in running)
+        web_sn = f"web{self.node_id}"
+        workload.extend(
+            P.DeviceWorkload(sn=web_sn, run_id=claim["run_id"],
+                             capability_id=f"web.lane.{claim['kind']}")
+            for claim in self._web_v5.active_claims() if claim["run_id"]
+        )
         capacity = self._web_v5.capacity()
-        workload.append(P.DeviceWorkload(sn=f"web{self.node_id}", **capacity))
+        workload.append(P.DeviceWorkload(sn=web_sn, capability_id="web.lane.capacity", **capacity))
         from mino_scout.runtime.input_contract import runtime_input_capabilities
         from mino_scout.plugins.state import status_list
         from mino_scout.config import development
@@ -1155,23 +1311,27 @@ class ScoutCore:
         now = time.time()
         cutoff = now - _IDEMPOTENT_TTL_SEC
         idle_cutoff = now - _IDLE_RUN_SEC
+        legacy_to_close: list[tuple[str, int]] = []
         with self._lock:
             self._evict_cancelled()
             for rid, ts in list(self._run_seen.items()):
                 if ts < cutoff or (ts < idle_cutoff and not self._requests.active(rid)):
                     self._active_runs.discard(rid)
                     self._run_seen.pop(rid, None)
+                    if self._web_v5.external_kind(rid) == "legacy":
+                        idx = self._web_v5.lane_index(rid)
+                        if idx is not None:
+                            legacy_to_close.append((rid, idx))
+        for rid, idx in legacy_to_close:
+            self._requests.stop(rid, "idle_run_closed", {}, terminal=True)
+            threading.Thread(target=self._close_legacy_lane,
+                             args=(rid, idx), kwargs={"settle_claim": True},
+                             daemon=True, name=f"scout-pw-close-{idx}").start()
 
     # ---------------- 幂等 ----------------
 
     # 幂等记录由 runtime/request_guard.py 持有：键 (run_id, step_idx)、内容比较、
     # 在途拒绝与缓存结果都在那里。这里不再维护第二份缓存。
-
-
-def _release_playwright_run(run_id: str) -> None:
-    from mino_scout.platform.web.playwright_hub import get_hub
-
-    get_hub().release_run(run_id)
 
 
 # ---------------- 载荷 ↔ 内部模型 ----------------
@@ -1228,7 +1388,9 @@ def _device_from_execute(req: P.Execute, *, node_id: str = "") -> DeviceRef:
         adb_serial = _adb_serial_guess(device_id or sn)
 
     extra = {k: v for k, v in hint.items()
-             if k not in {"platform", "adb_serial", "udid", "password", "model", "sn", "device_id"}}
+             if not k.startswith("_scout_") and k not in {
+                 "platform", "adb_serial", "udid", "password", "model", "sn", "device_id"
+             }}
     if req.run_id:
         extra["run_id"] = str(req.run_id)
 
@@ -1299,10 +1461,10 @@ def _event_result_to_observe_fields(ev: EventResult) -> dict[str, Any]:
 # ---------------- 小工具 ----------------
 
 
-def _stop_playwright_hub() -> None:
+def _stop_playwright_hub() -> bool:
     from mino_scout.platform.web.playwright_hub import get_hub
 
-    get_hub().shutdown_thread()
+    return get_hub().shutdown_thread()
 
 
 

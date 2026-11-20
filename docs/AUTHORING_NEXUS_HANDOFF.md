@@ -39,7 +39,7 @@
 | 字段 | 含义 |
 |---|---|
 | `status` | `online` / `offline`；`node_alive` 表示所属 Scout 节点是否在线 |
-| `busy_task_id` | 占用该设备的任务，空串=空闲；web 槽位恒为空串，改看 `active_run_count` / `web_parallel_max` / `web_parallel_full` |
+| `busy_task_id` | 占用该设备的任务，空串=空闲；web 槽位恒为空串，改看共享池的 `active_run_count` / `web_parallel_max` / `web_parallel_free` / `web_parallel_full`；`web_lanes_total/quarantined/reported` 给出 Scout 上报口径 |
 | `executable` | 现在能否立即使用 |
 | `blocking_code` / `blocked_reason` | 原因：`unclaimed` `not_owned` `node_offline` `channel_offline` `desktop_unreported` `capability_missing` `platform_unsupported` `app_incompatible` `busy` 等 |
 | `isolation` | 设备被隔离时的状态 |

@@ -649,21 +649,24 @@ class PlaywrightHub:
         out = [k for k in keys if k == bare or k.startswith(prefix)]
         return out
 
-    def close_case(self, sn: str = "", *, run_id: str = "") -> None:
+    def close_case(self, sn: str = "", *, run_id: str = "") -> bool:
+        """Close one run/session and report whether every live handle closed."""
         key = _session_key(sn, run_id)
         with self._lock:
             row = self._sessions.pop(key, None)
         if not row:
-            return
+            return True
         page = row.get("page")
         ctx = row.get("context")
+        closed = True
         for obj in (page, ctx):
             if obj is None:
                 continue
             try:
                 obj.close()
             except Exception:
-                pass
+                closed = False
+        return closed
 
     def close_run(self, sn: str, run_id: str = "", *, shutdown_browser: bool = False) -> None:
         """关本 run 的 Context；shutdown_browser 时若无其它 run 占用同 sn 再关 Chromium。"""
@@ -692,17 +695,19 @@ class PlaywrightHub:
                 # make a later cleanup falsely report that no browser remains.
                 pass
 
-    def release_run(self, run_id: str) -> None:
-        """任务 cancel / 结束：关掉该 run_id 下所有 Playwright 会话。"""
+    def release_run(self, run_id: str) -> bool:
+        """任务 cancel / 结束：关闭该 run_id 下所有会话并返回关闭回执。"""
         rid = str(run_id or "").strip()
         if not rid:
-            return
+            return True
         suffix = f"::{rid}"
         with self._lock:
             keys = [k for k in self._sessions if k.endswith(suffix)]
+        closed = True
         for key in keys:
             sn_part = key.split("::", 1)[0]
-            self.close_case(sn_part, run_id=rid)
+            closed = self.close_case(sn_part, run_id=rid) and closed
+        return closed
 
     def shutdown_thread(self) -> bool:
         closed = True

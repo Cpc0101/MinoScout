@@ -564,7 +564,7 @@ fixtures_sha256 = 0be21298b045a908bb1a829cdb12413035724416327ff26eea33812a2ffebf
 - `EXECUTE.device_hint` 带 `os/session_key/session_generation/desktop_lease/target_package`。任务创建时冻结代次，Desktop 输入必须持有当前任务的 SQLite 独占租约。Scout 重启或 Cua readiness 状态变化使旧代次失效，不能用新心跳给旧任务续代次；系统会话及窗口的实际输入准入由 SDK 最终校验。
 - 原生设备只路由 `mac` / `win` executor。未知平台显式拒绝，不落回 ADB 或 Playwright。截图 capture_id、OS session_generation、SDK snapshot_id 与报告截图 hash 是不同身份。
 - SDK 连接在一个桌面 worker 中持续复用。每次动作尝试消费最近一次截图引用，捕获绑定点击使用 Cua capture_id；超时视为结果未知，停止该 runtime 后续操作，不能自动换通道再输入。取消阻止新动作，不回滚已发生的输入。
-- Desktop 与该节点 headed Web 共享 `desktop:<node_id>:console` 锁；headless Web 保留四路独立并发。SQLite 事务同时建立设备租约和任务，终态释放租约。
+- Desktop 使用其独占的 `desktop:<node_id>:console` 锁。Web SN 不区分 headed/headless，也不区分 run/debug/script/v5；同一 Web SN 的所有执行共用一张 lane 池。SQLite 事务同时建立设备租约和任务，终态释放租约。
 - Native macOS/Windows 采用 Cua Driver 0.34.1，按锁定 SDK wheel API 对齐；会话、权限与平台 readiness 消费 Cua health_report，窗口捕获和输入准入由 Cua 校验，Linux 暂不开放执行。Windows fixtures 覆盖就绪、锁屏与 Session 0；真实硬件验收与二进制发布另行记录，不将契约验证当作实机通过。Cua perception 不在此切片。
 - `RESULT.extra` 保留精简动作证据 `cua_action`（effect/route/delivery/error.code/escalation），不保存输入正文或 SDK 原始 JSON。Nexus 在 `tool/result` 追加可信派单元信息 `scout`、`attempts` 和 `desktop`；未涉及任务的进程启动/注册/重连日志仍仅在 Scout 本地日志中。
 
@@ -616,7 +616,7 @@ OBSERVE 的 screenshot 与 RESULT 的执行诊断通过 capture_id、session_gen
 
 ### 10.4 容量与回收
 
-`HEARTBEAT.device_workload[]` 在 Web 设备行可带 `lanes_total/lanes_free/lanes_quarantined`，Nexus 以实际报告为准。严格 Web 默认 4 个独立进程 lane，每个 run 独占一 lane 与 Playwright 线程；第 5 个排队。legacy/headed 不与严格 Web lane 混用。超时终止 worker 和浏览器后代，未确认全部停止的 lane 隔离；close 与 dispatch 竞争时，不能在请求锁释放前宣称 lane 空闲。`close_web_strict/cancel_run` 返回 executor_stopped，未回收成功不能宣称干净结束。
+`HEARTBEAT.device_workload[]` 在 Web 设备行可带 `lanes_total/lanes_free/lanes_quarantined`，Nexus 以实际报告为准。资源本质上是按设备占用：Android/iOS/desktop 为单占；每个 Web SN 只有一张 `web:<sn>` lane 表。run、debug、script、v5、headed、headless 只是执行标签，不创建第二套容量，每个执行独占一 lane 与相应工作线程，满时排队或拒绝。默认容量为 8，可用 `MINO_WEB_PLAYWRIGHT_LANES` 配置为 1..64；8 是保守默认值，不是未经压测的硬件极限。心跳除容量行外，还会为每个活跃 lane 上报 `run_id` 与 `web.lane.<kind>`，供 Nexus 对本地预约和 Scout 实占去重。超时终止 worker 和浏览器后代，未确认全部停止的 lane 隔离；close 与 dispatch 竞争时，不能在请求锁释放前宣称 lane 空闲。`close_web_strict/cancel_run` 返回 executor_stopped，未回收成功不能宣称干净结束。
 
 ### 10.5 终结
 
@@ -709,7 +709,7 @@ Nexus POST /case-runner/tasks/{task_id}/write-safety/recheck 校验任务所有�
 
 Nexus 节点列表新增只读 `platform_contract_audit`：mode=shadow、activated=false、target_version、observed_device_count、issues、migration_required。仅报告平台字段问题计数，不输出参数、凭据或原始 manifest；不能将 issues 为空解释为完成数据迁移或具备新绑定执行能力。
 
-资源准入支持规范 mac/win SN，并与历史 desktop SN 及同宿主 headed Web 继续共用 `desktop:<node_id>:console` 资源锁。新 SN 与 node_id 不一致拒绝；headless Web 独立槽保持。此兼容基础不自动迁移设备，不释放已有隔离。
+资源准入支持规范 mac/win SN。Desktop 继续使用 `desktop:<node_id>:console` 独占资源锁；Web 使用 `web:<sn>` 的单一 lane 池，headed/headless 以及 run/debug/script/v5 不生成第二套容量。新 SN 与 node_id 不一致拒绝。此兼容基础不自动迁移设备，不释放已有隔离。
 
 原子切换仍依赖 N1/N2 与受控数据迁移。不能提前宣称新词表已全局生效；Scout 注册与输入能力、Nexus 运行消费者及 Workbench 写入口将在整体切换切片同步调整。
 

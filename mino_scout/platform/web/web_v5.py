@@ -1,4 +1,8 @@
-"""Strict Web contract. Four leased processes, one browser/context per run.
+"""Strict Web contract backed by the node's single shared lane pool.
+
+Every Web execution claims one lane from the same pool, regardless of whether it
+is a formal run, a debug session, v5, headed or headless. The execution label is
+not part of admission. One worker owns one browser/context while it holds a lane.
 
 No legacy resolver or executor fallback is reachable from this module.
 """
@@ -6,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import multiprocessing as mp
+import os
 import threading
 import time
 import uuid
@@ -15,6 +20,19 @@ from mino_scout.runtime.secret_redaction import register_inputs, remember, sanit
 from mino_scout.platform.web.viewports import DEFAULT_WEB_RESOLUTION, normalize_web_resolution, web_viewport
 
 CONTRACTS = {"web_v5": 1, "locator_contract": "web.locator.v1", "predicate_facts_contract": "web.atomic.v1"}
+DEFAULT_WEB_LANES = 8
+MIN_WEB_LANES = 1
+MAX_WEB_LANES = 64
+
+
+def configured_lanes() -> int:
+    """Return the one Web lane count shared by run, debug and v5."""
+    raw = str(os.environ.get("MINO_WEB_PLAYWRIGHT_LANES", "") or "").strip()
+    try:
+        value = int(raw) if raw else DEFAULT_WEB_LANES
+    except ValueError:
+        value = DEFAULT_WEB_LANES
+    return max(MIN_WEB_LANES, min(MAX_WEB_LANES, value))
 READS = frozenset({"probe", "read_web_target_facts", "screenshot"})
 CLEANUP = frozenset({"cancel_run", "close_web_v5"})
 WRITES = frozenset({"open_web_v5", "tap_target", "input_target"})
@@ -205,11 +223,23 @@ def _worker(conn):
 
 
 class WebV5Runtime:
-    def __init__(self, lanes=4):
+    """One capacity pool for every Web execution on this Scout node.
+
+    A lane occupied by ``claim_external`` has no child process of its own; the
+    script worker (or another in-process executor) owns that process externally.
+    Keeping external claims in the same lane table is what prevents run/debug or
+    legacy/v5 from oversubscribing one SN with independent pools.
+    """
+
+    def __init__(self, lanes=None):
+        count = configured_lanes() if lanes is None else int(lanes)
+        if not MIN_WEB_LANES <= count <= MAX_WEB_LANES:
+            raise ValueError("web_lane_count_invalid")
         self.condition = threading.Condition()
-        self.lanes = [{"run": "", "quarantined": False, "lock": threading.Lock(),
+        self.lanes = [{"run": "", "quarantined": False, "external": False,
+                       "external_run": "", "external_kind": "", "lock": threading.Lock(),
                        "kill_lock": threading.Lock(), "children": [],
-                       "process": None, "conn": None} for _ in range(lanes)]
+                       "process": None, "conn": None} for _ in range(count)]
         self.closed_runs: set[str] = set()
 
     def capacity(self):
@@ -219,6 +249,113 @@ class WebV5Runtime:
                     "lanes_free": sum(not x["run"] and not x["quarantined"] for x in self.lanes),
                     "lanes_quarantined": sum(x["quarantined"] for x in self.lanes)}
 
+    def lane_index(self, key) -> int | None:
+        """Return the stable lane index for an active run/attempt key."""
+        key = str(key or "").strip()
+        if not key:
+            return None
+        with self.condition:
+            return next((i for i, lane in enumerate(self.lanes) if lane["run"] == key), None)
+
+    def active_claims(self) -> list[dict[str, str]]:
+        """Return run IDs currently named by the shared lane table.
+
+        The heartbeat already carries aggregate free/total counts. These rows
+        let Nexus distinguish a formal reservation from a debug/script claim
+        without inventing a second pool or blindly adding both counts.
+        """
+        self._reap()
+        with self.condition:
+            claims = []
+            for lane in self.lanes:
+                key = str(lane.get("run") or "")
+                if not key or lane.get("quarantined"):
+                    # Quarantine is already excluded from usable capacity by the
+                    # capacity row; reporting it as an active claim would
+                    # double-count it at the full-pool boundary.
+                    continue
+                run_id = str(lane.get("external_run") or key) if lane.get("external") else key
+                claims.append({"run_id": run_id,
+                               "kind": str(lane.get("external_kind") or "v5")})
+            return claims
+
+    def external_kind(self, key) -> str:
+        """Return the execution label stored with an external claim, if any."""
+        key = str(key or "").strip()
+        if not key:
+            return ""
+        with self.condition:
+            lane = next((x for x in self.lanes if x["run"] == key and x["external"]), None)
+            return str(lane.get("external_kind") or "") if lane else ""
+
+    def claim_external_state(self, key, run_id="", deadline=None, *, kind="external"):
+        """Reserve or reuse one shared lane, returning the ownership outcome.
+
+        ``created`` means this call reserved a previously-free lane. ``reused``
+        means the same execution already owns the lane and must not settle it just
+        because the current step finished. ``busy`` and ``quarantined`` are
+        admission refusals. ``key`` identifies an attempt/session, never an
+        execution kind.
+        """
+        key = str(key or "").strip()
+        if not key:
+            raise ValueError("lane_claim_key_required")
+        expected_run = str(run_id or "")
+        expected_kind = str(kind or "external")
+        self._reap()
+        with self.condition:
+            while True:
+                existing = next((x for x in self.lanes if x["run"] == key), None)
+                if existing is not None:
+                    if existing["quarantined"]:
+                        return "quarantined"
+                    if (not existing["external"]
+                            or str(existing.get("external_run") or "") != expected_run
+                            or str(existing.get("external_kind") or "") != expected_kind):
+                        return "busy"
+                    return "reused"
+                lane = next((x for x in self.lanes if not x["run"] and not x["quarantined"]), None)
+                if lane is not None:
+                    lane.update(run=key, external=True, external_run=str(run_id or ""),
+                                external_kind=expected_kind)
+                    self.condition.notify_all()
+                    return "created"
+                if deadline is None:
+                    return "busy"
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return "busy"
+                self.condition.wait(remaining)
+
+    def claim_external(self, key, run_id="", deadline=None, *, kind="external"):
+        """Compatibility wrapper returning whether the lane is available."""
+        state = self.claim_external_state(key, run_id, deadline, kind=kind)
+        return state in {"created", "reused"}
+
+    def release_external(self, key):
+        """Release a non-quarantined external claim. Unknown keys are idempotent."""
+        key = str(key or "").strip()
+        with self.condition:
+            lane = next((x for x in self.lanes if x["run"] == key and x["external"]), None)
+            if lane is None:
+                return False
+            if lane["quarantined"]:
+                return False
+            lane.update(run="", external=False, external_run="", external_kind="")
+            self.condition.notify_all()
+            return True
+
+    def quarantine_external(self, key):
+        """Keep the lane occupied when worker/browser termination is unconfirmed."""
+        key = str(key or "").strip()
+        with self.condition:
+            lane = next((x for x in self.lanes if x["run"] == key and x["external"]), None)
+            if lane is None:
+                return False
+            lane["quarantined"] = True
+            self.condition.notify_all()
+            return True
+
     def _lease(self, run, deadline):
         self._reap()
         with self.condition:
@@ -227,10 +364,15 @@ class WebV5Runtime:
                     raise ValueError("run_write_stopped")
                 for i, lane in enumerate(self.lanes):
                     if lane["run"] == run:
+                        if lane["quarantined"]:
+                            raise ValueError("lane_quarantined")
+                        # A legacy claim for the same run can continue into v5.
+                        # From here the v5 worker owns the process.
+                        lane.update(external=False, external_run="", external_kind="")
                         return i, lane
                 for i, lane in enumerate(self.lanes):
                     if not lane["run"] and not lane["quarantined"]:
-                        lane["run"] = run
+                        lane.update(run=run, external=False, external_run="", external_kind="")
                         return i, lane
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -245,6 +387,10 @@ class WebV5Runtime:
             lane = next((x for x in self.lanes if x["run"] == run), None)
         if lane is None:
             return True
+        if lane["external"]:
+            # External executors have no child process owned by this runtime.
+            # Their browser/process owner must return a lifecycle receipt first.
+            return False
         if lane["lock"].acquire(timeout=max(0, deadline - time.monotonic())):
             try:
                 return self._kill(lane, deadline)
@@ -289,7 +435,8 @@ class WebV5Runtime:
             if stopped and release:
                 if lane["conn"]:
                     lane["conn"].close()
-                lane.update(run="", process=None, conn=None)
+                lane.update(run="", process=None, conn=None, external=False,
+                            external_run="", external_kind="")
             self.condition.notify_all()
         return stopped
 
@@ -297,7 +444,11 @@ class WebV5Runtime:
         # A close racing a dispatch cannot advertise the lane as free until
         # its dispatch lock and entire process tree have both been released.
         for lane in self.lanes:
-            if lane["quarantined"] and lane["lock"].acquire(blocking=False):
+            # External claims are owned by a process outside this runtime. With no
+            # process handle here, absence of a tracked child is not stop proof;
+            # only an explicit lifecycle receipt may release that quarantine.
+            if (lane["quarantined"] and not lane["external"]
+                    and lane["lock"].acquire(blocking=False)):
                 try:
                     self._kill(lane, time.monotonic() + .05)
                 finally:

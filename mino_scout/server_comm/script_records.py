@@ -12,7 +12,7 @@ import os
 import signal
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from mino_scout.runtime.records import RecordStore, Recorder, identifier, scrub
@@ -238,24 +238,55 @@ class ScriptRecords:
             if not created:
                 return summary
             conflicts = [job for job in self.jobs.values() if job["sn"] == payload.sn]
-            guarded = getattr(self.core, "_requests", None)
-            existing_writes = []
-            if guarded:
-                with guarded.lock:
-                    existing_writes = [row for row in guarded.requests.values() if row.get("worker_active") and row["content"].get("sn") == payload.sn]
-            exclusive = payload.execution_kind == "debug" or any(job.get("execution_kind") == "debug" for job in conflicts)
-            if getattr(self.core, "_update_busy", False) or conflicts and (exclusive or payload.platform != "web" or len(conflicts) >= 4) or existing_writes:
+            if getattr(self.core, "_update_busy", False) or (payload.platform != "web" and conflicts):
                 return self.store.finish(payload.task_id, payload.attempt_id, {"status": "blocked", "reason_code": "resource_busy",
                     "summary": "目标设备已有执行或节点正在更新", "execution_started": "no", "failure_stage": "admission"})
+
+            lane_key = ""
+            lane_index = None
+            claim_state = ""
+            if payload.platform == "web":
+                lane_key = payload.attempt_id or payload.session_id
+                claim_state = self.core._web_v5.claim_external_state(
+                    lane_key, run_id=payload.run_id, kind="script"
+                )
+                if claim_state == "quarantined":
+                    return self.store.finish(payload.task_id, payload.attempt_id, {
+                        "status": "blocked", "reason_code": "lane_quarantined",
+                        "summary": "Web lane 已隔离", "execution_started": "no",
+                        "failure_stage": "admission", "resource_isolated": True,
+                    })
+                if claim_state not in {"created", "reused"}:
+                    return self.store.finish(payload.task_id, payload.attempt_id, {
+                        "status": "blocked", "reason_code": "resource_busy",
+                        "summary": "Web lane 已满", "execution_started": "no",
+                        "failure_stage": "admission", "resource_isolated": False,
+                    })
+                lane_index = self.core._web_v5.lane_index(lane_key)
+                if lane_index is None:
+                    if claim_state == "created":
+                        self.core._web_v5.release_external(lane_key)
+                    return self.store.finish(payload.task_id, payload.attempt_id, {
+                        "status": "blocked", "reason_code": "lane_index_unavailable",
+                        "summary": "Web lane 索引不可用", "execution_started": "no",
+                        "failure_stage": "admission", "resource_isolated": False,
+                    })
+
+            hint = dict(req.device_hint or {})
+            if lane_key:
+                hint.update(_scout_lane_claimed=lane_key, _scout_lane_index=lane_index)
+            worker_req = replace(req, device_hint=hint)
             ctx = multiprocessing.get_context("spawn")
             stop = ctx.Event()
             connected = ctx.Event()
             connected.set()
             parent_pipe, child_pipe = ctx.Pipe()
-            process = ctx.Process(target=_worker, args=(str(self.store.root), asdict(payload), asdict(req), child_pipe, stop, connected), daemon=True,
+            process = ctx.Process(target=_worker, args=(str(self.store.root), asdict(payload), asdict(worker_req), child_pipe, stop, connected), daemon=True,
                                   name="scout-script-" + payload.attempt_id[:16])
             job = {"task_id": payload.task_id, "attempt_id": payload.attempt_id, "run_id": payload.run_id,
-                   "sn": payload.sn, "platform": payload.platform, "execution_kind": payload.execution_kind, "stop": stop, "connected": connected, "process": process}
+                   "sn": payload.sn, "platform": payload.platform, "execution_kind": payload.execution_kind,
+                   "stop": stop, "connected": connected, "process": process, "lane_key": lane_key,
+                   "lane_index": lane_index, "claim_state": claim_state}
             self.jobs[payload.attempt_id] = job
             try:
                 process.start()
@@ -267,8 +298,17 @@ class ScriptRecords:
                 self.jobs.pop(payload.attempt_id, None)
                 parent_pipe.close()
                 child_pipe.close()
+                started = process.pid is not None
+                if started:
+                    _terminate(process)
+                if lane_key and claim_state == "created":
+                    if started:
+                        self.core._web_v5.quarantine_external(lane_key)
+                    else:
+                        self.core._web_v5.release_external(lane_key)
                 return self.store.finish(payload.task_id, payload.attempt_id, {"status": "fail", "reason_code": "worker_start_failed",
-                    "summary": type(exc).__name__, "execution_started": "no", "failure_stage": "admission"})
+                    "summary": type(exc).__name__, "execution_started": "no", "failure_stage": "admission",
+                    "resource_isolated": bool(started)})
         return summary
 
     def _monitor(self, job, pipe, timeout):
@@ -353,6 +393,14 @@ class ScriptRecords:
                 pass  # Existing durable intent remains nonterminal and is recovered on restart.
         finally:
             pipe.close()
+            lane_key = str(job.get("lane_key") or "")
+            if lane_key and job.get("claim_state") == "created":
+                browser_closed = bool(outcome and outcome.get("browser_closed") is True)
+                stopped = not process.is_alive()
+                if stopped and browser_closed:
+                    self.core._web_v5.release_external(lane_key)
+                else:
+                    self.core._web_v5.quarantine_external(lane_key)
             with self.lock:
                 self.jobs.pop(job["attempt_id"], None)
 
@@ -375,8 +423,14 @@ class ScriptRecords:
     def close(self):
         with self.lock:
             self.closed = True
-            for job in self.jobs.values():
+            jobs = list(self.jobs.values())
+            for job in jobs:
                 job["stop"].set()
+        deadline = time.monotonic() + 8.0
+        for job in jobs:
+            monitor = job.get("monitor")
+            if monitor and monitor is not threading.current_thread():
+                monitor.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 def _terminate(process):
