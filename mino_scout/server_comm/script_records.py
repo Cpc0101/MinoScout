@@ -186,20 +186,33 @@ class ScriptRecords:
             summary = self.store.status(task_id, attempt_id)
             meta = self.store.metadata(task_id, attempt_id)
             generation = self.core.binding_guard.process_generation
+            original_generation = str(meta.get("scout_process_generation") or "")
             active = attempt_id in self.jobs
-            same_process = (meta.get("scout_process_generation") == generation
+            lane_active = self.core._web_v5.lane_index(attempt_id) is not None
+            same_process = (original_generation == generation
                             and summary.get("execution_stopped") is True
                             and summary.get("browser_closed") is True)
             started = process_started_at()
             finished = meta.get("finished_at")
-            # Historical records have no stop receipt. Retirement must be proved
-            # by the running service, including absence of orphan runtime children.
             if not finished and summary.get("finished_at"):
                 from datetime import datetime
                 finished = datetime.fromisoformat(summary["finished_at"]).timestamp()
-            retired = (not same_process and type(finished) in (int, float)
-                       and started > finished + 120 and run_lock_held()
-                       and foreign_runtime_processes(summary["sn"]) == 0)
+            lock_held = run_lock_held()
+            # A recorded, different generation identifies the old execution. The
+            # current single Scout has no worker or lane for that exact attempt,
+            # which is target-scoped retirement evidence. Do not let unrelated
+            # runtime processes on the node block a known old generation forever.
+            generation_retired = (not same_process and bool(original_generation)
+                                  and original_generation != generation and lock_held
+                                  and not active and not lane_active)
+            # Legacy records without a generation cannot identify the old worker.
+            # Keep the stricter process-start and node-wide orphan checks for them.
+            legacy_retired = (not same_process and not original_generation
+                              and type(finished) in (int, float)
+                              and started > finished + 120 and lock_held
+                              and not active and not lane_active
+                              and foreign_runtime_processes(summary["sn"]) == 0)
+            retired = generation_retired or legacy_retired
             confirmed = (summary["platform"] == "web" and summary["sealed"]
                          and not active and (same_process or retired))
             return {**summary, "resource_stop": {

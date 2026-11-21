@@ -1213,7 +1213,7 @@ account(requirements=None, prefer=None, data_need=None, data_requirements=None, 
 
 摘要可带 `execution_stopped`、`browser_closed`（bool）及 `scout_process_generation`。Scout 只在执行子进程退出后封存终态，浏览器清理失败或无法核实停止保持隔离。`wait_screen_ready` 是只读操作，其超时带明确 `execution_started=no`；定位、可见性、启用与 trial 检查失败不代表已发出点击。实际写入发出后的异常仍为 unknown。终态的结论和已保存的执行边界/清理事实不可改写。
 
-`record.resource_status` 的 `resource_stop` 合同为 `script_resource_stop.v1`，包含 stop_confirmed、worker_active、browser_closed、mode、scout_process_generation、process_started_at、reason_code。同进程要求原 attempt 的进程代际匹配、执行已退出、浏览器已关闭、记录封存且无活动 worker。历史退役要求当前单实例锁、进程启动晚于完成至少 120 秒、安装目录不存在外来运行时进程；源码模式或事实不明不确认。该证明不验证历史写入的业务结果。
+`record.resource_status` 的 `resource_stop` 合同为 `script_resource_stop.v1`，包含 stop_confirmed、worker_active、browser_closed、mode、scout_process_generation、process_started_at、reason_code。同进程要求原 attempt 的进程代际匹配、执行已退出、浏览器已关闭、记录封存且无活动 worker。原 attempt 有代际且与当前不同时，当前单实例锁有效、该 attempt 不在活动 worker/jobs 且不占 Web lane 即确认退役，不以任务结束时间或节点上其他运行时进程阻塞；无代际的历史记录仍要求进程启动晚于完成至少 120 秒且安装目录不存在外来运行时进程，源码模式或事实不明不确认。该证明不验证历史写入的业务结果。
 
 任务 owner 可调用 `POST /case-runner/tasks/{task_id}/resources/reconcile` 显式核验已结束 Web 任务。Nexus 经原认证节点获取每个已接单 attempt 的新证明，核对身份、摘要版本和当前租约代次；同一事务保存 resource_resolution 并释放设备槽位、账号租约与准入。Python 对应释放 execution resource、device lease、reservation 和账号租约。重复调用幂等；迟到摘要不会重隔离已恢复任务，也不会释放新持有者。实体设备仍需应用基线恢复。原始 Scout 结论、reason_code 和 execution_started 保留。
 
