@@ -421,6 +421,20 @@ class ScriptRecords:
         with self.lock:
             return [dict(run_id=job["run_id"], sn=job["sn"], platform=job["platform"]) for job in self.jobs.values()]
 
+    def active_run_ids(self, *, execution_kind: str | None = None) -> set[str]:
+        """Run ids owned by live script workers, optionally narrowed by kind.
+
+        Debug workers stay alive between explicit commands, so their run id is a
+        lifecycle fact rather than a recently-seen EXECUTE id.
+        """
+        with self.lock:
+            return {
+                str(job["run_id"])
+                for job in self.jobs.values()
+                if job.get("run_id")
+                and (execution_kind is None or job.get("execution_kind") == execution_kind)
+            }
+
     def connection(self, connected):
         with self.lock:
             for job in self.jobs.values():

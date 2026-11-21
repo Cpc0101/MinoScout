@@ -228,7 +228,10 @@ def locate(app, selector):
         params.update(x=round(x / width * input_width), y=round(y / height * input_height))
     elif app._platform == "web":
         from mino_scout.platform.web.playwright_hub import get_hub
-        page = get_hub().current_page(app._sn, run_id=app.run_id)
+        page = get_hub().current_page(
+            app._sn, run_id=app.run_id, actor=app._actor,
+            context_id=app._context_id, page_id=app._page_id,
+        )
         viewport = page.viewport_size if page else None
         if not viewport:
             raise _abort("Web 视口尺寸不可用", "observation_insufficient")

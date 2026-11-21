@@ -10,7 +10,10 @@ def observe_control(app, selector):
     from mino_scout.platform.web.playwright_hub import get_hub
     from mino_scout.runtime.script_exec import ActionResult, ScriptAbort
     app._guard()
-    page = get_hub().current_page(app._sn, run_id=app.run_id)
+    page = get_hub().current_page(
+        app._sn, run_id=app.run_id, actor=app._actor,
+        context_id=app._context_id, page_id=app._page_id,
+    )
     if page is None:
         raise ScriptAbort("缺 Chromium 会话", reason_code="channel_missing", status="blocked")
     value = str(selector.get("value") or "")
@@ -56,10 +59,10 @@ def locator_params(kind: str, value: str, name: str, label: str) -> dict:
     elif kind == "test_id":
         params["test_id"] = value
     elif kind == "role":
-        params["role"] = name
-        params["role_name"] = value
-        params["selector_text"] = value
-        params["target"] = {"text": value}
+        params["role"] = value
+        params["role_name"] = name or label
+        params["selector_text"] = name or label
+        params["target"] = {"text": name or label}
     return params
 
 
@@ -70,7 +73,10 @@ def act(case, kind: str, params: dict, text: str = ""):
 
     case._guard()
     case._require_channel()
-    page = get_hub().current_page(case._sn, run_id=case.run_id)
+    page = get_hub().current_page(
+        case._sn, run_id=case.run_id, actor=case._actor,
+        context_id=case._context_id, page_id=case._page_id,
+    )
     if page is None:
         raise ScriptAbort("缺 chromium", reason_code="channel_missing")
     capability = "tap_element" if kind == "tap" else "input_text"

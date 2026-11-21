@@ -26,6 +26,9 @@ def capture(device, *, timeout_sec: float = 15.0, compress_ratio: float = 2.0,
             headed=headed_from_hint(dict(device.extra or {})),
             screenshot_params=screenshot_params,
             web_resolution=str(device.extra.get("web_resolution") or DEFAULT_WEB_RESOLUTION),
+            actor=str(device.extra.get("actor") or ""),
+            context_id=str(device.extra.get("context_id") or ""),
+            page_id=str(device.extra.get("page_id") or ""),
         )
     except Exception as exc:
         return CapturedScreen(

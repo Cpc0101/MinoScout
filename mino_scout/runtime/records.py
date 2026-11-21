@@ -20,7 +20,7 @@ from urllib.parse import quote, unquote
 
 TERMINAL = frozenset({"pass", "fail", "blocked", "declined", "skipped", "cancelled", "interrupted"})
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,255}\Z")
-_SECRETS = frozenset({"password", "passwd", "otp", "otp_code", "token", "api_key", "secret", "secret_value", "authorization", "access_token", "refresh_token", "cookie", "cookies"})
+_SECRETS = frozenset({"password", "passwd", "otp", "otp_code", "token", "api_key", "secret", "secret_value", "authorization", "access_token", "refresh_token", "cookie", "cookies", "credential", "storage_state", "session_storage"})
 
 
 class _Connection(sqlite3.Connection):

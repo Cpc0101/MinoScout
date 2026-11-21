@@ -1294,3 +1294,29 @@ Nexus 不可达或回调拒绝在 Scout 记为 blocked，原因分别为 nexus_u
 脚本邮箱 OTP 的本地请求契约：先调用 `case.scout.otp_request(account)` 只读捕获邮箱 UIDVALIDITY/UIDNEXT，产品发码后调用 `case.scout.otp(account, request=...)`。请求绑定当前 Case、账号、收件邮箱及登录策略，一次消费且最长 90 秒；同收件人重新准备、整例重跑、reset 或进程重启使旧请求失效。缺请求 `otp_request_required`，未知/已用请求 `otp_request_invalid`，范围变化 `otp_request_mismatch`，过期 `otp_request_expired`，均 blocked。取码及重连核对 UIDVALIDITY，只接受 UIDNEXT 边界之后的邮件；邮箱代际变化以 `otp_environment_unavailable` / `otp_mailbox_changed` 阻塞。固定码兼容旧 API，`otp_mail(request=...)` 使用同一门禁和脱敏。请求、邮箱凭据和 UID 边界仅保存在 Scout 内存，不新增 Nexus wire 字段。边界不等于产品发码请求 ID，无法区分准备后才延迟到达的旧请求邮件。
 
 Nexus 账号回调按 slot 返回已缓存凭据前，必须检查该账号租约仍由当前 run/case/device 持有且未过期；失效返回 `resource_account_missing`，不能借用 `picked_account` 兼容视图或静默换号。`otp_mail(slot=...)` 只使用该 slot 已租账号且不隐式租号；无参旧路径仅当当前执行没有任何 slot 账号时走节点邮箱，已有其他 slot 但 default 未租时返回 `resource_account_missing`。旧 `otp(account)` 仍按传入账号对象取码。每个 slot 的 OTP 策略取自己的 app/env/surface，不得相互继承。
+
+
+## Web 认证快照与用例级 URI
+
+Web `App.launch(uri="", *, account=None, auth="none", identity_control="", identity_field="username", ready_control="", timeout_ms=20000)` 保留无参启动。`uri` 以应用 URL 解析，同源 HTTP(S) 地址、查询与 hash 均可用。`auth=required` 必须绑定当前租用账号、完整身份控件与目标就绪控件；Scout 新建隔离 context，首次导航前恢复认证并直达 URI，核对完整身份、唯一可见就绪控件及实际 URI。准备检查不增加业务断言计数。
+
+`App.save_auth(account, *, identity_control, identity_field="username", ttl_seconds=3600, timeout_ms=20000)` 在 Scout 验证 username/email/phone 的完整身份后，显式捕获当前 origin 的 cookies/localStorage 与当前页 sessionStorage。快照不自动覆盖；sessionStorage 仅首次导航注入，随后移除初始化脚本。当前固定 Playwright 1.49.1 不导出 IndexedDB 或多 origin SSO 状态。
+
+认证读写沿用 `EXECUTE capability_id=script.callback` / `RESULT data`，不新增信封或 dataclass 字段：
+
+| op | params（另含既有 run/session/task/attempt 绑定） | RESULT data |
+|---|---|---|
+| `web_auth_get` | `slot`, `account_id` | `state=missing/expired/invalidated/available`；已有快照带 revision/expires_at，仅 available 返回 credential |
+| `web_auth_save` | `slot`, `account_id`, `credential`, `ttl_seconds` | state=available, revision, expires_at |
+| `web_auth_invalidate` | `slot`, `account_id`, `revision` | invalidated: bool；旧 revision 不影响新快照 |
+
+`credential` 形状为 `{storage_state: {cookies: [...], origins: [{origin, localStorage: [{name, value}]}]}, session_storage: {origin: {key: value}}, identity_field, identity_value}`。上限 192 KiB；TTL 60–604800 秒。Nexus 从已验证准入和实际账号租约推导 project/app/env/surface/origin；客户端不能指定快照作用域。SQLite `web_auth_snapshots` 保存 AES-GCM 密文，附加认证数据绑定作用域；取回、保存和失效均校验当前租约。公开账号列表只返回 `web_auth: [{env, surface, origin, expires_at, state}]` 元数据，删除账号同时清除快照。
+
+快照缺失/过期/失效或身份不符明确阻塞，不隐式登录、换号或重跑。身份不符失效本次 revision；定位、网络和取消错误不判定凭据失效。credential/storage_state/session_storage 为不透明敏感字段，禁止进入普通记录、审计、公开 API 或仓库。恢复证据记录 revision、请求/实际 URI、验证结果及耗时；完整证据仍在 Scout。
+
+
+## Web 请求与错误观测
+
+Scout `app.network.expect_response` 在动作前注册期望，动作后等待注册后发起且属于当前页面的请求响应。path 精确匹配；occurrence 缺省为唯一候选，多个候选明确阻塞，显式序号按响应观察顺序累计。匹配只声明时间关联，HTTP 状态与业务字段仍须独立断言。正文只允许显式 capture_fields/json_fields 中的非敏感标量字段；缺字段证据、超限、无长度或压缩正文返回不可判定。网络等待使用真实时间并驱动浏览器事件，取消/超时清除期望。
+
+完整证据在 Scout：`browser/error` 保存首次导航及新标签页的 JS/console/请求/HTTP 错误；`browser/response` 保存已匹配请求标识、状态、字段和关联；`browser/observation` 保存保留数量、丢弃数量与采集缺口。角色、context/page、步骤字段沿用本地记录 payload，不新增信封。HTTP 状态码不是执行状态，错误诊断本身不改变用例结论。Nexus 仅同步既有任务摘要并代理 record.events 读取，不持久保存完整浏览器事件。

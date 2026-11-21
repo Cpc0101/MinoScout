@@ -927,10 +927,14 @@ class ScoutCore:
         if device.is_web:
             from mino_scout.platform.web.dom_hierarchy import dump_dom_nodes
 
+            extra_identity = dict(getattr(device, "extra", {}) or {})
             dump = dump_dom_nodes(
                 sn=str(device.sn or ""),
                 run_id=str(run_id or ""),
                 params=dict(hierarchy_params or {}),
+                actor=str(extra_identity.get("actor") or ""),
+                context_id=str(extra_identity.get("context_id") or ""),
+                page_id=str(extra_identity.get("page_id") or ""),
             )
             if not dump.ok:
                 return EventStatus.FAIL, {
@@ -1312,9 +1316,18 @@ class ScoutCore:
         cutoff = now - _IDEMPOTENT_TTL_SEC
         idle_cutoff = now - _IDLE_RUN_SEC
         legacy_to_close: list[tuple[str, int]] = []
+        records = getattr(self, "_script_records", None)
+        # Snapshot before taking the core lock. ScriptRecords.cancel_run() takes
+        # its own lock while core call paths may already hold this one, so never
+        # call back into ScriptRecords under self._lock.
+        persistent_debug_runs = (
+            records.active_run_ids(execution_kind="debug") if records else set()
+        )
         with self._lock:
             self._evict_cancelled()
             for rid, ts in list(self._run_seen.items()):
+                if rid in persistent_debug_runs:
+                    continue
                 if ts < cutoff or (ts < idle_cutoff and not self._requests.active(rid)):
                     self._active_runs.discard(rid)
                     self._run_seen.pop(rid, None)

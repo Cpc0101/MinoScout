@@ -269,16 +269,34 @@ class ScriptRun:
     inputs: dict[str, Any] = field(default_factory=dict)
     source_context: dict[str, Any] = field(default_factory=dict)
     debug_origin: dict[str, Any] = field(default_factory=dict)
+    web_capabilities: list[str] = field(default_factory=list)
 
 
 SCRIPT_RUN_CAPABILITY = "script.run"
 SCRIPT_SUBMIT_CAPABILITY = "script.submit"
+WEB_CAPABILITIES = (
+    "auth_snapshot",
+    "uri_direct",
+    "network_observation",
+    "browser_errors",
+    "page_clock",
+    "drag",
+    "keyboard_focus",
+    "clipboard",
+    "permissions",
+    "geolocation",
+    "locale_timezone",
+    "navigation",
+    "multi_actor",
+)
+_WEB_CAPABILITY_SET = frozenset(WEB_CAPABILITIES)
 RECORD_API_VERSION = 1
 RECORD_RESOURCE_STATUS_CAPABILITY = "record.resource_status"
 RECORD_RESOURCE_STOP_CONTRACT = "script_resource_stop.v1"
 RECORD_REPORT_VERSION = 1  # Optional bounded business projection in record.sync.
 SCRIPT_RUN_FIELDS = ("run_id", "session_id", "case_id", "sn", "platform", "repo_url", "branch", "revision", "script_path",
-                     "task_id", "attempt_id", "owner_user_id", "execution_timeout_sec", "inputs", "source_context", "execution_kind", "workspace", "debug_origin")
+                     "task_id", "attempt_id", "owner_user_id", "execution_timeout_sec", "inputs", "source_context", "execution_kind", "workspace", "debug_origin",
+                     "web_capabilities")
 _SCRIPT_RUN_FIELDS = SCRIPT_RUN_FIELDS
 
 
@@ -331,6 +349,21 @@ def validate_source_context(value: Any) -> dict[str, Any]:
     return data
 
 
+def validate_web_capabilities(value: Any) -> list[str]:
+    """Validate and freeze the Web capabilities granted to one script run."""
+    if not isinstance(value, list) or len(value) > 20:
+        raise ValueError("web_capabilities_invalid")
+    out: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item:
+            raise ValueError("web_capabilities_invalid")
+        if item not in _WEB_CAPABILITY_SET:
+            raise ValueError("web_capability_unsupported")
+        if item not in out:
+            out.append(item)
+    return out
+
+
 def validate_data_summary(value: Any) -> dict[str, Any]:
     outputs = validate_runtime_data(value.get("data_outputs", {}))
     missing = value.get("data_missing", [])
@@ -356,6 +389,7 @@ def load_script_run(raw: dict[str, Any]) -> ScriptRun:
         known["inputs"] = validate_runtime_data(known["inputs"])
     if "source_context" in known:
         known["source_context"] = validate_source_context(known["source_context"])
+    known["web_capabilities"] = validate_web_capabilities(known.get("web_capabilities", []))
     try:
         body = _decode(ScriptRun, known)
     except (TypeError, ValueError) as exc:
@@ -407,6 +441,9 @@ def load_script_run(raw: dict[str, Any]) -> ScriptRun:
     body.inputs = validate_runtime_data(body.inputs)
     body.source_context = validate_source_context(body.source_context)
     body.debug_origin = validate_debug_origin(body.debug_origin)
+    body.web_capabilities = validate_web_capabilities(body.web_capabilities)
+    if body.platform != "web" and body.web_capabilities:
+        raise ValueError("web_capability_platform_invalid")
     return body
 
 
@@ -460,7 +497,7 @@ def _encode(value: Any) -> Any:
         out = {}
         for f in fields(value):
             raw = getattr(value, f.name)
-            if f.name in ("data", "inputs", "source_context", "debug_origin") and not raw:
+            if f.name in ("data", "inputs", "source_context", "debug_origin", "web_capabilities") and not raw:
                 continue
             if f.name in ("device_id", "platform", "node_id", "node_token") and not raw and not (isinstance(value, Register) and f.name == "platform"):
                 continue

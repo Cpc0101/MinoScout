@@ -49,10 +49,16 @@ def dump_dom_nodes(
     sn: str,
     run_id: str = "",
     params: dict[str, Any] | None = None,
+    actor: str = "",
+    context_id: str = "",
+    page_id: str = "",
 ) -> DomDump:
     t0 = time.time()
     hub = get_hub()
-    page = hub.current_page(str(sn or ""), run_id=str(run_id or ""))
+    page = hub.current_page(
+        str(sn or ""), run_id=str(run_id or ""), actor=str(actor or ""),
+        context_id=str(context_id or ""), page_id=str(page_id or ""),
+    )
     if page is None:
         return DomDump(
             ok=False,
@@ -77,7 +83,10 @@ def dump_dom_nodes(
     observation = dict(data.get("observation") or {})
     mark_focused_node(nodes, web_focus)
     aria = _aria_snapshot_text(page, p, max_chars=int(p.get("aria_max_chars") or 6000))
-    tabs = hub.list_tabs(str(sn or ""), run_id=str(run_id or "")) if p.get("include_tabs") else None
+    tabs = hub.list_tabs(
+        str(sn or ""), run_id=str(run_id or ""), actor=str(actor or ""),
+        context_id=str(context_id or ""), page_id=str(page_id or ""),
+    ) if p.get("include_tabs") else None
     try:
         page_url = str(page.url or "").strip()
     except Exception:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -16,6 +17,11 @@ import traceback
 from pathlib import Path
 from typing import Any, Optional
 
+from mino_scout.platform.web.playwright_observability import (
+    WebObservability,
+    apply_context_options,
+    context_kwargs,
+)
 from mino_scout.platform.web.viewports import (
     DEFAULT_WEB_RESOLUTION,
     normalize_web_resolution,
@@ -76,12 +82,45 @@ def is_web_slot(sn: str = "", platform: str = "") -> bool:
     return valid and (not platform or platform=="web")
 
 
-def _session_key(sn: str, run_id: str = "") -> str:
+_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+def normalize_web_identity(
+    actor: str = "default",
+    context_id: str = "",
+    page_id: str = "",
+) -> tuple[str, str, str]:
+    """Validate the optional actor/context/page identity used by multi-account runs.
+
+    Calling the browser API without an explicit identity keeps the legacy
+    ``sn::run_id`` session key.  Scripts that use ``case.init(actor=...)`` get a
+    stable, deterministic identity tuple instead.
+    """
+    values = [str(actor or "").strip(), str(context_id or "").strip(), str(page_id or "").strip()]
+    if not any(values):
+        return "", "", ""
+    actor_v = values[0] or "default"
+    for name, value in (("actor", actor_v), ("context_id", values[1] or actor_v), ("page_id", values[2] or "main")):
+        if not _IDENTITY_RE.fullmatch(value):
+            raise ValueError(f"web_identity_invalid:{name}")
+    return actor_v, values[1] or actor_v, values[2] or "main"
+
+
+def _session_key(
+    sn: str,
+    run_id: str = "",
+    *,
+    actor: str = "",
+    context_id: str = "",
+    page_id: str = "",
+) -> str:
     base = str(sn or "").strip() or "web"
     rid = str(run_id or "").strip()
-    if rid:
-        return f"{base}::{rid}"
-    return base
+    legacy = f"{base}::{rid}" if rid else base
+    actor_v, context_v, page_v = normalize_web_identity(actor, context_id, page_id)
+    if not actor_v:
+        return legacy
+    return f"{legacy}::actor={actor_v}::context={context_v}::page={page_v}"
 
 
 def _browser_key(sn: str, resolution: str = DEFAULT_WEB_RESOLUTION) -> str:
@@ -344,29 +383,89 @@ class PlaywrightHub:
         sn: str,
         *,
         run_id: str = "",
+        actor: str = "",
+        context_id: str = "",
+        page_id: str = "",
         base_url: str = "",
         headed: Optional[bool] = None,
         goto_params: dict[str, Any] | None = None,
         web_resolution: str = DEFAULT_WEB_RESOLUTION,
+        credential: dict[str, Any] | None = None,
+        web_options: dict[str, Any] | None = None,
+        evidence_sink=None,
     ) -> Any:
-        key = _session_key(sn, run_id)
+        actor_v, context_v, page_v = normalize_web_identity(actor, context_id, page_id)
+        key = _session_key(sn, run_id, actor=actor_v, context_id=context_v, page_id=page_v)
         resolution = normalize_web_resolution(web_resolution)
         viewport = web_viewport(resolution)
-        self.close_case(sn, run_id=run_id)
+        # A fresh context replaces only this actor/page.  Other actors in the
+        # same run stay alive and retain their independent authentication.
+        self.close_case(sn, run_id=run_id, actor=actor_v, context_id=context_v, page_id=page_v)
         browser = self._browser(_session_key(sn), headed=headed, web_resolution=resolution)
+        browser_context_options = context_kwargs(web_options)
         context = browser.new_context(
             viewport=viewport,
             screen=viewport,
             device_scale_factor=1,
             ignore_https_errors=True,
+            **browser_context_options,
+            **({"storage_state": credential["storage_state"]} if credential else {}),
         )
-        page = context.new_page()
-        url = normalize_goto_url(base_url)
-        if url:
-            goto_url(page, url, params=goto_params)
+        try:
+            page = context.new_page()
+            # Clock and listeners must exist before authentication injection or
+            # the first application request, otherwise early evidence is lost.
+            apply_context_options(context, page, web_options)
+            observability = WebObservability(
+                page,
+                {"actor": actor_v or "default", "context_id": context_v or "default", "page_id": page_v or "main"},
+                dict(web_options or {}),
+                evidence_sink=evidence_sink,
+            )
+            url = normalize_goto_url(base_url)
+            if credential and credential.get("session_storage"):
+                # Chromium script exists only for the first navigation. Later logout,
+                # refresh and token rotation must not resurrect the saved baseline.
+                import json
+                cdp = context.new_cdp_session(page)
+                script = "const saved = " + json.dumps(credential["session_storage"], ensure_ascii=True) + ";" + \
+                    "if (saved[location.origin]) { for (const [k,v] of Object.entries(saved[location.origin])) sessionStorage.setItem(k,v); }"
+                identifier = cdp.send("Page.addScriptToEvaluateOnNewDocument", {"source": "(() => {" + script + "})()"})["identifier"]
+                try:
+                    if url:
+                        goto_url(page, url, params=goto_params)
+                finally:
+                    try:
+                        cdp.send("Page.removeScriptToEvaluateOnNewDocument", {"identifier": identifier})
+                    finally:
+                        cdp.detach()
+            elif url:
+                goto_url(page, url, params=goto_params)
+        except BaseException as exc:
+            if 'observability' in locals():
+                observability.record_navigation_error(exc, base_url)
+            try:
+                context.close()
+            except Exception:
+                pass
+            if credential and isinstance(exc, Exception):
+                raise RuntimeError("web_auth_restore_failed") from None
+            raise
         self._publish_session(
             key,
-            {"context": context, "page": page, "base_url": url, "web_resolution": resolution},
+            {
+                "context": context,
+                "page": page,
+                "base_url": url,
+                "web_resolution": resolution,
+                "sn": str(sn or ""),
+                "run_id": str(run_id or ""),
+                "actor": actor_v,
+                "context_id": context_v,
+                "page_id": page_v,
+                "web_options": dict(web_options or {}),
+                "observability": observability,
+            },
             run_id=str(run_id or ""),
         )
         SLog.i(TAG, f"case context ready sn={key} resolution={resolution} url={url or 'about:blank'}")
@@ -394,8 +493,7 @@ class PlaywrightHub:
             for key, row in list(self._sessions.items()):
                 if int(row.get("owner_thread") or 0) != ident:
                     continue
-                rid = key.split("::", 1)[1] if "::" in key else ""
-                run_ids.append(rid)
+                run_ids.append(str(row.get("run_id") or ""))
                 self._sessions.pop(key, None)
         self._bump_runs(run_ids)
 
@@ -407,8 +505,8 @@ class PlaywrightHub:
                 if not rid:
                     self._sessions.clear()
                     continue
-                suffix = f"::{rid}"
-                for key in [k for k in self._sessions if k.endswith(suffix)]:
+                for key in [k for k, row in self._sessions.items()
+                            if str(row.get("run_id") or "") == rid]:
                     self._sessions.pop(key, None)
 
     def release_this_lane(self) -> bool:
@@ -449,8 +547,17 @@ class PlaywrightHub:
                 return
             self._sessions[key] = row
 
-    def current_page(self, sn: str = "", *, run_id: str = "") -> Any:
-        key = _session_key(sn, run_id)
+    def current_page(
+        self,
+        sn: str = "",
+        *,
+        run_id: str = "",
+        actor: str = "",
+        context_id: str = "",
+        page_id: str = "",
+    ) -> Any:
+        actor_v, context_v, page_v = normalize_web_identity(actor, context_id, page_id)
+        key = _session_key(sn, run_id, actor=actor_v, context_id=context_v, page_id=page_v)
         rid = str(run_id or "")
         with self._lock:
             row = dict(self._sessions.get(key) or {})
@@ -461,8 +568,40 @@ class PlaywrightHub:
             return None
         return row.get("page")
 
-    def current_url(self, sn: str = "", *, run_id: str = "") -> str:
-        page = self.current_page(sn, run_id=run_id)
+    def current_observability(
+        self,
+        sn: str = "",
+        *,
+        run_id: str = "",
+        actor: str = "",
+        context_id: str = "",
+        page_id: str = "",
+    ) -> WebObservability | None:
+        actor_v, context_v, page_v = normalize_web_identity(actor, context_id, page_id)
+        key = _session_key(sn, run_id, actor=actor_v, context_id=context_v, page_id=page_v)
+        with self._lock:
+            row = self._sessions.get(key) or {}
+        obs = row.get("observability")
+        if obs is not None and row.get("page") is not None:
+            obs.page = row["page"]
+        return obs
+
+    def current_url(
+        self,
+        sn: str = "",
+        *,
+        run_id: str = "",
+        actor: str = "",
+        context_id: str = "",
+        page_id: str = "",
+    ) -> str:
+        page = self.current_page(
+            sn,
+            run_id=run_id,
+            actor=actor,
+            context_id=context_id,
+            page_id=page_id,
+        )
         if page is None:
             return ""
         try:
@@ -496,12 +635,24 @@ class PlaywrightHub:
         headed: Optional[bool] = None,
         screenshot_params: dict[str, Any] | None = None,
         web_resolution: str = DEFAULT_WEB_RESOLUTION,
+        actor: str = "",
+        context_id: str = "",
+        page_id: str = "",
     ) -> bytes:
-        page = self.current_page(sn, run_id=run_id)
+        page = self.current_page(
+            sn,
+            run_id=run_id,
+            actor=actor,
+            context_id=context_id,
+            page_id=page_id,
+        )
         if page is None:
             page = self.open_case(
                 sn,
                 run_id=run_id,
+                actor=actor,
+                context_id=context_id,
+                page_id=page_id,
                 base_url=base_url,
                 headed=headed,
                 web_resolution=web_resolution,
@@ -533,8 +684,17 @@ class PlaywrightHub:
             kwargs["clip"] = clip
         return page.screenshot(**kwargs)
 
-    def list_tabs(self, sn: str = "", *, run_id: str = "") -> list[dict[str, Any]]:
-        key = _session_key(sn, run_id)
+    def list_tabs(
+        self,
+        sn: str = "",
+        *,
+        run_id: str = "",
+        actor: str = "",
+        context_id: str = "",
+        page_id: str = "",
+    ) -> list[dict[str, Any]]:
+        actor_v, context_v, page_v = normalize_web_identity(actor, context_id, page_id)
+        key = _session_key(sn, run_id, actor=actor_v, context_id=context_v, page_id=page_v)
         with self._lock:
             row = self._sessions.get(key) or {}
         ctx = row.get("context")
@@ -570,8 +730,12 @@ class PlaywrightHub:
         tab_index: int | None = None,
         url_contains: str = "",
         title_contains: str = "",
+        actor: str = "",
+        context_id: str = "",
+        page_id: str = "",
     ) -> Any:
-        key = _session_key(sn, run_id)
+        actor_v, context_v, page_v = normalize_web_identity(actor, context_id, page_id)
+        key = _session_key(sn, run_id, actor=actor_v, context_id=context_v, page_id=page_v)
         with self._lock:
             row = self._sessions.get(key) or {}
         ctx = row.get("context")
@@ -611,8 +775,12 @@ class PlaywrightHub:
         *,
         run_id: str = "",
         url: str = "",
+        actor: str = "",
+        context_id: str = "",
+        page_id: str = "",
     ) -> Any:
-        key = _session_key(sn, run_id)
+        actor_v, context_v, page_v = normalize_web_identity(actor, context_id, page_id)
+        key = _session_key(sn, run_id, actor=actor_v, context_id=context_v, page_id=page_v)
         with self._lock:
             row = self._sessions.get(key) or {}
         ctx = row.get("context")
@@ -625,8 +793,23 @@ class PlaywrightHub:
         self._replace_page(key, page, run_id=str(run_id or ""))
         return page
 
-    def a11y_text(self, sn: str = "", *, run_id: str = "", max_chars: int = 4000) -> str:
-        page = self.current_page(sn, run_id=run_id)
+    def a11y_text(
+        self,
+        sn: str = "",
+        *,
+        run_id: str = "",
+        max_chars: int = 4000,
+        actor: str = "",
+        context_id: str = "",
+        page_id: str = "",
+    ) -> str:
+        page = self.current_page(
+            sn,
+            run_id=run_id,
+            actor=actor,
+            context_id=context_id,
+            page_id=page_id,
+        )
         if page is None:
             return ""
         try:
@@ -649,28 +832,49 @@ class PlaywrightHub:
         out = [k for k in keys if k == bare or k.startswith(prefix)]
         return out
 
-    def close_case(self, sn: str = "", *, run_id: str = "") -> bool:
-        """Close one run/session and report whether every live handle closed."""
-        key = _session_key(sn, run_id)
+    def _close_keys(self, keys: list[str]) -> bool:
         with self._lock:
-            row = self._sessions.pop(key, None)
-        if not row:
-            return True
-        page = row.get("page")
-        ctx = row.get("context")
+            rows = [(key, self._sessions.pop(key, None)) for key in keys]
         closed = True
-        for obj in (page, ctx):
-            if obj is None:
+        for _, row in rows:
+            if not row:
                 continue
-            try:
-                obj.close()
-            except Exception:
-                closed = False
+            page = row.get("page")
+            ctx = row.get("context")
+            obs = row.get("observability")
+            if obs is not None:
+                obs.flush_summary()
+            for obj in (page, ctx):
+                if obj is None:
+                    continue
+                try:
+                    obj.close()
+                except Exception:
+                    closed = False
         return closed
 
+    def close_case(
+        self,
+        sn: str = "",
+        *,
+        run_id: str = "",
+        actor: str = "",
+        context_id: str = "",
+        page_id: str = "",
+    ) -> bool:
+        """Close exactly one actor/context/page session."""
+        actor_v, context_v, page_v = normalize_web_identity(actor, context_id, page_id)
+        key = _session_key(sn, run_id, actor=actor_v, context_id=context_v, page_id=page_v)
+        return self._close_keys([key])
+
     def close_run(self, sn: str, run_id: str = "", *, shutdown_browser: bool = False) -> None:
-        """关本 run 的 Context；shutdown_browser 时若无其它 run 占用同 sn 再关 Chromium。"""
-        self.close_case(sn, run_id=run_id)
+        """Close every actor/context/page of this application and run."""
+        rid = str(run_id or "")
+        with self._lock:
+            keys = [key for key, row in self._sessions.items()
+                    if str(row.get("sn") or "") == str(sn or "")
+                    and str(row.get("run_id") or "") == rid]
+        self._close_keys(keys)
         if not shutdown_browser:
             return
         if self._session_keys_for_sn(sn):
@@ -700,26 +904,17 @@ class PlaywrightHub:
         rid = str(run_id or "").strip()
         if not rid:
             return True
-        suffix = f"::{rid}"
         with self._lock:
-            keys = [k for k in self._sessions if k.endswith(suffix)]
-        closed = True
-        for key in keys:
-            sn_part = key.split("::", 1)[0]
-            closed = self.close_case(sn_part, run_id=rid) and closed
-        return closed
+            keys = [key for key, row in self._sessions.items()
+                    if str(row.get("run_id") or "") == rid]
+        return self._close_keys(keys)
 
     def shutdown_thread(self) -> bool:
         closed = True
         with self._lock:
             keys = [key for key, row in self._sessions.items()
                     if int(row.get("owner_thread") or 0) == threading.get_ident()]
-        for key in keys:
-            if "::" in key:
-                sn_part, rid = key.split("::", 1)
-                self.close_case(sn_part, run_id=rid)
-            else:
-                self.close_case(key)
+        closed = self._close_keys(keys) and closed
         browsers: dict = getattr(self._local, "browsers", None) or {}
         remaining = {}
         for sn, browser in list(browsers.items()):

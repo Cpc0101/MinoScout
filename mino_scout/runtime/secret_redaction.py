@@ -9,6 +9,7 @@ _values: set[str] = set()
 _ordered_values: tuple[str, ...] | None = None
 _sensitive_runs: set[str] = set()
 _keys = {"password", "passwd", "secret", "secret_value", "api_key", "access_token", "authorization"}
+_opaque_keys = {"credential", "storage_state", "session_storage"}
 
 
 def remember(value: Any) -> None:
@@ -53,7 +54,7 @@ def sanitize(value: Any) -> Any:
             value = value.replace(secret, "[REDACTED]")
         return value
     if isinstance(value, dict):
-        return {k: ("" if str(k).lower() in _keys and not isinstance(v, (dict, bool))
+        return {k: ("[REDACTED]" if str(k).lower() in _opaque_keys else "" if str(k).lower() in _keys and not isinstance(v, (dict, bool))
                     else sanitize(v)) for k, v in value.items()}
     if isinstance(value, list):
         return [sanitize(v) for v in value]

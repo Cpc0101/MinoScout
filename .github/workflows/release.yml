@@ -90,6 +90,10 @@ jobs:
           python -m pip install .
       - name: Check execution lifecycle contracts
         run: python -B scripts/check_case_lifecycle.py
+      - name: Check Web authentication contracts
+        run: python -B scripts/check_web_auth_contracts.py
+      - name: Web observation contracts
+        run: python -B scripts/check_web_observation_contracts.py
       - name: Include PC Desktop SDK
         if: runner.os == 'macOS' || runner.os == 'Windows'
         run: python -m pip install ".[desktop]"

@@ -3,9 +3,14 @@ from __future__ import annotations
 from typing import Any
 
 # Only these framework/read implementations are known not to mutate UI.
-READS = frozenset({"write_stop_status", "probe", "probe_device_state", "screenshot", "hierarchy", "get_foreground_app", "get_app_version",
-                   "wait_screen_ready",
-                   "read_web_auth", "read_web_target_facts", "read_device_data"})
+READS = frozenset({
+    "write_stop_status", "probe", "probe_device_state", "screenshot", "hierarchy",
+    "get_foreground_app", "get_app_version", "wait_screen_ready", "read_web_auth",
+    "read_web_target_facts", "read_device_data", "network_expect_register",
+    "network_expect_wait", "network_expect_cancel", "read_browser_errors",
+    "read_web_environment", "read_clipboard", "assert_clipboard", "check_focused",
+    "read_focused", "read_url",
+})
 
 # 装包/卸载的成败由 adb / devicectl 给出终态，不是「界面效果未知」。
 # 它们仍是写动作（要串行、要受 stop 检查），但不该按界面写去封存资源：

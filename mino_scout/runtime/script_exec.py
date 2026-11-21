@@ -28,6 +28,72 @@ _BANNED = {"adbutils", "uiautomator2", "playwright", "facebook", "facebook_wda",
 _HIDDEN = {"otp", "password", "text", "image_base64", "image", "secret", "token"}
 _RUN_LOCK = threading.Lock()
 
+_WEB_PERMISSIONS = {"geolocation", "notifications", "clipboard-read", "clipboard-write"}
+
+
+def _normalize_web_options(value: dict[str, Any] | None) -> dict[str, Any]:
+    """Validate the stable browser environment contract shared with Nexus."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ScriptAbort("web_options 必须是映射", reason_code="web_options_invalid")
+    allowed = {"locale", "timezone_id", "region", "permissions", "geolocation", "page_clock"}
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ScriptAbort(f"web_options 不支持 {unknown[0]}", reason_code="web_options_invalid")
+    out: dict[str, Any] = {}
+    locale = str(value.get("locale") or "").strip()
+    if locale:
+        if len(locale) > 35 or not __import__("re").fullmatch(r"[A-Za-z]{2,8}(?:-[A-Za-z0-9]{2,8})*", locale):
+            raise ScriptAbort("locale 格式无效", reason_code="web_options_invalid")
+        out["locale"] = locale
+    timezone_id = str(value.get("timezone_id") or "").strip()
+    if timezone_id:
+        if len(timezone_id) > 64 or not __import__("re").fullmatch(r"[A-Za-z][A-Za-z0-9_+.-]*(?:/[A-Za-z0-9_+.-]+)*", timezone_id):
+            raise ScriptAbort("timezone_id 格式无效", reason_code="web_options_invalid")
+        out["timezone_id"] = timezone_id
+    region = str(value.get("region") or "").strip().upper()
+    if region:
+        if len(region) > 8 or not __import__("re").fullmatch(r"[A-Z0-9-]+", region):
+            raise ScriptAbort("region 格式无效", reason_code="web_options_invalid")
+        out["region"] = region
+    permissions = value.get("permissions")
+    if permissions is not None:
+        if not isinstance(permissions, dict):
+            raise ScriptAbort("permissions 必须是映射", reason_code="web_options_invalid")
+        bad = sorted(set(permissions) - _WEB_PERMISSIONS)
+        if bad:
+            raise ScriptAbort(f"permissions 不支持 {bad[0]}", reason_code="web_options_invalid")
+        normalized: dict[str, str] = {}
+        for name, state in permissions.items():
+            state_v = str(state or "").strip().lower()
+            if state_v not in {"granted", "denied", "prompt"}:
+                raise ScriptAbort(f"permission {name} 必须是 granted/denied/prompt", reason_code="web_options_invalid")
+            normalized[str(name)] = state_v
+        out["permissions"] = normalized
+    geolocation = value.get("geolocation")
+    if geolocation is not None:
+        if not isinstance(geolocation, dict):
+            raise ScriptAbort("geolocation 必须是映射", reason_code="web_options_invalid")
+        try:
+            lat = float(geolocation.get("latitude"))
+            lon = float(geolocation.get("longitude"))
+            accuracy = float(geolocation.get("accuracy", 0))
+        except (TypeError, ValueError):
+            raise ScriptAbort("geolocation 经纬度必须是数字", reason_code="web_options_invalid") from None
+        if not -90 <= lat <= 90 or not -180 <= lon <= 180 or accuracy < 0:
+            raise ScriptAbort("geolocation 超出有效范围", reason_code="web_options_invalid")
+        out["geolocation"] = {"latitude": lat, "longitude": lon, "accuracy": accuracy}
+    page_clock = value.get("page_clock")
+    if page_clock is not None:
+        if not isinstance(page_clock, dict):
+            raise ScriptAbort("page_clock 必须是映射", reason_code="web_options_invalid")
+        fixed = page_clock.get("fixed_time")
+        if fixed is not None and not isinstance(fixed, (int, str)):
+            raise ScriptAbort("page_clock.fixed_time 必须是毫秒整数或日期字符串", reason_code="web_options_invalid")
+        out["page_clock"] = {"fixed_time": fixed, "pause": bool(page_clock.get("pause", True))}
+    return out
+
 
 class ScriptHalt(BaseException):
     def __init__(self, message: str, *, reason_code: str):
@@ -269,6 +335,18 @@ def _failure(exc: BaseException, case: Case | None) -> dict[str, Any]:
 def _report_outcome(case, outcome):
     if case is None:
         return outcome
+    if case._recorder:
+        from mino_scout.platform.web.playwright_hub import get_hub
+        for app in case._apps.values():
+            if app._platform == "web":
+                try:
+                    obs = get_hub().current_observability(app._sn, run_id=app.run_id, **app._web_identity())
+                    if obs is not None:
+                        obs.flush_summary()
+                except Exception as exc:
+                    case._recorder.append("browser/observation", {
+                        "app": app.key, **app._web_identity(), "collection_gap": type(exc).__name__,
+                    })
     from mino_scout.runtime.business_report import build_report
     assertions = case._assertions
     counts = {"total": len(assertions), "pass": sum(r["status"] == "pass" for r in assertions),
@@ -583,6 +661,7 @@ class Case:
         self._otp_messages: dict[tuple[str, str, str], set[str]] = {}
         self._otp_requests: dict[str, dict] = {}
         self._apps: dict[str, App] = {}
+        self._active_identity: dict[str, str] = {}
         self._recorder = getattr(core, "_recording", None)
         self._source_ref = ""
         self._step_id = ""
@@ -666,7 +745,8 @@ class Case:
         row = {"assertion_id": "assert_" + uuid.uuid4().hex, "checker": checker, "status": status,
                "source_ref": self._source_ref, "source_hash": self._source_hash, "step_id": self._step_id,
                "title": str(self._step or ""), "role": self._role,
-               "assertion_kind": "page_identity" if checker == "on_page" else "business", **evidence}
+               "assertion_kind": "page_identity" if checker == "on_page" else "business",
+               **self._active_identity, **evidence}
         self._assertions.append(row)
         if self._recorder:
             self._recorder.append("assertion/result", row)
@@ -692,23 +772,58 @@ class Case:
         raise _unknown("case", name, ["config", "env", "app_id", "app_key", "init", "scout", "nexus", "data", "workspace", "output_dir"],
                        "。设备动作写在 app = case.init(case.config.<KEY>) 返回的 app 上")
 
-    def init(self, ref: AppRef, *, web_resolution: str = "") -> "App":
+    def init(
+        self,
+        ref: AppRef,
+        *,
+        web_resolution: str = "",
+        actor: str = "",
+        context_id: str = "",
+        page_id: str = "",
+        web_options: dict[str, Any] | None = None,
+    ) -> "App":
         self._guard()
         if not isinstance(ref, AppRef):
             raise ScriptAbort("case.init 只接受 case.config.<KEY>", reason_code="config_invalid")
         if ref.platform != self._platform:
             raise ScriptAbort(f"应用 {ref.key} 是 {ref.platform}，本次运行是 {self._platform}", reason_code="platform_mismatch")
         resolution = ""
+        actor_v = context_v = page_v = ""
+        options: dict[str, Any] = {}
         if ref.platform == "web":
             try:
                 resolution = normalize_web_resolution(web_resolution)
             except ValueError as exc:
                 raise ScriptAbort(str(exc), reason_code="config_invalid") from None
+            options = _normalize_web_options(web_options)
+            from mino_scout.platform.web.playwright_hub import normalize_web_identity
+            try:
+                actor_v, context_v, page_v = normalize_web_identity(actor, context_id, page_id)
+            except ValueError as exc:
+                raise ScriptAbort(str(exc), reason_code="config_invalid") from None
+            if options and not actor_v:
+                actor_v, context_v, page_v = normalize_web_identity("default")
         elif str(web_resolution or "").strip():
             raise ScriptAbort("web_resolution 只适用于 Web 应用", reason_code="config_invalid")
-        app = self._apps.get(ref.key)
+        elif actor or context_id or page_id or web_options is not None:
+            raise ScriptAbort("actor/context/page/web_options 只适用于 Web 应用", reason_code="config_invalid")
+        cache_key = json.dumps(
+            [ref.key, ref.app_id, self.env, resolution, actor_v, context_v, page_v, options],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        app = self._apps.get(cache_key)
         if app is None:
-            app = self._apps[ref.key] = App(self, ref, web_resolution=resolution)
+            app = self._apps[cache_key] = App(
+                self,
+                ref,
+                web_resolution=resolution,
+                actor=actor_v,
+                context_id=context_v,
+                page_id=page_v,
+                web_options=options,
+            )
         elif app._web_resolution != resolution:
             raise ScriptAbort(
                 f"应用 {ref.key} 已按 {app.web_resolution_label or DEFAULT_WEB_RESOLUTION} 初始化，不能在同一用例内切换分辨率",
@@ -793,12 +908,26 @@ class App:
     _started = _shared("_started")
     _mail_to = _shared("_mail_to")
 
-    def __init__(self, case: Case, ref: AppRef, *, web_resolution: str = ""):
+    def __init__(
+        self,
+        case: Case,
+        ref: AppRef,
+        *,
+        web_resolution: str = "",
+        actor: str = "",
+        context_id: str = "",
+        page_id: str = "",
+        web_options: dict[str, Any] | None = None,
+    ):
         self._case = case
         self.key = ref.key
         self._package = ref.package
         self._url = ref.url
         self._web_resolution = str(web_resolution or "")
+        self._actor = str(actor or "")
+        self._context_id = str(context_id or "")
+        self._page_id = str(page_id or "")
+        self._web_options = dict(web_options or {})
         self._pages = case._all_pages.get(ref.key, {})
         self._page_key = ""
         self._shot = None
@@ -827,17 +956,62 @@ class App:
 
         return str(WEB_VIEWPORTS[self._web_resolution]["label"])
 
+    @property
+    def identity(self) -> dict[str, str]:
+        """Stable actor/context/page attribution for this browser session."""
+        return self._web_identity()
+
+    @property
+    def network(self):
+        """Web request/response observation API; one expectation is one bounded window."""
+        from mino_scout.runtime.web_api import _Network
+
+        return _Network(self)
+
+    @property
+    def clipboard(self):
+        """Web clipboard read/write/assert API without persisting clipboard contents."""
+        from mino_scout.runtime.web_api import _Clipboard
+
+        return _Clipboard(self)
+
+    @property
+    def expect(self):
+        """Callable page/business expectation plus deterministic Web expect.* helpers."""
+        from mino_scout.runtime.web_api import _Expectation
+
+        return _Expectation(self)
+
     # ---- 启停
     def __getattr__(self, name: str):
         if name.startswith("_"):
             raise AttributeError(name)
         raise _unknown("app", name, _public_names(App))
 
-    def launch(self) -> ActionResult:
+    def launch(self, uri: str = "", *, account=None, auth: str = "none", identity_control: str = "",
+               identity_field: str = "username", ready_control: str = "", timeout_ms: int = 20000) -> ActionResult:
+        if not isinstance(uri, str):
+            raise ScriptAbort("uri 必须是字符串", reason_code="web_uri_invalid", status="blocked")
+        if uri or account is not None or auth != "none":
+            if self._platform != "web":
+                raise ScriptAbort("URI 与认证预置仅支持 Web", reason_code="web_auth_platform_invalid", status="blocked")
+            from mino_scout.platform.web.auth import launch
+            try:
+                return launch(self, uri, account, auth, identity_control, identity_field, ready_control, timeout_ms)
+            except ScriptAbort as exc:
+                if auth != "none":
+                    self._case._latched_error = self._case._latched_error or exc
+                raise
         params = {"package": self._package, "bundle": self._package, "bundle_id": self._package, "url": self._url}
         if self._web_resolution:
             params["web_resolution"] = self._web_resolution
         return self._device("launch_app", params)
+
+    def save_auth(self, account, *, identity_control: str, identity_field: str = "username",
+                  ttl_seconds: int = 3600, timeout_ms: int = 20000) -> ActionResult:
+        """Explicit preparation only: verify the leased identity, then save its snapshot."""
+        from mino_scout.platform.web.auth import save
+        return save(self, account, identity_control, identity_field, ttl_seconds, timeout_ms)
 
     def close(self) -> ActionResult:
         return self._device("close_app", {"package": self._package, "bundle": self._package, "bundle_id": self._package})
@@ -941,6 +1115,127 @@ class App:
     def reload(self) -> ActionResult:
         return self._device("reload_page", {})
 
+    def focus(self, control: str) -> ActionResult:
+        """Focus one Web control through its published locator contract."""
+        if self._platform != "web":
+            raise ScriptAbort("焦点控件操作仅支持 Web", reason_code="web_capability_platform_invalid", status="blocked")
+        return self._device("focus_element", self._locate(str(control or ""), "focus_element"))
+
+    def drag_control(self, source: str, target: str, *, mode: str = "mouse",
+                     duration_ms: int = 500, steps: int = 0) -> ActionResult:
+        """Drag between two independently resolved Web controls."""
+        if self._platform != "web":
+            raise ScriptAbort("控件拖拽仅支持 Web", reason_code="web_capability_platform_invalid", status="blocked")
+        mode_v = str(mode or "mouse").strip().lower()
+        if mode_v not in {"mouse", "html5"}:
+            raise ScriptAbort("拖拽 mode 必须是 mouse 或 html5", reason_code="drag_invalid", status="blocked")
+        if type(duration_ms) is not int or not 0 <= duration_ms <= 120_000:
+            raise ScriptAbort("duration_ms 必须是 0..120000 的整数", reason_code="drag_invalid", status="blocked")
+        if type(steps) is not int or not 0 <= steps <= 500:
+            raise ScriptAbort("steps 必须是 0..500 的整数", reason_code="drag_invalid", status="blocked")
+        source_params = self._locate(str(source or ""), "drag_control")
+        target_params = self._locate(str(target or ""), "drag_control")
+        params: dict[str, Any] = {
+            "source_target": source_params,
+            "target_target": target_params,
+            "mode": mode_v,
+            "duration_ms": duration_ms,
+        }
+        if steps:
+            params["steps"] = steps
+        return self._device("drag_control", params)
+
+    def forward(self, *, timeout_ms: int = 15000) -> ActionResult:
+        """Move the current page forward without inventing a target URL."""
+        if self._platform != "web":
+            raise ScriptAbort("页面前进仅支持 Web", reason_code="web_capability_platform_invalid", status="blocked")
+        if type(timeout_ms) is not int or not 1000 <= timeout_ms <= 120000:
+            raise ScriptAbort("timeout_ms 必须是 1000..120000 的整数", reason_code="navigation_invalid", status="blocked")
+        return self._device("forward_page", {"timeout_ms": timeout_ms})
+
+    def navigate(self, uri: str, *, timeout_ms: int = 15000) -> ActionResult:
+        """Navigate within the current origin through the public Web contract."""
+        if self._platform != "web":
+            raise ScriptAbort("页面导航仅支持 Web", reason_code="web_capability_platform_invalid", status="blocked")
+        if not isinstance(uri, str) or not uri.strip():
+            raise ScriptAbort("navigate 需要非空 uri", reason_code="navigation_invalid", status="blocked")
+        if type(timeout_ms) is not int or not 1000 <= timeout_ms <= 120000:
+            raise ScriptAbort("timeout_ms 必须是 1000..120000 的整数", reason_code="navigation_invalid", status="blocked")
+        return self._device("navigate_page", {"uri": uri, "timeout_ms": timeout_ms})
+
+    def current_url(self) -> str:
+        """Read the committed current URL as evidence, without asserting it."""
+        if self._platform != "web":
+            raise ScriptAbort("URL 读取仅支持 Web", reason_code="web_capability_platform_invalid", status="blocked")
+        result = self._device("read_url", {})
+        return str((result.data or {}).get("page_url") or "")
+
+    def browser_errors(self, *, clear: bool = False) -> dict[str, Any]:
+        return self.network.errors(clear=clear)
+
+    def environment(self) -> dict[str, Any]:
+        return self.network.environment()
+
+    def set_permission(self, permission: str, state: str, *, origin: str = "") -> ActionResult:
+        """Set one supported browser permission; denied must be configured at context creation."""
+        if self._platform != "web":
+            raise ScriptAbort("浏览器权限仅支持 Web", reason_code="web_capability_platform_invalid", status="blocked")
+        name = str(permission or "").strip()
+        state_v = str(state or "").strip().lower()
+        if name not in _WEB_PERMISSIONS:
+            raise ScriptAbort("不支持的浏览器权限", reason_code="web_permission_invalid", status="blocked")
+        if state_v not in {"granted", "denied", "prompt"}:
+            raise ScriptAbort("权限状态必须是 granted/denied/prompt", reason_code="web_permission_invalid", status="blocked")
+        params: dict[str, Any] = {"permission": name, "state": state_v}
+        if origin:
+            params["origin"] = str(origin)
+        return self._device("set_web_permission", params)
+
+    def set_geolocation(self, latitude: float, longitude: float, *, accuracy: float = 0) -> ActionResult:
+        """Apply a deterministic browser geolocation to the current context."""
+        if self._platform != "web":
+            raise ScriptAbort("地理位置仅支持 Web", reason_code="web_capability_platform_invalid", status="blocked")
+        return self._device("set_geolocation", {
+            "latitude": float(latitude), "longitude": float(longitude), "accuracy": float(accuracy),
+        })
+
+    def set_page_time(self, *, fixed_time=None, fast_forward_ms: int | None = None,
+                      run_for_ms: int | None = None, pause_at=None,
+                      resume: bool = False) -> ActionResult:
+        """Set/fast-forward/run/pause/resume Playwright's page clock."""
+        if self._platform != "web":
+            raise ScriptAbort("页面时间控制仅支持 Web", reason_code="web_capability_platform_invalid", status="blocked")
+        selected = sum((fixed_time is not None, fast_forward_ms is not None, run_for_ms is not None,
+                        pause_at is not None, bool(resume)))
+        if selected != 1:
+            raise ScriptAbort("页面时间操作必须且只能选择一种", reason_code="page_clock_invalid", status="blocked")
+        params: dict[str, Any]
+        if fixed_time is not None:
+            from mino_scout.platform.web.playwright_observability import _fixed_time_ms
+            try:
+                epoch_ms = _fixed_time_ms(fixed_time)
+            except (TypeError, ValueError) as exc:
+                raise ScriptAbort(f"fixed_time 无效: {exc}", reason_code="page_clock_invalid", status="blocked") from None
+            params = {"action": "set_fixed", "epoch_ms": int(epoch_ms)}
+        elif fast_forward_ms is not None:
+            if type(fast_forward_ms) is not int or not 0 <= fast_forward_ms <= 86_400_000:
+                raise ScriptAbort("fast_forward_ms 必须是 0..86400000 的整数", reason_code="page_clock_invalid", status="blocked")
+            params = {"action": "fast_forward", "milliseconds": fast_forward_ms}
+        elif run_for_ms is not None:
+            if type(run_for_ms) is not int or not 0 <= run_for_ms <= 86_400_000:
+                raise ScriptAbort("run_for_ms 必须是 0..86400000 的整数", reason_code="page_clock_invalid", status="blocked")
+            params = {"action": "run_for", "milliseconds": run_for_ms}
+        elif pause_at is not None:
+            from mino_scout.platform.web.playwright_observability import _fixed_time_ms
+            try:
+                epoch_ms = _fixed_time_ms(pause_at)
+            except (TypeError, ValueError) as exc:
+                raise ScriptAbort(f"pause_at 无效: {exc}", reason_code="page_clock_invalid", status="blocked") from None
+            params = {"action": "pause", "epoch_ms": int(epoch_ms)}
+        else:
+            params = {"action": "resume"}
+        return self._device("set_page_time", params)
+
     def open_tab(self, url: str = "") -> ActionResult:
         return self._device("open_tab", {"url": str(url or self._url)})
 
@@ -1037,15 +1332,6 @@ class App:
 
         return on_page(self, page_key)
 
-    def expect(self, page: str = "", prompt: str = "", verdict: str = "pass", *, allow_model: bool = False) -> str:
-        """分别验证页面身份和业务预期；文字证据不确定时取新截图判断。
-
-        页面成立不能代替业务预期成立；明确失败直接终止本次断言。
-        """
-        from mino_scout.platform.scout.run import expect as _expect
-
-        return _expect(self, page=page, prompt=prompt, verdict=verdict, allow_model=allow_model)
-
     def expect_text(self, text: str, *, control: str = "", present: bool = True, timeout_ms: int = 0,
                     ocr: bool = False, region=None):
         from mino_scout.runtime.deterministic import verify
@@ -1084,6 +1370,16 @@ class App:
         return vlm_frame(self, index, prompt, verdict=verdict)
 
     # ---- 内部
+    def _web_identity(self) -> dict[str, str]:
+        actor = str(getattr(self, "_actor", "") or "")
+        if self._platform != "web" or not actor:
+            return {}
+        return {
+            "actor": actor,
+            "context_id": str(getattr(self, "_context_id", "") or ""),
+            "page_id": str(getattr(self, "_page_id", "") or ""),
+        }
+
     def _locate(self, control: str, kind: str, index: Optional[int] = None) -> dict[str, Any]:
         try:
             params = self._locator_params(control, index=index)
@@ -1101,11 +1397,15 @@ class App:
             if self._case._recorder:
                 self._case._recorder.append("locator/result", {"status": "fail", "phase": "locator", "execution_started": "no",
                     "control": control, "capability_id": kind, "reason_code": exc.reason_code, "summary": str(exc),
-                    "app": self.key, "action_seq": self._seq + 1, "details": exc.details})
+                    "app": self.key, "action_seq": self._seq + 1, **self._web_identity(), "details": exc.details})
             raise
 
-    def _device(self, capability: str, params: dict[str, Any], extra: dict[str, Any] | None = None) -> ActionResult:
-        self._guard()
+    def _device(self, capability: str, params: dict[str, Any], extra: dict[str, Any] | None = None, *,
+                allow_latched: bool = False, allow_failed: bool = False) -> ActionResult:
+        if not allow_latched:
+            self._guard()
+        else:
+            self._case._active_identity = self._web_identity()
         executor = self._require_channel()
         if not executor.supports(capability):
             raise ScriptAbort(f"{self._platform} 渠道不支持 {capability}", reason_code="declined")
@@ -1113,30 +1413,52 @@ class App:
         self._begin_action(capability, params)
         if ui_write(capability):
             self.touched = True
-        event = PlanEvent(seq=self._seq, capability_id=capability, event_kind=capability, params=dict(params),
+        event_params = {**params, "_web_identity": self._web_identity()}
+        event = PlanEvent(seq=self._seq, capability_id=capability, event_kind=capability, params=event_params,
                            executor_order=[_EXECUTOR[self._platform]], selected_impl={"executor": _EXECUTOR[self._platform]})
         started = time.perf_counter()
         router = getattr(self.core, "router", None)
+        shared = {"write_stopped": lambda: bool(self._case._latched_error),
+                  "web_observer_sink": self._web_observer_sink,
+                  "network_guard": self._network_guard}
         if router is not None:
             result = router.dispatch(event, self._device_ref(), run_id=self.run_id, step_idx=self._seq,
-                                     shared={"write_stopped": lambda: bool(self._case._latched_error)})
+                                     shared=shared)
         else:
-            result = executor.execute(event, ExecutorContext(device=self._device_ref(), run_id=self.run_id, step_idx=self._seq))
+            result = executor.execute(event, ExecutorContext(device=self._device_ref(), run_id=self.run_id, step_idx=self._seq,
+                                                             shared=shared))
         elapsed = int((time.perf_counter() - started) * 1000)
         status = str(getattr(result.status, "value", result.status) or "fail")
         action = ActionResult(ok=status == "pass", summary=str(result.summary or ""), status=status, data=_public(result.raw_response))
         self._report(capability, action, str(result.executor_used or _EXECUTOR[self._platform]), elapsed, extra=extra)
-        if not action.ok:
+        if not action.ok and not allow_failed:
             raw = action.data
             execution = raw.get("execution") if isinstance(raw.get("execution"), dict) else {}
             control = raw.get("execution_control") if isinstance(raw.get("execution_control"), dict) else {}
             reason = str(execution.get("reason_code") or raw.get("reason_code") or raw.get("error_kind") or "action_failed")
+            if reason in {"cancelled", "script_timeout"}:
+                raise ScriptHalt(action.summary or "网络等待已停止", reason_code=reason)
             error = ScriptAbort(action.summary or "设备动作失败", reason_code=reason,
                                 status=status if status in {"fail", "blocked", "declined", "skipped"} else "fail",
                                 details={**control, "phase": "device", "execution_started": execution.get("execution_started", "unknown")})
             self._case._latched_error = self._case._latched_error or error
             raise error
         return action
+
+    def _network_guard(self):
+        # Convert the runtime's cancellation halt to an executor-readable exception.
+        try:
+            self._guard()
+        except ScriptHalt as exc:
+            raise ScriptAbort(str(exc), reason_code=exc.reason_code, status="blocked") from None
+
+    def _web_observer_sink(self, event_type: str, data: dict):
+        if self._case._recorder:
+            self._case._recorder.append(event_type, {
+                "app": self.key, "action_seq": self._seq, "step_id": self._case._step_id,
+                "source_ref": self._case._source_ref, "source_hash": self._case._source_hash,
+                "association": "timing_only", **data,
+            })
 
     def _begin_action(self, capability: str, params: dict):
         from mino_scout.runtime.execution_boundary import ui_write
@@ -1153,14 +1475,25 @@ class App:
             self._shot = None
             self._observation_id = ""
             self._artifact_id = ""
-        safe_params = {key: value for key, value in params.items() if key not in {"text", "script"}}
+        safe_params = {
+            key: value
+            for key, value in params.items()
+            if key not in {"text", "expected_text", "script", "credential"}
+        }
+        if "credential" in params:
+            safe_params["credential_configured"] = True
         if "text" in params:
             safe_params["text_length"] = len(str(params["text"]))
+        if "expected_text" in params:
+            expected = str(params["expected_text"])
+            safe_params["expected_text_length"] = len(expected)
+            safe_params["expected_text_sha256"] = hashlib.sha256(expected.encode("utf-8")).hexdigest()
         if "script" in params:
             safe_params["script_sha256"] = hashlib.sha256(str(params["script"]).encode()).hexdigest()
         if self._case._recorder:
             self._case._recorder.append("tool/call", {"capability_id": capability, "params": safe_params,
                 "action_seq": self._seq, "effect_class": "write" if writing else "read", "app": self.key,
+                **self._web_identity(),
                 "source_ref": self._case._source_ref, "source_hash": self._case._source_hash,
                 "step_id": self._case._step_id, "role": self._case._role})
 
@@ -1289,6 +1622,10 @@ class App:
         if self._url:
             extra["url"] = self._url
         extra["web_resolution"] = self._web_resolution
+        if self._platform == "web":
+            extra.update(self._web_identity())
+            if self._web_options:
+                extra["web_options"] = dict(self._web_options)
         serial = str(hint.get("adb_serial") or "")
         udid = str(hint.get("udid") or "")
         if self._platform == "android":
@@ -1302,12 +1639,17 @@ class App:
 
     def _report(self, capability: str, result: ActionResult, executor: str, elapsed: int, image=None,
                 extra: dict[str, Any] | None = None) -> None:
-        return self._case._report(capability, result, executor, elapsed, image=image, app=self.key, extra=extra)
+        attribution = dict(extra or {})
+        attribution.update(self._web_identity())
+        if self._web_options:
+            attribution["web_options"] = dict(self._web_options)
+        return self._case._report(capability, result, executor, elapsed, image=image, app=self.key, extra=attribution)
 
     def _callback(self, capability: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
         return self._case._callback(capability, params, timeout)
 
     def _guard(self) -> None:
+        self._case._active_identity = self._web_identity()
         self._case._guard()
 
 

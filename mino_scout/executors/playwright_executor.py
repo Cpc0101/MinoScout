@@ -3,11 +3,12 @@
 """Web 执行通道：Playwright，和 AdbExecutor 平级。禁止 page.evaluate 改界面。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from mino_scout.tools.keep_alive.log import SLog
 
@@ -102,7 +103,52 @@ _SUPPORTED_CAPS: set[str] = {
     "upload_file",
     "reload_page",
     "set_clipboard",
+    "network_expect_register",
+    "network_expect_wait",
+    "network_expect_cancel",
+    "read_browser_errors",
+    "read_web_environment",
+    "read_clipboard",
+    "assert_clipboard",
+    "focus_element",
+    "check_focused",
+    "read_focused",
+    "forward_page",
+    "navigate_page",
+    "read_url",
+    "drag_control",
+    "set_geolocation",
+    "set_web_permission",
+    "set_page_time",
 }
+
+
+def _web_identity(event: PlanEvent, ctx: ExecutorContext) -> tuple[str, str, str]:
+    """Read the same explicit identity from event params or device attribution."""
+    from mino_scout.platform.web.playwright_hub import normalize_web_identity
+
+    params = event.params or {}
+    extra = ctx.device.extra or {}
+    nested = extra.get("_web_identity")
+    sources = (params, nested if isinstance(nested, dict) else {}, extra)
+    actor = context_id = page_id = ""
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        actor = actor or str(source.get("actor") or "")
+        context_id = context_id or str(source.get("context_id") or source.get("context") or "")
+        page_id = page_id or str(source.get("page_id") or source.get("page") or "")
+    return normalize_web_identity(actor, context_id, page_id)
+
+
+def _identity_kwargs(identity: tuple[str, str, str]) -> dict[str, str]:
+    actor, context_id, page_id = identity
+    return {"actor": actor, "context_id": context_id, "page_id": page_id}
+
+
+def _clipboard_evidence(value: str) -> dict[str, Any]:
+    raw = str(value or "").encode("utf-8")
+    return {"length": len(str(value or "")), "sha256": hashlib.sha256(raw).hexdigest()}
 
 
 def _input_summary_snippet(text: str, *, max_len: int = 40) -> str:
@@ -158,9 +204,11 @@ class PlaywrightExecutor:
     id = "playwright"
 
     def __init__(self) -> None:
-        self._focus_actions: dict[tuple[str, str], tuple[Any, list[tuple[Any, str, Any]]]] = {}
+        self._focus_actions: dict[
+            tuple[str, str, str, str, str], tuple[Any, list[tuple[Any, str, Any]]]
+        ] = {}
 
-    def _forget_focus(self, key: tuple[str, str]) -> None:
+    def _forget_focus(self, key: tuple[str, str, str, str, str]) -> None:
         old = self._focus_actions.pop(key, None)
         if old is not None:
             for _, _, document in old[1]:
@@ -259,7 +307,9 @@ class PlaywrightExecutor:
             cap = "close_app"
         sn = str(ctx.device.sn or "")
         run_id = str(ctx.run_id or "")
-        focus_key = (sn, run_id)
+        identity = _web_identity(event, ctx)
+        id_kwargs = _identity_kwargs(identity)
+        focus_key = (sn, run_id, *identity)
         if not ctx.device.is_web:
             return make_event_result(
                 event, status=EventStatus.DECLINED, executor_used=self.id,
@@ -272,6 +322,8 @@ class PlaywrightExecutor:
         hub = get_hub()
         headed = headed_from_hint(ctx.device.extra)
         web_resolution = str(ctx.device.extra.get("web_resolution") or DEFAULT_WEB_RESOLUTION)
+        web_options = ctx.device.extra.get("web_options")
+        web_options = dict(web_options) if isinstance(web_options, dict) else {}
         try:
             if cap == "launch_app":
                 p = event.params or {}
@@ -280,8 +332,8 @@ class PlaywrightExecutor:
                     ctx.device.extra.get("target_package"),
                     p.get("package"),
                 )
-                page = hub.current_page(sn, run_id=run_id)
-                if page is None:
+                page = hub.current_page(sn, run_id=run_id, **id_kwargs)
+                if page is None or p.get("fresh_context"):
                     page = hub.open_case(
                         sn,
                         run_id=run_id,
@@ -289,6 +341,10 @@ class PlaywrightExecutor:
                         headed=headed,
                         goto_params=p,
                         web_resolution=web_resolution,
+                        credential=p.get("credential"),
+                        web_options=web_options,
+                        evidence_sink=ctx.shared.get("web_observer_sink"),
+                        **id_kwargs,
                     )
                 elif url:
                     goto_url(page, url, params=p)
@@ -298,13 +354,13 @@ class PlaywrightExecutor:
                 if p.get("shutdown_browser") or p.get("shutdown"):
                     hub.close_run(sn, run_id, shutdown_browser=True)
                     return self._ok(event, started_at, t0, "关闭本任务 Chromium", execution_started="yes")
-                hub.close_case(sn, run_id=run_id)
-                return self._ok(event, started_at, t0, "关闭页面", execution_started="yes")
+                hub.close_case(sn, run_id=run_id, **id_kwargs)
+                return self._ok(event, started_at, t0, "关闭当前页面会话", execution_started="yes")
             if cap == "read_web_auth":
                 return self._read_web_auth(
-                    event, hub.current_page(sn, run_id=run_id), started_at, t0
+                    event, hub.current_page(sn, run_id=run_id, **id_kwargs), started_at, t0
                 )
-            page = hub.current_page(sn, run_id=run_id)
+            page = hub.current_page(sn, run_id=run_id, **id_kwargs)
             if page is None:
                 page = hub.open_case(
                     sn,
@@ -312,27 +368,286 @@ class PlaywrightExecutor:
                     base_url=pick_goto_url(ctx.device.extra.get("target_package")),
                     headed=headed,
                     web_resolution=web_resolution,
+                    web_options=web_options,
+                    evidence_sink=ctx.shared.get("web_observer_sink"),
+                    **id_kwargs,
                 )
             if cap == "get_foreground_app":
-                return self._get_foreground_app(event, hub, sn, run_id, started_at, t0)
+                return self._get_foreground_app(
+                    event, hub, sn, run_id, started_at, t0, identity=identity
+                )
             if cap == "wait_screen_ready":
                 return self._wait_screen_ready(event, page, started_at, t0)
             if cap == "switch_tab":
-                return self._switch_tab(event, hub, sn, run_id, started_at, t0)
+                return self._switch_tab(
+                    event, hub, sn, run_id, started_at, t0, identity=identity
+                )
             if cap == "open_tab":
-                return self._open_tab(event, hub, sn, run_id, started_at, t0)
+                return self._open_tab(
+                    event, hub, sn, run_id, started_at, t0, identity=identity
+                )
             if cap == "upload_file":
                 return self._upload_file(event, page, started_at, t0)
             if cap == "set_clipboard":
-                text = str((event.params or {}).get("text") or "")
-                if not text:
+                p = event.params or {}
+                if "text" not in p:
                     return self._fail(event, started_at, t0, "set_clipboard 缺 text")
+                text = str(p.get("text") or "")
                 try:
-                    page.context.grant_permissions(["clipboard-read", "clipboard-write"])
-                except Exception:
-                    pass
-                page.evaluate("(value) => navigator.clipboard.writeText(value)", text)
-                return self._ok(event, started_at, t0, f"剪贴板写入 {len(text)} 字", execution_started="yes")
+                    page.evaluate("(value) => navigator.clipboard.writeText(value)", text)
+                except Exception as exc:
+                    return self._fail(event, started_at, t0, f"剪贴板写入失败: {exc}", execution_started="yes")
+                evidence = _clipboard_evidence(text)
+                return make_event_result(
+                    event, status=EventStatus.PASS, executor_used=self.id,
+                    started_at=started_at, elapsed_ms=int((time.time() - t0) * 1000),
+                    summary=f"剪贴板写入 {evidence['length']} 字",
+                    raw_response={"clipboard": evidence, "execution": {
+                        "execution_started": "yes", "phase": "completed", "source": "playwright.native.v1"}},
+                )
+            if cap == "read_clipboard":
+                try:
+                    text = str(page.evaluate("() => navigator.clipboard.readText()") or "")
+                except Exception as exc:
+                    return self._fail(event, started_at, t0, f"剪贴板读取失败: {exc}", execution_started="no")
+                return make_event_result(
+                    event, status=EventStatus.PASS, executor_used=self.id,
+                    started_at=started_at, elapsed_ms=int((time.time() - t0) * 1000),
+                    summary="已读取浏览器剪贴板（内容不落证据）",
+                    raw_response={"clipboard": _clipboard_evidence(text), "execution": {
+                        "execution_started": "no", "phase": "completed", "source": "playwright.native.v1"}},
+                )
+            if cap == "assert_clipboard":
+                expected = str((event.params or {}).get("expected_text") or "")
+                exact = bool((event.params or {}).get("exact", True))
+                try:
+                    actual = str(page.evaluate("() => navigator.clipboard.readText()") or "")
+                except Exception as exc:
+                    return self._fail(event, started_at, t0, f"剪贴板读取失败: {exc}", execution_started="no")
+                matched = actual == expected if exact else expected in actual
+                evidence = {"expected": _clipboard_evidence(expected), "actual": _clipboard_evidence(actual),
+                            "exact": exact, "matched": matched}
+                if not matched:
+                    return make_event_result(
+                        event, status=EventStatus.FAIL, executor_used=self.id,
+                        started_at=started_at, elapsed_ms=int((time.time() - t0) * 1000),
+                        summary="剪贴板内容与预期不一致", error="clipboard_mismatch",
+                        raw_response={"clipboard": evidence, "execution": {
+                            "execution_started": "no", "phase": "executor", "source": "playwright.native.v1"}},
+                    )
+                return make_event_result(
+                    event, status=EventStatus.PASS, executor_used=self.id,
+                    started_at=started_at, elapsed_ms=int((time.time() - t0) * 1000),
+                    summary="剪贴板内容符合预期",
+                    raw_response={"clipboard": evidence, "execution": {
+                        "execution_started": "no", "phase": "completed", "source": "playwright.native.v1"}},
+                )
+            if cap in {"network_expect_register", "network_expect_wait", "network_expect_cancel"}:
+                obs = hub.current_observability(sn, run_id=run_id, **id_kwargs)
+                if obs is None:
+                    return self._fail(event, started_at, t0, "当前页面没有请求观测器", execution_started="no")
+                p = event.params or {}
+                try:
+                    if cap == "network_expect_register":
+                        expectation = obs.register(**{key: value for key, value in p.items()
+                                                       if key != "_web_identity"})
+                        data = {"expectation": expectation.describe()}
+                        summary = "已注册网络响应期望"
+                    elif cap == "network_expect_wait":
+                        data = obs.wait(str(p.get("expectation_id") or ""),
+                                        timeout_ms=int(p.get("timeout_ms") or 10_000),
+                                        guard=ctx.shared.get("network_guard"))
+                        summary = f"匹配响应 {data.get('method', '')} {data.get('path', '')} {data.get('status', '')}"
+                    else:
+                        removed = obs.cancel(str(p.get("expectation_id") or ""))
+                        data = {"cancelled": removed, "expectation_id": str(p.get("expectation_id") or "")}
+                        summary = "已取消网络响应期望" if removed else "网络响应期望已不存在"
+                except Exception as exc:
+                    reason = str(getattr(exc, "reason_code", "") or str(exc).split(" ", 1)[0])
+                    if not reason.startswith("network_") and reason not in {"cancelled", "script_timeout"}:
+                        reason = "network_observation_failed"
+                    blocked = reason in {"network_expectation_ambiguous", "network_observation_overflow",
+                                         "network_capture_fields_invalid", "cancelled", "script_timeout"}
+                    return make_event_result(
+                        event, status=EventStatus.BLOCKED if blocked else EventStatus.FAIL,
+                        executor_used=self.id, started_at=started_at,
+                        elapsed_ms=int((time.time() - t0) * 1000), summary=f"网络响应期望失败: {exc}",
+                        raw_response={"reason_code": reason, "execution": {"execution_started": "no",
+                                      "phase": "observer", "reason_code": reason}},
+                    )
+                return make_event_result(
+                    event, status=EventStatus.PASS, executor_used=self.id,
+                    started_at=started_at, elapsed_ms=int((time.time() - t0) * 1000),
+                    summary=summary,
+                    raw_response={**data, "execution": {
+                        "execution_started": "no", "phase": "completed", "source": "playwright.native.v1"}},
+                )
+            if cap in {"read_browser_errors", "read_web_environment"}:
+                obs = hub.current_observability(sn, run_id=run_id, **id_kwargs)
+                if obs is None:
+                    return self._fail(event, started_at, t0, "当前页面没有请求观测器", execution_started="no")
+                try:
+                    if cap == "read_browser_errors":
+                        data = obs.browser_errors(clear=bool((event.params or {}).get("clear", False)))
+                        summary = f"读取浏览器错误 {data.get('count', 0)} 条"
+                    else:
+                        data = obs.environment()
+                        observed = data.get("observed") if isinstance(data.get("observed"), dict) else {}
+                        summary = f"浏览器环境 {observed.get('language') or '未读取'} / {observed.get('timezone_id') or '未读取'}"
+                except Exception as exc:
+                    return self._fail(event, started_at, t0, f"读取 Web 证据失败: {exc}", execution_started="no")
+                return make_event_result(
+                    event, status=EventStatus.PASS, executor_used=self.id,
+                    started_at=started_at, elapsed_ms=int((time.time() - t0) * 1000),
+                    summary=summary,
+                    raw_response={**data, "execution": {
+                        "execution_started": "no", "phase": "completed", "source": "playwright.native.v1"}},
+                )
+            if cap == "focus_element":
+                try:
+                    loc = locator_from_params(page, event.params or {})
+                    if loc is None:
+                        return self._fail(event, started_at, t0, "焦点控件未找到", execution_started="no")
+                    loc.focus(timeout=4_000)
+                    return self._ok(event, started_at, t0, "控件已获得焦点", execution_started="yes")
+                except Exception as exc:
+                    return self._fail(event, started_at, t0, f"控件聚焦失败: {exc}", execution_started="yes")
+            if cap == "check_focused":
+                try:
+                    loc = locator_from_params(page, event.params or {})
+                    if loc is None:
+                        return self._fail(event, started_at, t0, "焦点控件未找到", execution_started="no")
+                    focused = bool(loc.evaluate(
+                        "el => { let root = el.getRootNode(); while (root && root.activeElement) { "
+                        "if (root.activeElement === el) return true; const active = root.activeElement; "
+                        "root = active.shadowRoot || active.getRootNode(); if (root === active.getRootNode()) break; el = active; } "
+                        "return document.activeElement === el; }"
+                    ))
+                except Exception as exc:
+                    return self._fail(event, started_at, t0, f"读取焦点失败: {exc}", execution_started="no")
+                if not focused:
+                    return self._fail(event, started_at, t0, "目标控件没有焦点", execution_started="no")
+                return self._ok(event, started_at, t0, "目标控件持有焦点", execution_started="no")
+            if cap == "read_focused":
+                try:
+                    element, _ = self._focused_element(page)
+                    if element is None:
+                        return self._fail(event, started_at, t0, "当前没有焦点控件", execution_started="no")
+                    facts = element.evaluate(
+                        "el => ({tag:el.tagName?.toLowerCase() || '', id:el.id || '', name:el.getAttribute?.('name') || '',"
+                        "type:el.getAttribute?.('type') || '', role:el.getAttribute?.('role') || '',"
+                        "value_length:String(el.value ?? el.textContent ?? '').length})"
+                    )
+                    element.dispose()
+                except Exception as exc:
+                    return self._fail(event, started_at, t0, f"读取焦点失败: {exc}", execution_started="no")
+                return make_event_result(
+                    event, status=EventStatus.PASS, executor_used=self.id,
+                    started_at=started_at, elapsed_ms=int((time.time() - t0) * 1000),
+                    summary=f"焦点 {facts.get('tag', '')}#{facts.get('id', '')}",
+                    raw_response={"focused": facts, "execution": {
+                        "execution_started": "no", "phase": "completed", "source": "playwright.native.v1"}},
+                )
+            if cap == "read_url":
+                return self._read_url(event, page, started_at, t0)
+            if cap in {"forward_page", "navigate_page"}:
+                target = str(page.url or "")
+                try:
+                    if cap == "forward_page":
+                        page.go_forward(wait_until="domcontentloaded", timeout=int(
+                            (event.params or {}).get("timeout_ms") or 15_000))
+                    else:
+                        raw = str((event.params or {}).get("uri") or (event.params or {}).get("url") or "").strip()
+                        if not raw:
+                            return self._fail(event, started_at, t0, f"{cap} 缺 uri")
+                        target = urljoin(page.url, raw)
+                        before = urlparse(page.url)
+                        after = urlparse(target)
+                        if after.scheme not in {"http", "https"}:
+                            return self._fail(event, started_at, t0, "导航只允许 http/https", execution_started="no")
+                        if before.netloc and after.netloc != before.netloc:
+                            return self._fail(event, started_at, t0, "跨 origin 导航需要显式能力，当前已阻止",
+                                             execution_started="no")
+                        page.goto(target, wait_until="domcontentloaded", timeout=int(
+                            (event.params or {}).get("timeout_ms") or 15_000))
+                    actual = str(page.url or "")
+                    return make_event_result(
+                        event, status=EventStatus.PASS, executor_used=self.id,
+                        started_at=started_at, elapsed_ms=int((time.time() - t0) * 1000),
+                        summary=f"已导航 {actual[:120]}",
+                        raw_response={"page_url": actual, "requested_url": target,
+                                      "load_state": "domcontentloaded", "execution": {
+                                          "execution_started": "yes", "phase": "completed",
+                                          "source": "playwright.native.v1"}},
+                    )
+                except Exception as exc:
+                    obs = hub.current_observability(sn, run_id=run_id, **id_kwargs)
+                    if obs is not None:
+                        obs.record_navigation_error(exc, target)
+                    return self._fail(event, started_at, t0, f"页面导航失败: {exc}", execution_started="yes")
+            if cap == "drag_control":
+                return self._drag_control(event, page, started_at, t0)
+            if cap == "set_geolocation":
+                p = event.params or {}
+                try:
+                    latitude = float(p.get("latitude"))
+                    longitude = float(p.get("longitude"))
+                    accuracy = float(p.get("accuracy", 0))
+                    if not -90 <= latitude <= 90 or not -180 <= longitude <= 180 or accuracy < 0:
+                        raise ValueError("范围内无效")
+                    page.context.set_geolocation({"latitude": latitude, "longitude": longitude,
+                                                  "accuracy": accuracy})
+                except (TypeError, ValueError) as exc:
+                    return self._fail(event, started_at, t0, f"地理位置无效: {exc}", execution_started="no")
+                return self._ok(event, started_at, t0, f"位置 {latitude},{longitude}", execution_started="yes")
+            if cap == "set_web_permission":
+                p = event.params or {}
+                name = str(p.get("permission") or p.get("name") or "").strip()
+                state = str(p.get("state") or "").strip().lower()
+                origin = str(p.get("origin") or "").strip()
+                if name not in {"geolocation", "notifications", "clipboard-read", "clipboard-write"}:
+                    return self._fail(event, started_at, t0, "不支持的浏览器权限", execution_started="no")
+                try:
+                    if state == "granted":
+                        kwargs = {"origin": origin} if origin else {}
+                        page.context.grant_permissions([name], **kwargs)
+                    elif state in {"prompt", "default"}:
+                        kwargs = {"origin": origin} if origin else {}
+                        page.context.clear_permissions(**kwargs)
+                    elif state == "denied":
+                        return make_event_result(
+                            event, status=EventStatus.BLOCKED, executor_used=self.id,
+                            started_at=started_at, elapsed_ms=int((time.time() - t0) * 1000),
+                            summary="当前 Chromium 通道不能可靠强制 denied，请重建 context 或在配置中声明",
+                            error="web_permission_denied_unsupported",
+                            raw_response={"permission": name, "requested_state": state,
+                                          "execution": {"execution_started": "no", "phase": "preflight",
+                                                        "reason_code": "web_permission_denied_unsupported",
+                                                        "source": "playwright.native.v1"}},
+                        )
+                    else:
+                        return self._fail(event, started_at, t0, "权限状态必须是 granted/denied/prompt",
+                                          execution_started="no")
+                except Exception as exc:
+                    return self._fail(event, started_at, t0, f"设置权限失败: {exc}", execution_started="yes")
+                return self._ok(event, started_at, t0, f"权限 {name}={state}", execution_started="yes")
+            if cap == "set_page_time":
+                p = event.params or {}
+                try:
+                    action = str(p.get("action") or "set_fixed").strip()
+                    if action == "fast_forward":
+                        page.clock.fast_forward(int(p.get("milliseconds") or 0))
+                    elif action == "run_for":
+                        page.clock.run_for(int(p.get("milliseconds") or 0))
+                    elif action == "pause":
+                        page.clock.pause_at(int(p.get("epoch_ms")))
+                    elif action == "resume":
+                        page.clock.resume()
+                    else:
+                        page.clock.set_fixed_time(int(p.get("epoch_ms")))
+                except Exception as exc:
+                    return self._fail(event, started_at, t0, f"页面时钟操作失败: {exc}", execution_started="yes")
+                return self._ok(event, started_at, t0, f"页面时钟 {action}", execution_started="yes")
             if cap == "reload_page":
                 try:
                     page.reload(wait_until="domcontentloaded", timeout=15_000)
@@ -432,7 +747,9 @@ class PlaywrightExecutor:
             return self._fail(event, started_at, t0, f"PlaywrightExecutor 不处理 {cap}")
         except Exception as exc:
             SLog.e(TAG, f"execute exception cap={cap} sn={sn}: {exc}")
-            if cap in {"tap_element", "long_press_element", "input_text", "press_key", "swipe_direction", "swipe_element_to_element", "set_clipboard"}:
+            if cap in {"tap_element", "long_press_element", "input_text", "press_key", "swipe_direction",
+                       "swipe_element_to_element", "set_clipboard", "focus_element", "drag_control",
+                       "forward_page", "navigate_page", "set_geolocation", "set_web_permission", "set_page_time"}:
                 return make_event_result(event, status=EventStatus.BLOCKED, executor_used=self.id,
                     started_at=started_at, elapsed_ms=int((time.time()-t0)*1000),
                     summary="设备写动作结果不确定，请先观察确认", error=f"exception: {exc}",
@@ -603,8 +920,10 @@ class PlaywrightExecutor:
         run_id: str,
         started_at: str,
         t0: float,
+        *,
+        identity: tuple[str, str, str] = ("", "", ""),
     ) -> EventResult:
-        url = hub.current_url(sn, run_id=run_id)
+        url = hub.current_url(sn, run_id=run_id, **_identity_kwargs(identity))
         if not url:
             return self._fail(event, started_at, t0, "无打开页面，无法读取当前 URL")
         expect = pick_goto_url(
@@ -641,6 +960,8 @@ class PlaywrightExecutor:
         run_id: str,
         started_at: str,
         t0: float,
+        *,
+        identity: tuple[str, str, str] = ("", "", ""),
     ) -> EventResult:
         p = event.params or {}
         try:
@@ -650,6 +971,7 @@ class PlaywrightExecutor:
                 tab_index=p.get("tab_index") if p.get("tab_index") is not None else None,
                 url_contains=str(p.get("url_contains") or p.get("url") or ""),
                 title_contains=str(p.get("title_contains") or p.get("title") or ""),
+                **_identity_kwargs(identity),
             )
             return self._ok(event, started_at, t0, f"切换 Tab {str(page.url or '')[:80]}", execution_started="yes")
         except Exception as exc:
@@ -663,6 +985,8 @@ class PlaywrightExecutor:
         run_id: str,
         started_at: str,
         t0: float,
+        *,
+        identity: tuple[str, str, str] = ("", "", ""),
     ) -> EventResult:
         p = event.params or {}
         try:
@@ -670,6 +994,7 @@ class PlaywrightExecutor:
                 sn,
                 run_id=run_id,
                 url=str(p.get("url") or pick_goto_url(p.get("package")) or ""),
+                **_identity_kwargs(identity),
             )
             return self._ok(event, started_at, t0, f"新开 Tab {str(page.url or '')[:80]}", execution_started="yes")
         except Exception as exc:
@@ -700,6 +1025,80 @@ class PlaywrightExecutor:
             return self._ok(event, started_at, t0, f"上传 {len(files)} 个文件", execution_started="yes")
         except Exception as exc:
             return self._fail(event, started_at, t0, f"上传失败: {exc}")
+
+    def _read_url(self, event: PlanEvent, page, started_at: str, t0: float) -> EventResult:
+        actual = str(page.url or "")
+        expected = str((event.params or {}).get("expected_uri") or (event.params or {}).get("uri") or "")
+        if expected:
+            expected = urljoin(actual, expected)
+            matched = _page_matches_expect(actual, expected)
+            if not matched:
+                return make_event_result(
+                    event, status=EventStatus.FAIL, executor_used=self.id,
+                    started_at=started_at, elapsed_ms=int((time.time() - t0) * 1000),
+                    summary=f"URL 未命中 {actual[:120]}", error="url_mismatch",
+                    raw_response={"page_url": actual, "expected_url": expected, "match": False,
+                                  "execution": {"execution_started": "no", "phase": "executor",
+                                                "source": "playwright.native.v1"}},
+                )
+            return make_event_result(
+                event, status=EventStatus.PASS, executor_used=self.id,
+                started_at=started_at, elapsed_ms=int((time.time() - t0) * 1000),
+                summary=f"URL 命中 {actual[:120]}",
+                raw_response={"page_url": actual, "expected_url": expected, "match": True,
+                              "execution": {"execution_started": "no", "phase": "completed",
+                                            "source": "playwright.native.v1"}},
+            )
+        return make_event_result(
+            event, status=EventStatus.PASS, executor_used=self.id,
+            started_at=started_at, elapsed_ms=int((time.time() - t0) * 1000),
+            summary=f"URL {actual[:120]}",
+            raw_response={"page_url": actual, "execution": {
+                "execution_started": "no", "phase": "completed", "source": "playwright.native.v1"}},
+        )
+
+    def _drag_control(self, event: PlanEvent, page, started_at: str, t0: float) -> EventResult:
+        p = event.params or {}
+        source_p = p.get("source_target") if isinstance(p.get("source_target"), dict) else {}
+        target_p = p.get("target_target") if isinstance(p.get("target_target"), dict) else {}
+        try:
+            source = locator_from_params(page, {**p, **source_p, "require_unique": True})
+            target = locator_from_params(page, {**p, **target_p, "require_unique": True})
+            if source is None or target is None:
+                return self._fail(event, started_at, t0, "拖拽源或目标控件未找到", execution_started="no")
+            mode = str(p.get("mode") or "mouse").lower()
+            if mode == "html5":
+                source.drag_to(target, timeout=max(1_000, int(p.get("duration_ms") or 4_000)))
+                return self._ok(event, started_at, t0, "HTML5 拖拽已执行", execution_started="yes")
+            if mode != "mouse":
+                return self._fail(event, started_at, t0, "拖拽 mode 必须是 mouse 或 html5", execution_started="no")
+            source.scroll_into_view_if_needed(timeout=4_000)
+            target.scroll_into_view_if_needed(timeout=4_000)
+            src_box = source.bounding_box()
+            dst_box = target.bounding_box()
+            if not src_box or not dst_box:
+                return self._fail(event, started_at, t0, "拖拽控件没有可操作区域", execution_started="no")
+            sx = float(src_box["x"]) + float(src_box["width"]) * float(p.get("source_x_ratio", 0.5))
+            sy = float(src_box["y"]) + float(src_box["height"]) * float(p.get("source_y_ratio", 0.5))
+            tx = float(dst_box["x"]) + float(dst_box["width"]) * float(p.get("target_x_ratio", 0.5))
+            ty = float(dst_box["y"]) + float(dst_box["height"]) * float(p.get("target_y_ratio", 0.5))
+            duration = max(0, int(p.get("duration_ms") or 500))
+            steps = max(1, int(p.get("steps") or min(60, max(8, duration // 20))))
+            page.mouse.move(sx, sy)
+            page.mouse.down()
+            try:
+                page.mouse.move(tx, ty, steps=steps)
+            finally:
+                page.mouse.up()
+            return self._ok(event, started_at, t0,
+                            f"控件拖拽 ({sx:.0f},{sy:.0f})→({tx:.0f},{ty:.0f})，{duration}ms",
+                            execution_started="yes")
+        except Exception as exc:
+            try:
+                page.mouse.up()
+            except Exception:
+                pass
+            return self._fail(event, started_at, t0, f"控件拖拽失败: {exc}", execution_started="yes")
 
     def _wait_screen_ready(self, event: PlanEvent, page, started_at: str, t0: float) -> EventResult:
         p = event.params or {}

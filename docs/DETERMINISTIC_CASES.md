@@ -17,3 +17,5 @@ Web OCR 使用当前视口和明确 viewport_pixels 坐标；iOS 转为 WDA 点�
 完成时 Scout 从实际原文、断言与事件生成 test_report：按预期聚合 pass/fail/unknown/not_run，保留失败优先级、证据序号、预期/实际、执行阶段、首个失败作用域及模型消耗。suspected_product 仅表示业务差异待归因，不能宣布产品缺陷；定位/脚本/策略错误归自动化，资源/观察不足归阻塞。索引最多展开 50 条，完整事件仍归执行 Scout。Nexus 两种部署只接收有界索引，Workbench 默认展示业务结论，按需查看执行诊断。断言总数与业务预期数分别统计。
 
 验证使用隔离临时目录 smoke、原生 OCR 合成图片和 Workbench API fixtures；不访问团队业务库、不跑 pytest。真机验收与实际性能测量单独完成。
+
+Web 用例级 URI 和账号认证快照见 [WEB_AUTH](WEB_AUTH.md)：`launch(uri=...)` 直达入口，`save_auth()` 显式准备，`launch(account=..., auth="required", ...)` 恢复并校验身份与目标页；准备检查不增加业务断言计数。
