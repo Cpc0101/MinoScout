@@ -19,6 +19,7 @@ from typing import Any, Callable, Optional
 
 from mino_scout.executors.base import DeviceRef, ExecutorContext
 from mino_scout.platform.web.viewports import DEFAULT_WEB_RESOLUTION, normalize_web_resolution
+from mino_scout.platform.web.web_keyboard import normalize_key, normalize_key_value
 from mino_scout.schemas import PlanEvent
 
 _CELLS = {"android": "uiautomator", "ios": "xcuitest", "web": "playwright", "mac": "ax", "win": "uia"}
@@ -69,6 +70,12 @@ def _normalize_web_options(value: dict[str, Any] | None) -> dict[str, Any]:
             state_v = str(state or "").strip().lower()
             if state_v not in {"granted", "denied", "prompt"}:
                 raise ScriptAbort(f"permission {name} 必须是 granted/denied/prompt", reason_code="web_options_invalid")
+            if state_v == "denied":
+                raise ScriptAbort(
+                    "当前 Chromium 渠道无法可靠模拟 denied，拒绝在设备动作前继续",
+                    reason_code="web_permission_denied_unsupported",
+                    status="blocked",
+                )
             normalized[str(name)] = state_v
         out["permissions"] = normalized
     geolocation = value.get("geolocation")
@@ -89,9 +96,17 @@ def _normalize_web_options(value: dict[str, Any] | None) -> dict[str, Any]:
         if not isinstance(page_clock, dict):
             raise ScriptAbort("page_clock 必须是映射", reason_code="web_options_invalid")
         fixed = page_clock.get("fixed_time")
-        if fixed is not None and not isinstance(fixed, (int, str)):
+        if fixed is not None and type(fixed) is not int and not isinstance(fixed, str):
             raise ScriptAbort("page_clock.fixed_time 必须是毫秒整数或日期字符串", reason_code="web_options_invalid")
-        out["page_clock"] = {"fixed_time": fixed, "pause": bool(page_clock.get("pause", True))}
+        pause = page_clock.get("pause", True)
+        if type(pause) is not bool:
+            raise ScriptAbort("page_clock.pause 必须是布尔值", reason_code="web_options_invalid")
+        try:
+            from mino_scout.platform.web.playwright_observability import _fixed_time_ms
+            _fixed_time_ms(fixed)
+        except ValueError:
+            raise ScriptAbort("page_clock.fixed_time 超出有效范围", reason_code="web_options_invalid") from None
+        out["page_clock"] = {"fixed_time": fixed, "pause": pause}
     return out
 
 
@@ -1086,7 +1101,53 @@ class App:
             "duration_ms": int(duration_ms), "point_policy": "coordinate"})
 
     def press(self, key: str) -> ActionResult:
-        return self._device("press_key", {"key": str(key or "")})
+        raw = str(key or "")
+        if self._platform == "web":
+            try:
+                raw = normalize_key_value(raw, allow_combo=True)
+            except ValueError:
+                raise ScriptAbort("按键无效", reason_code="web_key_invalid", status="blocked") from None
+        return self._device("press_key", {"key": raw})
+
+    def key_down(self, key: str) -> ActionResult:
+        """Hold one Web key until key_up or the execution cleanup runs."""
+        if self._platform != "web":
+            raise ScriptAbort("长按按键仅支持 Web", reason_code="web_capability_platform_invalid", status="blocked")
+        try:
+            normalized = normalize_key(key)
+        except ValueError:
+            raise ScriptAbort("按键无效", reason_code="web_key_invalid", status="blocked") from None
+        return self._device("key_down", {"key": normalized})
+
+    def key_up(self, key: str) -> ActionResult:
+        """Release a Web key held through key_down or hold_key."""
+        if self._platform != "web":
+            raise ScriptAbort("长按按键仅支持 Web", reason_code="web_capability_platform_invalid", status="blocked")
+        try:
+            normalized = normalize_key(key)
+        except ValueError:
+            raise ScriptAbort("按键无效", reason_code="web_key_invalid", status="blocked") from None
+        return self._device("key_up", {"key": normalized})
+
+    def hold_key(self, key: str, function: Optional[Callable[[], Any]] = None) -> Any:
+        """Run a callback while one Web key is held, releasing it on every exit path."""
+        if self._platform != "web":
+            raise ScriptAbort("长按按键仅支持 Web", reason_code="web_capability_platform_invalid", status="blocked")
+        if not callable(function):
+            raise ScriptAbort("hold_key 需要可调用函数", reason_code="web_key_callback_invalid", status="blocked")
+        self.key_down(key)
+        callback_error: BaseException | None = None
+        try:
+            return function()
+        except BaseException as exc:
+            callback_error = exc
+            raise
+        finally:
+            try:
+                self.key_up(key)
+            except BaseException:
+                if callback_error is None:
+                    raise
 
     def back(self) -> ActionResult:
         return self.press("back")
@@ -1186,6 +1247,12 @@ class App:
             raise ScriptAbort("不支持的浏览器权限", reason_code="web_permission_invalid", status="blocked")
         if state_v not in {"granted", "denied", "prompt"}:
             raise ScriptAbort("权限状态必须是 granted/denied/prompt", reason_code="web_permission_invalid", status="blocked")
+        if state_v == "denied":
+            raise ScriptAbort(
+                "当前 Chromium 渠道无法可靠模拟 denied",
+                reason_code="web_permission_denied_unsupported",
+                status="blocked",
+            )
         params: dict[str, Any] = {"permission": name, "state": state_v}
         if origin:
             params["origin"] = str(origin)

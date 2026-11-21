@@ -16,6 +16,7 @@ class CaseData:
         self._outputs = {}
         self._missing = {}
         self._generation_counts: dict[str, int] = {}
+        self._unique_namespace = ""
 
     @property
     def inputs(self):
@@ -65,8 +66,11 @@ class CaseData:
         """Generate a replayable synthetic input without creating business data.
 
         The same kind/version/seed/locale/namespace/unique call sequence produces
-        the same value.  Unique mode adds a deterministic counter to an explicit
-        run namespace and therefore needs a namespace that is unique per run.
+        the same value for the same generator version and call order; values are
+        not promised to match across Python runtime versions. Unique mode binds
+        the first explicit namespace to this CaseData instance. Later unique calls
+        may omit the namespace, while a different namespace is blocked. Callers
+        must inject a run-unique namespace on the first unique call.
         Evidence records metadata, length and SHA-256, never the generated value.
         """
         self._case._guard()
@@ -88,8 +92,18 @@ class CaseData:
         if not re.fullmatch(r"[A-Za-z]{2,8}(?:-[A-Za-z0-9]{2,8})*", locale):
             invalid("data_generator_invalid", "locale 格式无效")
         namespace = str(namespace or "").strip()
-        if unique and not namespace:
-            invalid("data_generator_namespace_required", "unique=True 时必须显式提供 namespace")
+        if unique:
+            if self._unique_namespace:
+                if namespace and namespace != self._unique_namespace:
+                    invalid(
+                        "data_generator_namespace_changed",
+                        "同一 CaseData 的 unique namespace 不能变更",
+                    )
+                namespace = self._unique_namespace
+            elif not namespace:
+                invalid("data_generator_namespace_required", "首个 unique=True 调用必须显式提供 namespace")
+            else:
+                self._unique_namespace = namespace
         if len(namespace) > 160 or any(ord(ch) < 32 for ch in namespace):
             invalid("data_generator_invalid", "namespace 无效")
         if unique:

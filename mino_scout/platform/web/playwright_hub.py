@@ -21,12 +21,14 @@ from mino_scout.platform.web.playwright_observability import (
     WebObservability,
     apply_context_options,
     context_kwargs,
+    validate_context_options,
 )
 from mino_scout.platform.web.viewports import (
     DEFAULT_WEB_RESOLUTION,
     normalize_web_resolution,
     web_viewport,
 )
+from mino_scout.platform.web.web_url import normalize_goto_url, validate_page_url
 from mino_scout.tools.keep_alive.log import SLog
 
 TAG = "PlaywrightHub"
@@ -35,13 +37,6 @@ TAG = "PlaywrightHub"
 _DEFAULT_VIEWPORT = web_viewport(DEFAULT_WEB_RESOLUTION)
 VIEWPORT_W = int(_DEFAULT_VIEWPORT["width"])
 VIEWPORT_H = int(_DEFAULT_VIEWPORT["height"])
-
-_URL_SCHEMES = ("http://", "https://", "file://", "about:", "data:")
-# 带点的主机才当网址；末段是常见 TLD。Android 包名 com.foo.bar 的末段不是 TLD。
-_WEB_TLDS = {
-    "com", "cn", "net", "org", "io", "app", "dev", "cc", "co", "xyz", "me", "ai",
-    "test", "local", "edu", "gov", "info", "top", "shop",
-}
 
 _probe_lock = threading.Lock()
 _probe_cache: tuple[float, str, dict] = (0.0, "", {})
@@ -117,10 +112,12 @@ def _session_key(
     base = str(sn or "").strip() or "web"
     rid = str(run_id or "").strip()
     legacy = f"{base}::{rid}" if rid else base
-    actor_v, context_v, page_v = normalize_web_identity(actor, context_id, page_id)
+    actor_v, context_v, _page_v = normalize_web_identity(actor, context_id, page_id)
     if not actor_v:
         return legacy
-    return f"{legacy}::actor={actor_v}::context={context_v}::page={page_v}"
+    # A page selects an active tab; it does not own another BrowserContext.
+    # All tabs for one actor/context lease share cookies and storage.
+    return f"{legacy}::actor={actor_v}::context={context_v}"
 
 
 def _browser_key(sn: str, resolution: str = DEFAULT_WEB_RESOLUTION) -> str:
@@ -129,32 +126,7 @@ def _browser_key(sn: str, resolution: str = DEFAULT_WEB_RESOLUTION) -> str:
 
 
 def looks_like_url(value: str) -> bool:
-    """是网址才给 Playwright goto；Android 包名 / iOS bundle 一律不算。"""
-    s = str(value or "").strip()
-    if not s or any(ch.isspace() for ch in s):
-        return False
-    low = s.lower()
-    if low.startswith(_URL_SCHEMES):
-        return True
-    if low.startswith("localhost") or low.startswith("127.0.0.1"):
-        return True
-    host = s.split("/", 1)[0].split(":", 1)[0]
-    if host.count(".") >= 1:
-        last = host.rsplit(".", 1)[-1].lower()
-        if last in _WEB_TLDS:
-            return True
-        if last.isdigit():
-            return False
-    return False
-
-
-def normalize_goto_url(value: str) -> str:
-    s = str(value or "").strip()
-    if not looks_like_url(s):
-        return ""
-    if s.lower().startswith(_URL_SCHEMES):
-        return s
-    return "https://" + s
+    return bool(normalize_goto_url(value))
 
 
 _GOTO_WAIT_STATES = frozenset({"commit", "domcontentloaded", "load", "networkidle"})
@@ -164,14 +136,17 @@ def goto_options_from_params(params: dict[str, Any] | None) -> tuple[str, int]:
     p = dict(params or {})
     wait_until = str(p.get("wait_until") or p.get("load_state") or "domcontentloaded").strip().lower()
     if wait_until not in _GOTO_WAIT_STATES:
-        wait_until = "domcontentloaded"
-    timeout = int(p.get("timeout_ms") or p.get("goto_timeout_ms") or 60_000)
-    return wait_until, max(5_000, min(timeout, 120_000))
+        raise ValueError("web_goto_wait_invalid")
+    raw_timeout = p.get("timeout_ms", p.get("goto_timeout_ms", 60_000))
+    if type(raw_timeout) is not int or not 5_000 <= raw_timeout <= 120_000:
+        raise ValueError("web_goto_timeout_invalid")
+    return wait_until, raw_timeout
 
 
 def goto_url(page: Any, url: str, *, params: dict[str, Any] | None = None) -> None:
     wait_until, timeout = goto_options_from_params(params)
-    page.goto(url, wait_until=wait_until, timeout=timeout)
+    target = validate_page_url(url)
+    page.goto(target, wait_until=wait_until, timeout=timeout)
 
 
 def pick_goto_url(*candidates: Any) -> str:
@@ -294,6 +269,9 @@ class PlaywrightHub:
         self._lock = threading.Lock()
         # 同一条 run 超时后 +1。旧线程晚到的写入对不上这个数，不能盖住新线程的页面。
         self._run_tokens: dict[str, int] = {}
+        # key_down is intentionally cross-event state.  It belongs to the
+        # actor/context lease and is released before that context is closed.
+        self._pressed_keys: dict[str, set[str]] = {}
 
     def _playwright(self):
         pw = getattr(self._local, "pw", None)
@@ -398,7 +376,8 @@ class PlaywrightHub:
         key = _session_key(sn, run_id, actor=actor_v, context_id=context_v, page_id=page_v)
         resolution = normalize_web_resolution(web_resolution)
         viewport = web_viewport(resolution)
-        # A fresh context replaces only this actor/page.  Other actors in the
+        web_options = validate_context_options(web_options)
+        # A fresh context replaces only this actor/context. Other actors in the
         # same run stay alive and retain their independent authentication.
         self.close_case(sn, run_id=run_id, actor=actor_v, context_id=context_v, page_id=page_v)
         browser = self._browser(_session_key(sn), headed=headed, web_resolution=resolution)
@@ -494,6 +473,7 @@ class PlaywrightHub:
                 if int(row.get("owner_thread") or 0) != ident:
                     continue
                 run_ids.append(str(row.get("run_id") or ""))
+                self._pressed_keys.pop(key, None)
                 self._sessions.pop(key, None)
         self._bump_runs(run_ids)
 
@@ -504,9 +484,11 @@ class PlaywrightHub:
                 self._run_tokens[rid] = int(self._run_tokens.get(rid, 0)) + 1
                 if not rid:
                     self._sessions.clear()
+                    self._pressed_keys.clear()
                     continue
                 for key in [k for k, row in self._sessions.items()
                             if str(row.get("run_id") or "") == rid]:
+                    self._pressed_keys.pop(key, None)
                     self._sessions.pop(key, None)
 
     def release_this_lane(self) -> bool:
@@ -568,6 +550,89 @@ class PlaywrightHub:
             return None
         return row.get("page")
 
+    def keyboard_down(
+        self,
+        sn: str = "",
+        *,
+        run_id: str = "",
+        key: str,
+        actor: str = "",
+        context_id: str = "",
+        page_id: str = "",
+    ) -> None:
+        """Press and retain one key for the actor/context lease."""
+        actor_v, context_v, page_v = normalize_web_identity(actor, context_id, page_id)
+        session = _session_key(sn, run_id, actor=actor_v, context_id=context_v, page_id=page_v)
+        with self._lock:
+            row = dict(self._sessions.get(session) or {})
+            held = set(self._pressed_keys.get(session) or set())
+        page = row.get("page")
+        if page is None:
+            raise RuntimeError("web_session_missing")
+        if key in held:
+            raise RuntimeError("web_key_already_down")
+        page.keyboard.down(key)
+        with self._lock:
+            self._pressed_keys.setdefault(session, set()).add(key)
+
+    def keyboard_up(
+        self,
+        sn: str = "",
+        *,
+        run_id: str = "",
+        key: str,
+        actor: str = "",
+        context_id: str = "",
+        page_id: str = "",
+    ) -> None:
+        """Release a key that this lease explicitly pressed."""
+        actor_v, context_v, page_v = normalize_web_identity(actor, context_id, page_id)
+        session = _session_key(sn, run_id, actor=actor_v, context_id=context_v, page_id=page_v)
+        with self._lock:
+            row = dict(self._sessions.get(session) or {})
+            held = set(self._pressed_keys.get(session) or set())
+        if key not in held:
+            raise RuntimeError("web_key_not_down")
+        page = row.get("page")
+        if page is None:
+            raise RuntimeError("web_session_missing")
+        page.keyboard.up(key)
+        with self._lock:
+            values = self._pressed_keys.get(session)
+            if values is not None:
+                values.discard(key)
+                if not values:
+                    self._pressed_keys.pop(session, None)
+
+    def release_pressed_keys(
+        self,
+        sn: str = "",
+        *,
+        run_id: str = "",
+        actor: str = "",
+        context_id: str = "",
+        page_id: str = "",
+    ) -> list[str]:
+        """Best-effort release for every key held by this actor/context lease."""
+        actor_v, context_v, page_v = normalize_web_identity(actor, context_id, page_id)
+        session = _session_key(sn, run_id, actor=actor_v, context_id=context_v, page_id=page_v)
+        with self._lock:
+            keys = set(self._pressed_keys.pop(session, set()) or set())
+            row = dict(self._sessions.get(session) or {})
+        return self._release_key_set(row.get("page"), keys)
+
+    @staticmethod
+    def _release_key_set(page: Any, keys: set[str]) -> list[str]:
+        failures: list[str] = []
+        if page is None:
+            return sorted(keys)
+        for key in sorted(keys):
+            try:
+                page.keyboard.up(key)
+            except Exception:
+                failures.append(key)
+        return failures
+
     def current_observability(
         self,
         sn: str = "",
@@ -582,8 +647,10 @@ class PlaywrightHub:
         with self._lock:
             row = self._sessions.get(key) or {}
         obs = row.get("observability")
-        if obs is not None and row.get("page") is not None:
-            obs.page = row["page"]
+        page = row.get("page")
+        if obs is not None and page is not None:
+            obs.attach_page(page)
+            obs.page = page
         return obs
 
     def current_url(
@@ -762,11 +829,19 @@ class PlaywrightHub:
                     continue
         if target is None:
             raise RuntimeError("未找到目标 Tab")
+        # Keyboard state is page-scoped in Playwright. Release it on the outgoing
+        # page before changing the active tab.
+        self.release_pressed_keys(
+            sn, run_id=run_id, actor=actor_v, context_id=context_v, page_id=page_v
+        )
         try:
             target.bring_to_front()
         except Exception:
             pass
         self._replace_page(key, target, run_id=str(run_id or ""))
+        self.current_observability(
+            sn, run_id=run_id, actor=actor_v, context_id=context_v, page_id=page_v
+        )
         return target
 
     def open_tab(
@@ -786,11 +861,27 @@ class PlaywrightHub:
         ctx = row.get("context")
         if ctx is None:
             raise RuntimeError("无浏览器上下文")
+        self.release_pressed_keys(
+            sn, run_id=run_id, actor=actor_v, context_id=context_v, page_id=page_v
+        )
+        raw_dest = str(url or "").strip()
+        dest = normalize_goto_url(raw_dest)
+        if raw_dest and not dest:
+            raise ValueError("web_uri_invalid")
         page = ctx.new_page()
-        dest = normalize_goto_url(url)
-        if dest:
-            goto_url(page, dest)
+        try:
+            if dest:
+                goto_url(page, dest)
+        except BaseException:
+            try:
+                page.close()
+            except Exception:
+                pass
+            raise
         self._replace_page(key, page, run_id=str(run_id or ""))
+        self.current_observability(
+            sn, run_id=run_id, actor=actor_v, context_id=context_v, page_id=page_v
+        )
         return page
 
     def a11y_text(
@@ -836,12 +927,17 @@ class PlaywrightHub:
         with self._lock:
             rows = [(key, self._sessions.pop(key, None)) for key in keys]
         closed = True
-        for _, row in rows:
+        for session, row in rows:
             if not row:
+                with self._lock:
+                    self._pressed_keys.pop(session, None)
                 continue
             page = row.get("page")
             ctx = row.get("context")
             obs = row.get("observability")
+            with self._lock:
+                held = set(self._pressed_keys.pop(session, set()) or set())
+            self._release_key_set(page, held)
             if obs is not None:
                 obs.flush_summary()
             for obj in (page, ctx):

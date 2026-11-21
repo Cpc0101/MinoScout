@@ -321,8 +321,8 @@ class _Clipboard:
 
     def expect_text(self, expected: str, *, exact: bool = True):
         _require_web(self.app)
-        if not isinstance(expected, str) or not expected:
-            raise _abort("剪贴板预期必须是非空字符串", "clipboard_assertion_invalid", status="blocked", app=self.app)
+        if not isinstance(expected, str):
+            raise _abort("剪贴板预期必须是字符串", "clipboard_assertion_invalid", status="blocked", app=self.app)
         result = self.app._device(
             "assert_clipboard",
             {"expected_text": expected, "exact": bool(exact)},
@@ -358,7 +358,8 @@ class _Expectation:
         params = self.app._locate(str(control or ""), "check_focused")
         result = self.app._device("check_focused", params, allow_failed=True)
         actual = dict(result.data or {})
-        matched = result.ok and actual.get("focused") is not False
+        explicit_match = actual.get("focused") if "focused" in actual else True
+        matched = bool(result.ok and explicit_match is True)
         if not actual:
             actual = {"focused": matched, "summary": result.summary}
         return _assert(

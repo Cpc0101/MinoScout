@@ -68,20 +68,33 @@ def _json_field(value: Any, path: str) -> tuple[bool, Any]:
     return True, current
 
 
+_MAX_PAGE_CLOCK_EPOCH_MS = 4_102_444_800_000  # 2100-01-01T00:00:00Z
+
+
 def _fixed_time_ms(value: Any) -> int | None:
     if value is None or value == "":
         return None
-    if isinstance(value, bool):
+    if type(value) is not int and not isinstance(value, str):
         raise ValueError("page_clock.fixed_time 无效")
     if isinstance(value, int):
-        return value
-    text = str(value).strip()
-    if re.fullmatch(r"-?\d+", text):
-        return int(text)
-    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return int(parsed.timestamp() * 1000)
+        epoch_ms = value
+    else:
+        text = value.strip()
+        if not text:
+            raise ValueError("page_clock.fixed_time 无效")
+        try:
+            if re.fullmatch(r"\d+", text):
+                epoch_ms = int(text)
+            else:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                epoch_ms = int(parsed.timestamp() * 1000)
+        except (OverflowError, TypeError, ValueError):
+            raise ValueError("page_clock.fixed_time 无效") from None
+    if not 0 <= epoch_ms <= _MAX_PAGE_CLOCK_EPOCH_MS:
+        raise ValueError("page_clock.fixed_time 超出范围")
+    return epoch_ms
 
 
 class NetworkExpectation:
@@ -470,6 +483,37 @@ class WebObservability:
             observed["geolocation"] = {"error": type(exc).__name__}
         return {"requested": _redact_json(self.requested_options), "observed": _redact_json(observed)}
 
+
+
+def validate_context_options(options: dict[str, Any] | None) -> dict[str, Any]:
+    """Validate options that must fail before a BrowserContext is created."""
+    opts = dict(options or {})
+    permissions = opts.get("permissions")
+    if permissions is not None:
+        if not isinstance(permissions, dict):
+            raise ValueError("web_permission_options_invalid")
+        allowed = {"geolocation", "notifications", "clipboard-read", "clipboard-write"}
+        if set(permissions) - allowed:
+            raise ValueError("web_permission_invalid")
+        for state in permissions.values():
+            state_v = str(state or "").strip().lower()
+            if state_v == "denied":
+                # Playwright's Chromium API cannot reliably force denied; prompt
+                # means no grant and lets the page's real permission behavior run.
+                raise ValueError("web_permission_denied_unsupported")
+            if state_v not in {"granted", "prompt"}:
+                raise ValueError("web_permission_invalid")
+    clock = opts.get("page_clock")
+    if clock is not None:
+        if not isinstance(clock, dict):
+            raise ValueError("page_clock_invalid")
+        unknown = sorted(set(clock) - {"fixed_time", "pause"})
+        if unknown:
+            raise ValueError("page_clock_invalid")
+        _fixed_time_ms(clock.get("fixed_time"))
+        if "pause" in clock and type(clock["pause"]) is not bool:
+            raise ValueError("page_clock.pause 必须是布尔值")
+    return opts
 
 def apply_context_options(context: Any, page: Any, options: dict[str, Any] | None) -> None:
     """Apply page clock before the first navigation. Context options are passed on creation."""

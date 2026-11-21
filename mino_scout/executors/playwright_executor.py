@@ -8,7 +8,6 @@ import json
 import re
 import time
 from typing import Any
-from urllib.parse import urljoin, urlparse
 
 from mino_scout.tools.keep_alive.log import SLog
 
@@ -29,6 +28,13 @@ from mino_scout.platform.web.playwright_locators import (
 )
 from mino_scout.platform.web.viewports import DEFAULT_WEB_RESOLUTION, web_viewport
 from mino_scout.platform.web.web_focus import locate_editable_at
+from mino_scout.platform.web.web_keyboard import normalize_key, normalize_key_value
+from mino_scout.platform.web.web_url import (
+    parse_http_url,
+    resolve_uri,
+    same_entry_url,
+    validate_page_url,
+)
 
 TAG = "PlaywrightExecutor"
 _DEFAULT_WEB_VIEWPORT = web_viewport(DEFAULT_WEB_RESOLUTION)
@@ -41,20 +47,45 @@ _AUTH_TOKEN_NAME = re.compile(
 
 
 def _host_of(url: str) -> str:
-    return (urlparse(str(url or "")).hostname or "").lower().rstrip(".")
+    try:
+        parsed, _ = parse_http_url(str(url or ""))
+    except ValueError:
+        return ""
+    return str(parsed.hostname or "").lower().rstrip(".")
 
 
-def _page_matches_expect(current: str, expect: str) -> bool:
-    """当前页与目标地址：主机必须相关，路径按前缀比，不用整段 URL 子串。"""
-    cu = urlparse(str(current or ""))
-    eu = urlparse(str(expect or ""))
-    if not _hosts_related(cu.hostname or "", eu.hostname or ""):
-        return False
-    ep = (eu.path or "/").rstrip("/") or "/"
-    cp = (cu.path or "/").rstrip("/") or "/"
-    if ep == "/":
-        return True
-    return cp == ep or cp.startswith(ep + "/")
+def _mouse_drag(page: Any, start: tuple[float, float], end: tuple[float, float], *,
+                duration_ms: int = 500, steps: int = 0) -> None:
+    """Drag with monotonic pacing and release the mouse on every exit path."""
+    if type(duration_ms) is not int or not 0 <= duration_ms <= 120_000:
+        raise ValueError("drag_duration_invalid")
+    if type(steps) is not int or not 0 <= steps <= 500:
+        raise ValueError("drag_steps_invalid")
+    sx, sy = float(start[0]), float(start[1])
+    ex, ey = float(end[0]), float(end[1])
+    page.mouse.move(sx, sy)
+    page.mouse.down()
+    try:
+        started = time.monotonic()
+        if steps == 0:
+            if duration_ms:
+                time.sleep(duration_ms / 1000.0)
+            page.mouse.move(ex, ey)
+        else:
+            for index in range(1, steps + 1):
+                ratio = index / steps
+                remaining = duration_ms / 1000.0 - (time.monotonic() - started)
+                if remaining > 0:
+                    time.sleep(remaining / (steps - index + 1))
+                page.mouse.move(sx + (ex - sx) * ratio, sy + (ey - sy) * ratio)
+    except BaseException:
+        try:
+            page.mouse.up()
+        except BaseException:
+            # Preserve cancellation and the original drag failure.
+            pass
+        raise
+    page.mouse.up()
 
 
 def _hosts_related(left: str, right: str) -> bool:
@@ -88,6 +119,8 @@ _SUPPORTED_CAPS: set[str] = {
     "close_app",
     "kill_app",
     "press_key",
+    "key_down",
+    "key_up",
     "tap_element",
     "tap_xy",
     "exec_script",
@@ -300,6 +333,34 @@ class PlaywrightExecutor:
         return capability_id in _SUPPORTED_CAPS
 
     def execute(self, event: PlanEvent, ctx: ExecutorContext) -> EventResult:
+        """Run one event and clear this lease's transient keys on every non-pass exit."""
+        try:
+            result = self._execute(event, ctx)
+        except BaseException:
+            if ctx.device.is_web:
+                try:
+                    identity = _web_identity(event, ctx)
+                    get_hub().release_pressed_keys(
+                        str(ctx.device.sn or ""),
+                        run_id=str(ctx.run_id or ""),
+                        **_identity_kwargs(identity),
+                    )
+                except BaseException:
+                    pass
+            raise
+        if ctx.device.is_web and result.status != EventStatus.PASS:
+            try:
+                identity = _web_identity(event, ctx)
+                get_hub().release_pressed_keys(
+                    str(ctx.device.sn or ""),
+                    run_id=str(ctx.run_id or ""),
+                    **_identity_kwargs(identity),
+                )
+            except BaseException:
+                pass
+        return result
+
+    def _execute(self, event: PlanEvent, ctx: ExecutorContext) -> EventResult:
         started_at = _now_iso()
         t0 = time.time()
         cap = event.capability_id
@@ -513,18 +574,31 @@ class PlaywrightExecutor:
                 except Exception as exc:
                     return self._fail(event, started_at, t0, f"控件聚焦失败: {exc}", execution_started="yes")
             if cap == "check_focused":
+                target = actual = None
                 try:
                     loc = locator_from_params(page, event.params or {})
                     if loc is None:
                         return self._fail(event, started_at, t0, "焦点控件未找到", execution_started="no")
-                    focused = bool(loc.evaluate(
-                        "el => { let root = el.getRootNode(); while (root && root.activeElement) { "
-                        "if (root.activeElement === el) return true; const active = root.activeElement; "
-                        "root = active.shadowRoot || active.getRootNode(); if (root === active.getRootNode()) break; el = active; } "
-                        "return document.activeElement === el; }"
+                    actual, frames = self._focused_element(page)
+                    target = loc.element_handle(timeout=4_000)
+                    target_frame = getattr(loc, "_frame", None) or getattr(loc, "owner_frame", None)
+                    actual_frame = frames[-1] if frames else None
+                    if target is None or actual is None:
+                        return self._fail(event, started_at, t0, "无法取得焦点元素身份", execution_started="no")
+                    if target_frame is None or actual_frame is None or target_frame != actual_frame:
+                        return self._fail(event, started_at, t0, "目标控件不在当前焦点 Frame", execution_started="no")
+                    focused = bool(target.evaluate(
+                        "(target, actual) => target === actual", actual
                     ))
                 except Exception as exc:
                     return self._fail(event, started_at, t0, f"读取焦点失败: {exc}", execution_started="no")
+                finally:
+                    for handle in (target, actual):
+                        if handle is not None:
+                            try:
+                                handle.dispose()
+                            except Exception:
+                                pass
                 if not focused:
                     return self._fail(event, started_at, t0, "目标控件没有焦点", execution_started="no")
                 return self._ok(event, started_at, t0, "目标控件持有焦点", execution_started="no")
@@ -551,31 +625,56 @@ class PlaywrightExecutor:
             if cap == "read_url":
                 return self._read_url(event, page, started_at, t0)
             if cap in {"forward_page", "navigate_page"}:
-                target = str(page.url or "")
+                p = event.params or {}
+                timeout = p.get("timeout_ms", 15_000)
+                if type(timeout) is not int or not 1 <= timeout <= 120_000:
+                    return self._fail(
+                        event, started_at, t0,
+                        "timeout_ms 必须是 1..120000 的整数",
+                        execution_started="no",
+                    )
+                try:
+                    current = validate_page_url(str(page.url or ""))
+                except ValueError as exc:
+                    return self._fail(
+                        event, started_at, t0, f"当前页面 URL 无效: {exc}",
+                        execution_started="no",
+                    )
+                target = current
+                if cap == "navigate_page":
+                    raw = str(p.get("uri") or p.get("url") or "").strip()
+                    if not raw:
+                        return self._fail(event, started_at, t0, f"{cap} 缺 uri", execution_started="no")
+                    try:
+                        target = resolve_uri(current, raw)
+                    except ValueError as exc:
+                        return self._fail(
+                            event, started_at, t0, f"导航 URI 无效: {exc}",
+                            execution_started="no",
+                        )
+                navigated = {"main_frame": False}
+                if cap == "forward_page":
+                    def _on_main_frame_navigation(frame: Any) -> None:
+                        if frame == page.main_frame:
+                            navigated["main_frame"] = True
+                    page.on("framenavigated", _on_main_frame_navigation)
                 try:
                     if cap == "forward_page":
-                        page.go_forward(wait_until="domcontentloaded", timeout=int(
-                            (event.params or {}).get("timeout_ms") or 15_000))
+                        page.go_forward(wait_until="domcontentloaded", timeout=timeout)
                     else:
-                        raw = str((event.params or {}).get("uri") or (event.params or {}).get("url") or "").strip()
-                        if not raw:
-                            return self._fail(event, started_at, t0, f"{cap} 缺 uri")
-                        target = urljoin(page.url, raw)
-                        before = urlparse(page.url)
-                        after = urlparse(target)
-                        if after.scheme not in {"http", "https"}:
-                            return self._fail(event, started_at, t0, "导航只允许 http/https", execution_started="no")
-                        if before.netloc and after.netloc != before.netloc:
-                            return self._fail(event, started_at, t0, "跨 origin 导航需要显式能力，当前已阻止",
-                                             execution_started="no")
-                        page.goto(target, wait_until="domcontentloaded", timeout=int(
-                            (event.params or {}).get("timeout_ms") or 15_000))
-                    actual = str(page.url or "")
+                        page.goto(target, wait_until="domcontentloaded", timeout=timeout)
+                    actual = validate_page_url(str(page.url or ""))
+                    if cap == "forward_page" and not navigated["main_frame"] and actual == current:
+                        return self._fail(
+                            event, started_at, t0, "没有可前进的页面历史",
+                            error="web_forward_noop", execution_started="yes",
+                        )
                     return make_event_result(
                         event, status=EventStatus.PASS, executor_used=self.id,
                         started_at=started_at, elapsed_ms=int((time.time() - t0) * 1000),
                         summary=f"已导航 {actual[:120]}",
                         raw_response={"page_url": actual, "requested_url": target,
+                                      "instrument_simulated": False,
                                       "load_state": "domcontentloaded", "execution": {
                                           "execution_started": "yes", "phase": "completed",
                                           "source": "playwright.native.v1"}},
@@ -585,6 +684,12 @@ class PlaywrightExecutor:
                     if obs is not None:
                         obs.record_navigation_error(exc, target)
                     return self._fail(event, started_at, t0, f"页面导航失败: {exc}", execution_started="yes")
+                finally:
+                    if cap == "forward_page":
+                        try:
+                            page.remove_listener("framenavigated", _on_main_frame_navigation)
+                        except Exception:
+                            pass
             if cap == "drag_control":
                 return self._drag_control(event, page, started_at, t0)
             if cap == "set_geolocation":
@@ -695,54 +800,94 @@ class PlaywrightExecutor:
                 result = self._input(event, ctx, page, started_at, t0)
                 self._forget_focus(focus_key)
                 return result
-            if cap == "press_key":
+            if cap in {"press_key", "key_down", "key_up"}:
                 p = event.params or {}
-                key = str(p.get("key") or p.get("keycode") or "Escape")
+                raw_key = p.get("key") or p.get("keycode")
+                if cap in {"key_down", "key_up"} and raw_key is None:
+                    return self._fail(event, started_at, t0, f"{cap} 缺 key", execution_started="no")
+                key = str(raw_key or "Escape")
                 low = key.lower()
-                if low in ("back", "browser_back") and p.get("browser_back", True):
+                if cap == "press_key" and low in ("back", "browser_back") and p.get("browser_back", True):
                     try:
                         page.go_back(wait_until="domcontentloaded", timeout=10_000)
                         return self._ok(event, started_at, t0, "浏览器后退", execution_started="yes")
                     except Exception as exc:
                         return self._fail(event, started_at, t0, f"浏览器后退失败: {exc}")
-                mapped = {"back": "Escape", "home": "Home", "enter": "Enter", "esc": "Escape"}.get(low, key)
-                page.keyboard.press(mapped)
-                return self._ok(event, started_at, t0, f"按键 {mapped}", execution_started="yes")
+                try:
+                    mapped = (
+                        normalize_key(key)
+                        if cap in {"key_down", "key_up"}
+                        else normalize_key_value(key, allow_combo=True)
+                    )
+                except ValueError as exc:
+                    return self._fail(event, started_at, t0, f"按键无效: {exc}", execution_started="no")
+                try:
+                    if cap == "key_down":
+                        hub.keyboard_down(sn, run_id=run_id, key=mapped, **id_kwargs)
+                    elif cap == "key_up":
+                        hub.keyboard_up(sn, run_id=run_id, key=mapped, **id_kwargs)
+                    else:
+                        page.keyboard.press(mapped)
+                except Exception as exc:
+                    return self._fail(event, started_at, t0, f"按键失败: {exc}", execution_started="no")
+                action = "按下" if cap == "key_down" else "抬起" if cap == "key_up" else "按键"
+                return self._ok(event, started_at, t0, f"{action} {mapped}", execution_started="yes")
             if cap == "swipe_direction":
                 p = event.params or {}
-                direction = str(p.get("direction") or "down").lower()
+                direction = str(p.get("direction") or "down").strip().lower()
+                if "direction" in p and direction not in {"up", "down", "left", "right"}:
+                    return self._fail(event, started_at, t0, "direction 必须是 up/down/left/right",
+                                      execution_started="no")
+                duration = p.get("duration_ms", 500)
+                steps = p.get("steps", 12)
+                if type(duration) is not int or not 0 <= duration <= 120_000:
+                    return self._fail(event, started_at, t0, "duration_ms 必须是 0..120000 的整数",
+                                      execution_started="no")
+                if type(steps) is not int or not 0 <= steps <= 500:
+                    return self._fail(event, started_at, t0, "steps 必须是 0..500 的整数",
+                                      execution_started="no")
                 box = page.viewport_size or _DEFAULT_WEB_VIEWPORT
                 w, h = int(box["width"]), int(box["height"])
                 fx, fy, tx, ty = p.get("from_x"), p.get("from_y"), p.get("to_x"), p.get("to_y")
-                if None not in (fx, fy, tx, ty):
-                    x1, y1 = to_viewport_xy(fx, fy, page)
-                    x2, y2 = to_viewport_xy(tx, ty, page)
-                    delta = (x1, y1, x2, y2)
-                    summary = f"滑动 ({fx},{fy})→({tx},{ty})"
-                else:
-                    cx, cy = w // 2, h // 2
-                    delta = {
-                        "up": (cx, int(h * 0.75), cx, int(h * 0.25)),
-                        "down": (cx, int(h * 0.25), cx, int(h * 0.75)),
-                        "left": (int(w * 0.75), cy, int(w * 0.25), cy),
-                        "right": (int(w * 0.25), cy, int(w * 0.75), cy),
-                    }.get(direction, (cx, int(h * 0.75), cx, int(h * 0.25)))
-                    summary = f"滑动 {direction}"
-                page.mouse.move(delta[0], delta[1])
-                page.mouse.down()
-                page.mouse.move(delta[2], delta[3], steps=12)
-                page.mouse.up()
+                try:
+                    if None not in (fx, fy, tx, ty):
+                        x1, y1 = to_viewport_xy(fx, fy, page)
+                        x2, y2 = to_viewport_xy(tx, ty, page)
+                        delta = (x1, y1, x2, y2)
+                        summary = f"滑动 ({fx},{fy})→({tx},{ty})"
+                    else:
+                        cx, cy = w // 2, h // 2
+                        delta = {
+                            "up": (cx, int(h * 0.75), cx, int(h * 0.25)),
+                            "down": (cx, int(h * 0.25), cx, int(h * 0.75)),
+                            "left": (int(w * 0.75), cy, int(w * 0.25), cy),
+                            "right": (int(w * 0.25), cy, int(w * 0.75), cy),
+                        }[direction]
+                        summary = f"滑动 {direction}"
+                    _mouse_drag(page, (delta[0], delta[1]), (delta[2], delta[3]),
+                                duration_ms=duration, steps=steps)
+                except Exception as exc:
+                    return self._fail(event, started_at, t0, f"滑动失败: {exc}", execution_started="yes")
                 return self._ok(event, started_at, t0, summary, execution_started="yes")
             if cap == "swipe_element_to_element":
                 p = event.params or {}
                 if None in (p.get("from_x"), p.get("from_y"), p.get("to_x"), p.get("to_y")):
-                    return self._fail(event, started_at, t0, "拖拽需要 from_x/from_y/to_x/to_y")
-                x1, y1 = to_viewport_xy(p.get("from_x"), p.get("from_y"), page)
-                x2, y2 = to_viewport_xy(p.get("to_x"), p.get("to_y"), page)
-                page.mouse.move(x1, y1)
-                page.mouse.down()
-                page.mouse.move(x2, y2, steps=12)
-                page.mouse.up()
+                    return self._fail(event, started_at, t0, "拖拽需要 from_x/from_y/to_x/to_y",
+                                      execution_started="no")
+                duration = p.get("duration_ms", 400)
+                steps = p.get("steps", 12)
+                if type(duration) is not int or not 0 <= duration <= 120_000:
+                    return self._fail(event, started_at, t0, "duration_ms 必须是 0..120000 的整数",
+                                      execution_started="no")
+                if type(steps) is not int or not 0 <= steps <= 500:
+                    return self._fail(event, started_at, t0, "steps 必须是 0..500 的整数",
+                                      execution_started="no")
+                try:
+                    x1, y1 = to_viewport_xy(p.get("from_x"), p.get("from_y"), page)
+                    x2, y2 = to_viewport_xy(p.get("to_x"), p.get("to_y"), page)
+                    _mouse_drag(page, (x1, y1), (x2, y2), duration_ms=duration, steps=steps)
+                except Exception as exc:
+                    return self._fail(event, started_at, t0, f"拖拽失败: {exc}", execution_started="yes")
                 return self._ok(event, started_at, t0, f"拖拽 ({x1},{y1})→({x2},{y2})", execution_started="yes")
             return self._fail(event, started_at, t0, f"PlaywrightExecutor 不处理 {cap}")
         except Exception as exc:
@@ -932,7 +1077,13 @@ class PlaywrightExecutor:
         )
         match = None
         if expect:
-            match = _page_matches_expect(url, expect)
+            try:
+                match = same_entry_url(url, expect)
+            except ValueError as exc:
+                return self._fail(
+                    event, started_at, t0, f"URL 比较失败: {exc}",
+                    execution_started="no",
+                )
         summary = url[:120]
         if expect:
             summary = f"{summary}（目标{'命中' if match else '未命中'}）"
@@ -1029,9 +1180,20 @@ class PlaywrightExecutor:
     def _read_url(self, event: PlanEvent, page, started_at: str, t0: float) -> EventResult:
         actual = str(page.url or "")
         expected = str((event.params or {}).get("expected_uri") or (event.params or {}).get("uri") or "")
+        try:
+            actual = validate_page_url(actual)
+        except ValueError as exc:
+            return self._fail(
+                event, started_at, t0, f"当前页面 URL 无效: {exc}",
+                execution_started="no",
+            )
         if expected:
-            expected = urljoin(actual, expected)
-            matched = _page_matches_expect(actual, expected)
+            try:
+                expected = resolve_uri(actual, expected)
+                matched = same_entry_url(actual, expected)
+            except ValueError as exc:
+                return self._fail(event, started_at, t0, f"期望 URI 无效: {exc}",
+                                  execution_started="no")
             if not matched:
                 return make_event_result(
                     event, status=EventStatus.FAIL, executor_used=self.id,
@@ -1061,6 +1223,18 @@ class PlaywrightExecutor:
         p = event.params or {}
         source_p = p.get("source_target") if isinstance(p.get("source_target"), dict) else {}
         target_p = p.get("target_target") if isinstance(p.get("target_target"), dict) else {}
+        duration = p.get("duration_ms", 500)
+        if type(duration) is not int or not 0 <= duration <= 120_000:
+            return self._fail(event, started_at, t0, "duration_ms 必须是 0..120000 的整数",
+                              execution_started="no")
+        steps_value = p.get("steps")
+        if steps_value is None:
+            steps = min(60, max(8, duration // 20)) if duration else 0
+        else:
+            steps = steps_value
+        if type(steps) is not int or not 0 <= steps <= 500:
+            return self._fail(event, started_at, t0, "steps 必须是 0..500 的整数",
+                              execution_started="no")
         try:
             source = locator_from_params(page, {**p, **source_p, "require_unique": True})
             target = locator_from_params(page, {**p, **target_p, "require_unique": True})
@@ -1068,7 +1242,7 @@ class PlaywrightExecutor:
                 return self._fail(event, started_at, t0, "拖拽源或目标控件未找到", execution_started="no")
             mode = str(p.get("mode") or "mouse").lower()
             if mode == "html5":
-                source.drag_to(target, timeout=max(1_000, int(p.get("duration_ms") or 4_000)))
+                source.drag_to(target, timeout=max(1_000, duration or 4_000))
                 return self._ok(event, started_at, t0, "HTML5 拖拽已执行", execution_started="yes")
             if mode != "mouse":
                 return self._fail(event, started_at, t0, "拖拽 mode 必须是 mouse 或 html5", execution_started="no")
@@ -1082,22 +1256,11 @@ class PlaywrightExecutor:
             sy = float(src_box["y"]) + float(src_box["height"]) * float(p.get("source_y_ratio", 0.5))
             tx = float(dst_box["x"]) + float(dst_box["width"]) * float(p.get("target_x_ratio", 0.5))
             ty = float(dst_box["y"]) + float(dst_box["height"]) * float(p.get("target_y_ratio", 0.5))
-            duration = max(0, int(p.get("duration_ms") or 500))
-            steps = max(1, int(p.get("steps") or min(60, max(8, duration // 20))))
-            page.mouse.move(sx, sy)
-            page.mouse.down()
-            try:
-                page.mouse.move(tx, ty, steps=steps)
-            finally:
-                page.mouse.up()
+            _mouse_drag(page, (sx, sy), (tx, ty), duration_ms=duration, steps=steps)
             return self._ok(event, started_at, t0,
                             f"控件拖拽 ({sx:.0f},{sy:.0f})→({tx:.0f},{ty:.0f})，{duration}ms",
                             execution_started="yes")
         except Exception as exc:
-            try:
-                page.mouse.up()
-            except Exception:
-                pass
             return self._fail(event, started_at, t0, f"控件拖拽失败: {exc}", execution_started="yes")
 
     def _wait_screen_ready(self, event: PlanEvent, page, started_at: str, t0: float) -> EventResult:
@@ -1531,15 +1694,20 @@ class PlaywrightExecutor:
                 "execution_started": execution_started, "phase": "completed", "source": "playwright.native.v1"}},
         )
 
-    def _fail(self, event, started_at, t0, msg: str, *, execution_started: str = "unknown") -> EventResult:
+    def _fail(self, event, started_at, t0, msg: str, *, execution_started: str = "unknown",
+              error: str = "") -> EventResult:
         if event.params.get("sensitive"):
             msg = "敏感输入失败（详细内容已脱敏）"
+        execution = {
+            "execution_started": execution_started,
+            "phase": "preflight" if execution_started == "no" else "executor",
+            "source": "playwright.native.v1",
+        }
+        if error:
+            execution["reason_code"] = error
         return make_event_result(
             event, status=EventStatus.FAIL, executor_used=self.id,
             started_at=started_at, elapsed_ms=int((time.time() - t0) * 1000),
-            summary=msg, error=msg,
-            raw_response={"sensitive": bool(event.params.get("sensitive")), "execution": {
-                "execution_started": execution_started,
-                "phase": "preflight" if execution_started == "no" else "executor",
-                "source": "playwright.native.v1"}},
+            summary=msg, error=error or msg,
+            raw_response={"sensitive": bool(event.params.get("sensitive")), "execution": execution},
         )

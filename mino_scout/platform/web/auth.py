@@ -3,39 +3,9 @@ from __future__ import annotations
 
 import json
 import time
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlsplit
 
-
-def origin(url):
-    try:
-        p = urlsplit(url)
-        if p.scheme not in {"http", "https"} or not p.hostname or p.username or p.password:
-            raise ValueError()
-        port = p.port
-        host = p.hostname.lower()
-        if ":" in host:
-            host = f"[{host}]"
-        suffix = f":{port}" if port and port != (443 if p.scheme == "https" else 80) else ""
-        return f"{p.scheme}://{host}{suffix}"
-    except (ValueError, TypeError):
-        raise ValueError("web_auth_origin_invalid") from None
-
-
-def resolve_uri(base, uri):
-    from mino_scout.platform.web.playwright_hub import normalize_goto_url
-    base = normalize_goto_url(base)
-    if not isinstance(uri, str) or not uri.strip() or any(c.isspace() or ord(c) < 32 for c in uri) or "\\" in uri:
-        raise ValueError("web_uri_invalid")
-    target = urljoin(base, uri)
-    if origin(target) != origin(base):
-        raise ValueError("web_uri_origin_mismatch")
-    return target
-
-
-def same_entry_url(actual, expected):
-    left, right = urlsplit(actual), urlsplit(expected)
-    return origin(actual) == origin(expected) and (
-        left.path.rstrip("/"), left.query, left.fragment) == (right.path.rstrip("/"), right.query, right.fragment)
+from mino_scout.platform.web.web_url import normalize_goto_url, origin, resolve_uri, same_entry_url
 
 
 def _abort(message, code):

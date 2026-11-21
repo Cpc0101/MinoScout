@@ -1011,6 +1011,7 @@ ADB Keyboard 的电脑 APK 缓存与手机已安装事实独立：缓存缺失�
 | `inputs` | 单例业务值字典，默认空并省略，最多 16KiB，不含凭据或 UI 句柄 |
 | `source_context` | 显式 Agent 任务关系，默认空并省略；parent_task_id、purpose=prepare/resume、可选 data_need |
 | `script_path` | 仓库内相对路径，必须是 `.py`，可空。空表示 Scout 自己按 `tests/**/<case_id>.py` 定位 |
+| `web_capabilities` | 仅 Web 脚本使用的冻结能力清单；空值省略。节点必须按清单授予权限，未知能力拒绝 |
 
 不再有 `files`：Nexus 不读取、不打包脚本仓库。Scout 自己拉取 `repo_url`，在 `revision`（或分支最新）上读脚本、`config.yaml`、`pages/` 并执行；应用与环境的对应由 Scout 读仓库里的 `config.yaml`。
 
@@ -1320,3 +1321,62 @@ Web `App.launch(uri="", *, account=None, auth="none", identity_control="", ident
 Scout `app.network.expect_response` 在动作前注册期望，动作后等待注册后发起且属于当前页面的请求响应。path 精确匹配；occurrence 缺省为唯一候选，多个候选明确阻塞，显式序号按响应观察顺序累计。匹配只声明时间关联，HTTP 状态与业务字段仍须独立断言。正文只允许显式 capture_fields/json_fields 中的非敏感标量字段；缺字段证据、超限、无长度或压缩正文返回不可判定。网络等待使用真实时间并驱动浏览器事件，取消/超时清除期望。
 
 完整证据在 Scout：`browser/error` 保存首次导航及新标签页的 JS/console/请求/HTTP 错误；`browser/response` 保存已匹配请求标识、状态、字段和关联；`browser/observation` 保存保留数量、丢弃数量与采集缺口。角色、context/page、步骤字段沿用本地记录 payload，不新增信封。HTTP 状态码不是执行状态，错误诊断本身不改变用例结论。Nexus 仅同步既有任务摘要并代理 record.events 读取，不持久保存完整浏览器事件。
+
+
+## Web 交互执行契约
+
+Web 脚本能力清单固定为 `auth_snapshot`、`uri_direct`、`network_observation`、`browser_errors`、`page_clock`、`drag`、`keyboard_focus`、`key_down`、`key_up`、`clipboard`、`permissions`、`geolocation`、`locale_timezone`、`navigation`、`multi_actor`。`keyboard_focus` 负责输入焦点，`key_down` / `key_up` 显式按下和释放单个按键；退出或异常时必须释放按住状态。拖拽同样在结束或异常路径清理鼠标按键与中间状态。
+
+actor、browser context 和 page/tab 在一条用例内隔离，不得跨用例共享可变页面句柄。直接 URI 导航按应用 URL 解析，只允许相同 scheme/host/port 的 HTTP(S) 地址，可携带 query/hash；非同源返回 `web_uri_origin_mismatch`。首次业务导航可以直达脚本指定 URI，不要求先进入站点根目录。
+
+导航回退只在确有历史时执行。没有历史可前进时，`forward_page` 返回 `status=fail`、`error=web_forward_noop`。目标权限不可授予或能力不支持时返回 `status=blocked`、`error=web_permission_denied_unsupported`。这些错误不能被记成通过，也不能用另一设备或另一权限配置静默重试。
+
+`region` 只作为 Nexus 的请求归因元数据，用于解释账号、环境或业务请求来源；它不模拟浏览器或后端的地理位置。需要浏览器地理位置时使用 `geolocation` 能力并独立校验页面实际观测值。
+
+
+## 用例标签筛选与执行选择
+
+`POST /case-runner/run` 可携带 `include_tags` / `exclude_tags`，每项接受字符串或字符串数组，也接受中英文逗号分隔。标签去掉首尾空白和可选 `#` 前缀，按 Unicode casefold 去重并保留首次展示拼写；最多 32 个，每个最多 64 字符。筛选采用 include-any 与 exclude-any，排除条件优先。筛选在 `start_index` 分页之前执行，因此分页不会改变标签集合。空匹配必须返回 `tag_filter_matched_no_cases`，不得回退为全部用例。
+
+任务创建后，Nexus 冻结执行选择并在回执中返回：
+
+```json
+{
+  "filters": {"include_tags": ["smoke"], "exclude_tags": ["flaky"]},
+  "matched_count": 2,
+  "selected_case_ids": ["case_a", "case_b"],
+  "skipped": [
+    {"case_id": "case_c", "reason": "tag_not_included"},
+    {"case_id": "case_d", "reason": "tag_excluded"}
+  ],
+  "source_revision": "git-revision",
+  "selected_case_revisions": {"case_a": "revision-a", "case_b": "revision-b"}
+}
+```
+
+`matched_count` 必须等于去重后的 `selected_case_ids` 数量；`selected_case_revisions` 的键集合必须与选中用例一致。任务存储后该投影不可改写。Workbench 可以本地筛选帮助选择，但正式运行必须把标签条件交给 Nexus 冻结，不能只在前端过滤后发送一组临时用例 ID。
+
+
+## 失败历史分析
+
+`POST /case-runner/case-results` 的 `history_limit` 范围为 1–100，默认 20。响应在原有 `items` 之外返回 `failure_analysis`：
+
+```json
+{
+  "groups": [],
+  "incomparable": [],
+  "summary": {
+    "runs_scanned": 0,
+    "cases_scanned": 0,
+    "groups": 0,
+    "stable_repeated_failures": 0,
+    "fail_then_pass": 0,
+    "single_failures": 0,
+    "incomparable_observations": 0,
+    "history_limit": 20,
+    "app_id": "app-id"
+  }
+}
+```
+
+失败组分类固定为 `stable_repeated_failure`、`fail_then_pass`、`single_failure`。文本签名前必须把 UUID、时间、request id 和端口等易变片段规范化；签名相同且可比的历史才归入同一组。比较兼容性至少核对 app、platform、environment baseline、env profile、env surface、tested build、execution mode、case identity 和 fixture digest。任一关键字段缺失或变化时，观测进入 `incomparable` 并附 `reason_codes`，不能推断为稳定失败或已恢复。

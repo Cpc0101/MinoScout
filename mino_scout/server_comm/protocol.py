@@ -282,6 +282,8 @@ WEB_CAPABILITIES = (
     "page_clock",
     "drag",
     "keyboard_focus",
+    "key_down",
+    "key_up",
     "clipboard",
     "permissions",
     "geolocation",
@@ -290,6 +292,12 @@ WEB_CAPABILITIES = (
     "multi_actor",
 )
 _WEB_CAPABILITY_SET = frozenset(WEB_CAPABILITIES)
+CASE_TAG_MAX_COUNT = 32
+CASE_TAG_MAX_LENGTH = 64
+CASE_TAG_SKIP_REASONS = frozenset({"tag_excluded", "tag_not_included"})
+FAILURE_CLASSIFICATIONS = frozenset({"stable_repeated_failure", "fail_then_pass", "single_failure"})
+CASE_RESULT_HISTORY_MIN = 1
+CASE_RESULT_HISTORY_MAX = 100
 RECORD_API_VERSION = 1
 RECORD_RESOURCE_STATUS_CAPABILITY = "record.resource_status"
 RECORD_RESOURCE_STOP_CONTRACT = "script_resource_stop.v1"
@@ -298,6 +306,131 @@ SCRIPT_RUN_FIELDS = ("run_id", "session_id", "case_id", "sn", "platform", "repo_
                      "task_id", "attempt_id", "owner_user_id", "execution_timeout_sec", "inputs", "source_context", "execution_kind", "workspace", "debug_origin",
                      "web_capabilities")
 _SCRIPT_RUN_FIELDS = SCRIPT_RUN_FIELDS
+
+
+def normalize_case_tags(value: Any) -> list[str]:
+    """Normalize case-selection tags identically in Nexus and Scout.
+
+    Filters use include-any/exclude-any semantics after case-insensitive
+    deduplication. Display spelling is preserved for the first occurrence.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = value.replace("，", ",").split(",")
+    if not isinstance(value, (list, tuple, set)):
+        raise ValueError("case_tags_invalid")
+    tags: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError("case_tags_invalid")
+        tag = item.strip().lstrip("#").strip()
+        if not tag:
+            continue
+        if len(tag) > CASE_TAG_MAX_LENGTH:
+            raise ValueError("case_tag_too_long")
+        key = tag.casefold()
+        if key not in seen:
+            seen.add(key)
+            tags.append(tag)
+    if len(tags) > CASE_TAG_MAX_COUNT:
+        raise ValueError("too_many_case_tags")
+    return tags
+
+
+def validate_execution_selection(value: Any) -> dict[str, Any]:
+    """Validate the immutable plan returned by a Nexus case run."""
+    if not isinstance(value, dict):
+        raise ValueError("execution_selection_invalid")
+    required = {"filters", "matched_count", "selected_case_ids", "skipped", "source_revision", "selected_case_revisions"}
+    if not required.issubset(value):
+        raise ValueError("execution_selection_incomplete")
+    filters = value["filters"]
+    if not isinstance(filters, dict) or set(filters) != {"include_tags", "exclude_tags"}:
+        raise ValueError("execution_selection_filters_invalid")
+    includes = normalize_case_tags(filters["include_tags"])
+    excludes = normalize_case_tags(filters["exclude_tags"])
+    selected = value["selected_case_ids"]
+    skipped = value["skipped"]
+    revisions = value["selected_case_revisions"]
+    matched_count = value["matched_count"]
+    source_revision = value["source_revision"]
+    if not isinstance(selected, list) or any(not isinstance(item, str) or not item for item in selected):
+        raise ValueError("execution_selection_case_ids_invalid")
+    if len(selected) != len(set(selected)):
+        raise ValueError("execution_selection_case_ids_invalid")
+    if type(matched_count) is not int or matched_count < 0 or matched_count != len(selected):
+        raise ValueError("execution_selection_count_invalid")
+    if not isinstance(skipped, list):
+        raise ValueError("execution_selection_skipped_invalid")
+    for item in skipped:
+        if not isinstance(item, dict) or set(item) != {"case_id", "reason"}:
+            raise ValueError("execution_selection_skipped_invalid")
+        if not isinstance(item["case_id"], str) or not item["case_id"] or item["reason"] not in CASE_TAG_SKIP_REASONS:
+            raise ValueError("execution_selection_skipped_invalid")
+    if not isinstance(source_revision, str):
+        raise ValueError("execution_selection_revision_invalid")
+    if not isinstance(revisions, dict) or any(not isinstance(key, str) or not key or not isinstance(item, str) for key, item in revisions.items()):
+        raise ValueError("execution_selection_revisions_invalid")
+    if set(revisions) != set(selected):
+        raise ValueError("execution_selection_revisions_invalid")
+    return {
+        "filters": {"include_tags": includes, "exclude_tags": excludes},
+        "matched_count": matched_count,
+        "selected_case_ids": list(selected),
+        "skipped": [dict(item) for item in skipped],
+        "source_revision": source_revision,
+        "selected_case_revisions": dict(revisions),
+    }
+
+
+def validate_failure_analysis(value: Any) -> dict[str, Any]:
+    """Validate a bounded history-analysis projection.
+
+    This checks the transport shape and invariants. It does not claim that
+    the observations were collected or that the failures are reproducible.
+    """
+    if not isinstance(value, dict) or set(value) != {"groups", "incomparable", "summary"}:
+        raise ValueError("failure_analysis_invalid")
+    groups = value["groups"]
+    incomparable = value["incomparable"]
+    summary = value["summary"]
+    if not isinstance(groups, list) or not isinstance(incomparable, list) or not isinstance(summary, dict):
+        raise ValueError("failure_analysis_invalid")
+    observation_fields = {
+        "run_id", "case_id", "execution_unit_id", "attempt_id", "session_id", "status",
+        "started_at", "finished_at", "failure_stage", "case_step", "reason_code", "assertion",
+        "summary", "signature", "signature_parts", "platform", "environment_baseline_digest",
+        "env_profile", "env_surface", "tested_build", "execution_mode", "fixture_digest",
+    }
+
+    def validate_observation(item: Any) -> None:
+        if not isinstance(item, dict) or not observation_fields.issubset(item):
+            raise ValueError("failure_analysis_observation_invalid")
+        if not isinstance(item["run_id"], str) or not isinstance(item["case_id"], str):
+            raise ValueError("failure_analysis_observation_invalid")
+        if item["status"] not in {"failed", "passed"} or not isinstance(item["signature_parts"], (dict, list)):
+            raise ValueError("failure_analysis_observation_invalid")
+
+    for group in groups:
+        if not isinstance(group, dict) or not {"case_id", "signature", "signature_parts", "first_failure", "observations", "classification", "run_ids"}.issubset(group):
+            raise ValueError("failure_analysis_group_invalid")
+        if group["classification"] not in FAILURE_CLASSIFICATIONS:
+            raise ValueError("failure_analysis_classification_invalid")
+        if not isinstance(group["observations"], list) or not group["observations"]:
+            raise ValueError("failure_analysis_group_invalid")
+        for observation in group["observations"]:
+            validate_observation(observation)
+        if not isinstance(group["run_ids"], list) or any(not isinstance(item, str) for item in group["run_ids"]):
+            raise ValueError("failure_analysis_group_invalid")
+    for observation in incomparable:
+        validate_observation(observation)
+        if not isinstance(observation.get("reason_codes"), list):
+            raise ValueError("failure_analysis_incomparable_invalid")
+    if not isinstance(summary.get("history_limit"), int) or not CASE_RESULT_HISTORY_MIN <= summary["history_limit"] <= CASE_RESULT_HISTORY_MAX:
+        raise ValueError("failure_analysis_history_limit_invalid")
+    return value
 
 
 def validate_runtime_data(value: Any, *, max_bytes: int = 16384) -> dict[str, Any]:
