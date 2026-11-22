@@ -1,4 +1,4 @@
-"""飞书、Meego、机器人的本机调用。密钥从保险库读，不放进回执。"""
+"""飞书、Meego、机器人的本机调用。密钥从本机私有文件读，不放进回执。"""
 from __future__ import annotations
 
 from typing import Any

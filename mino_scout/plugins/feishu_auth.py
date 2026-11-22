@@ -42,9 +42,9 @@ def _save(home: Path, data: dict) -> None:
 def local_ready() -> bool:
     """Return cached authorization state without invoking the CLI.
 
-    Status collection runs on every heartbeat. The Feishu CLI may resolve
-    secrets from the operating-system keychain while verifying credentials, so
-    background status checks must never execute it.
+    Status collection runs on every heartbeat. Credential verification may
+    launch the external Feishu CLI, so background status checks only read the
+    cached authorization state.
     """
     from mino_scout.plugins.state import _item, installed
     if _item("cli", "feishu").get("import_blocked") or not installed("cli", "feishu"):

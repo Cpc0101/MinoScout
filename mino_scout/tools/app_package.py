@@ -5,7 +5,7 @@ Scout 只接受「本机可访问的路径」或「可下载地址」，不接�
 - `path`：Scout 主机上的绝对路径。SMB / NFS 已挂载后就是普通路径。
 - `url` ：`http(s)` 直链，下载到临时文件后安装。
 - `url` ：`smb://[用户@]主机/共享名/文件路径`，macOS 上用 `open -g` 挂载共享盘、
-  等卷出现后按剩余路径取文件（凭证走钥匙串，不接受明文密码）。
+  等卷出现后按剩余路径取文件（凭证由系统挂载配置处理，不接受明文密码）。
 
 下载与挂载都产生临时状态；调用方用 `release()` 清理。
 """
@@ -138,7 +138,7 @@ def _mount_smb(url: str, *, timeout_sec: float) -> str:
             time.sleep(1.0)
             root = _smb_root(share)
     if root is None:
-        raise PackageError(f"共享盘 {share} 没有挂载出来：确认主机可达、钥匙串里有该共享的凭证")
+        raise PackageError(f"共享盘 {share} 没有挂载出来：确认主机可达、系统挂载配置里有该共享的凭证")
     return str(root / rest)
 
 

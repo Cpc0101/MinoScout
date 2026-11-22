@@ -178,7 +178,7 @@ Scout 重装保留 `scout_id` 和已有长期 token，先以 `pending_install_to
 
 `host` 可省略。旧 Scout 不带时，列表功耗格显示「—」。`mode` 为 `running` 或 `asleep`。`power_source` 为 `ac` / `battery`。`charging` 为 `charging` / `not charging` / `charged` / `discharging`。`inhibit` 表示睡眠抑制还在（macOS 上即 `caffeinate` 还活着）。`children` 只数本进程的子进程。
 
-`plugins` 可省略。省略表示这台 Scout 还不认识插件状态，网页显示「需更新后才能配置插件」。每项必有 `class` / `id` / `installed` / `configured`。非密钥明文放在 `values`（如 Gmail `inbox_address`），已写入保险库的字段名放在 `saved_secrets`。密钥值不上报。`class` 为 `cli` / `mcp` / `bot` / `mail`。`REGISTER` 使用同一份列表。
+`plugins` 可省略。省略表示这台 Scout 还不认识插件状态，网页显示「需更新后才能配置插件」。每项必有 `class` / `id` / `installed` / `configured`。非密钥明文放在 `values`（如 Gmail `inbox_address`），已写入本机私有凭据文件的字段名放在 `saved_secrets`。密钥值不上报。`class` 为 `cli` / `mcp` / `bot` / `mail`。`REGISTER` 使用同一份列表。
 
 
 `runtime_capabilities` 可省略。省略表示这台正在运行的进程没有上报输入契约，Nexus 不凭版本号猜测它是否支持当前焦点输入。列表只含执行器实际实现的组合：`id`、`executor`、`platform`、`contract_version`、`supported_combinations`（`target_mode` + `write_modes`）。`REGISTER` 与 `HEARTBEAT` 使用同一份列表；心跳带上它，重启后的新进程才会被当成支持新契约。
@@ -247,8 +247,8 @@ Scout 重装保留 `scout_id` 和已有长期 token，先以 `pending_install_to
 | `node.shutting_down` | S→N | 人主动停。Nexus 立刻失败该节点在途 run。Scout 会在这条之前再发一帧 HEARTBEAT |
 | `node.update_progress` | S→N | 远程/本机自更新进度。`params.progress`：`stage` / `label` / `percent` / `layer` / `bytes_*` |
 | `node.plugin_install` | N→S | 按发布清单安装一个 CLI / MCP。`params.class` + `params.id`。不接受临时 URL |
-| `node.plugin_remove` | N→S | 卸掉该插件目录，并删掉它在本机保险库里的密钥 |
-| `node.plugin_config` | N→S | 写入该插件参数。密钥只留在 Scout 本机保险库，应答里不回显 |
+| `node.plugin_remove` | N→S | 卸掉该插件目录，并删掉它在本机私有凭据文件里的密钥 |
+| `node.plugin_config` | N→S | 写入该插件参数。密钥只留在 Scout 本机私有凭据文件，应答里不回显 |
 | `node.plugin_progress` | S→N | 插件安装进度。形状同 `node.update_progress`，另带 `class` / `id`，不写入自更新的 `update_job` |
 | `plugin.gmail.fetch_otp` | N→S | 用这台节点自己的 Gmail 应用专用密码取验证码。参数只有 To、时间、发件人过滤和轮询预算，没有密码 |
 | `plugin.cli.feishu` | N→S | 用这台节点的飞书应用凭证读文档。参数是 `action=read_doc` 和 `url`，没有 `app_secret`。另支持 auth_start/auth_status/auth_cancel：由节点运行官方 CLI config init --new 及 auth login --recommend，返回 state/summary/authorization_url（仅官方 HTTPS 授权页）；凭据不出节点。start 复用进行中的授权，status 不创建应用，cancel 仅停止当前授权子进程。重启返回 interrupted；继续时复用已保存应用。扫码授权和手动应用凭据均可读取文档 |
@@ -1065,7 +1065,7 @@ Nexus 侧不需要为不同平台选不同 id。
 | 参数 | 平台 | 说明 |
 |---|---|---|
 | `path` | 全部 | **Scout 主机上**的绝对路径。SMB/NFS 已挂载后就是普通路径 |
-| `url` | 全部 | `http(s)` 直链，或 macOS 上的 `smb://[用户@]主机/共享名/文件路径`。smb 由 `open -g` 挂载，凭证走钥匙串，**不接受明文密码** |
+| `url` | 全部 | `http(s)` 直链，或 macOS 上的 `smb://[用户@]主机/共享名/文件路径`。smb 由 `open -g` 挂载，凭证由系统挂载配置处理，**不接受明文密码** |
 | `file_name` | 全部 | 下载落盘用的文件名；缺省从 URL 末段推断 |
 | `install_timeout_sec` | 全部 | 安装超时。Android 默认 300s、iOS 默认 600s、桌面默认 1800s |
 | `split_files` / `splits` | android | 拆分包列表；给了就与 `path`（基包）一起用 `install-multiple` 装 |

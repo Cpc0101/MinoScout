@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from mino_scout.plugins.paths import data_dir
-from mino_scout.plugins.secret_store import account_name, delete_secret, get_secret, put_secret
+from mino_scout.plugins.secret_store import account_name, delete_secret, get_secret, has_secret, put_secret
 
 CONFIG_LOCK = threading.RLock()
 
@@ -212,8 +212,7 @@ def release_installed_import_blocks() -> list[str]:
 
 
 def configured(node_id: str, kind: str, plugin_id: str) -> bool:
-    """心跳会频繁调用。密钥是否在，只看本机清单里的标记，不去读保险库。"""
-    del node_id
+    """Return whether required values exist in the local private store."""
     row = spec(kind, plugin_id)
     if row is None or not row.get("fields"):
         return False
@@ -229,7 +228,7 @@ def configured(node_id: str, kind: str, plugin_id: str) -> bool:
         if field.get("optional"):
             continue
         if field.get("secret"):
-            if not item.get(f"has_{key}"):
+            if not has_secret(account_name(node_id, kind, plugin_id, key)):
                 return False
         elif not str(item.get(key) or "").strip():
             return False
@@ -249,7 +248,7 @@ def status_list(node_id: str) -> list[dict[str, Any]]:
             if not key:
                 continue
             if field.get("secret"):
-                if item.get(f"has_{key}"):
+                if has_secret(account_name(node_id, kind, pid, key)):
                     saved_secrets.append(key)
             else:
                 text = str(item.get(key) or "").strip()
@@ -341,7 +340,7 @@ def _field_type(row: dict[str, Any], key: str) -> str:
 
 @config_locked
 def remember_secret(node_id: str, kind: str, plugin_id: str, field: str, secret: str) -> None:
-    """扫码登录这类不走表单的密钥。只在清单里记「有没有」，明文进保险库。"""
+    """扫码登录这类不走表单的密钥。只在清单里记「有没有」，明文进本机私有文件。"""
     text = str(secret or "")
     if text:
         put_secret(account_name(node_id, kind, plugin_id, field), text)

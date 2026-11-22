@@ -100,25 +100,34 @@ jobs:
       - name: Validate PC SDK native library
         if: runner.os != 'Linux'
         run: python -c "import cua_driver; from importlib.metadata import version; assert version('cua-driver') == '0.34.1'; print('PC SDK native library loaded')"
-      - name: Verify real Windows credential storage
-        if: runner.os == 'Windows'
+      - name: Verify private credential files
+        env:
+          MINO_SCOUT_DEV_HOME: ${{ runner.temp }}/scout-credential-check
         shell: bash
         run: |
           python - <<'PYCODE'
+          import os
+          import stat
           import uuid
-          from mino_scout.plugins.secret_store import _win_get, _win_put, _win_delete
-          account = 'ci-native-' + uuid.uuid4().hex
+          from mino_scout.plugins.file_secrets import root
+          from mino_scout.plugins.secret_store import delete_secret, get_secret, put_secret
+          account = 'ci-private-' + uuid.uuid4().hex
           value = uuid.uuid4().hex
           try:
-              assert _win_get(account) == ''
-              _win_put(account, value)
-              assert _win_get(account) == value
-              _win_delete(account)
-              assert _win_get(account) == ''
-              _win_delete(account)
+              assert get_secret(account) == ''
+              put_secret(account, value)
+              assert get_secret(account) == value
+              files = [path for path in root().iterdir() if path.suffix == '.json']
+              assert len(files) == 1
+              if os.name != 'nt':
+                  assert stat.S_IMODE(root().stat().st_mode) == 0o700
+                  assert stat.S_IMODE(files[0].stat().st_mode) == 0o600
+              delete_secret(account)
+              assert get_secret(account) == ''
+              delete_secret(account)
           finally:
-              _win_delete(account)
-          print('Windows credential missing/write/read/delete passed')
+              delete_secret(account)
+          print('private credential missing/write/read/delete passed')
           PYCODE
       - name: Freeze, probe, pack zips
         env:
