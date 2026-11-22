@@ -221,8 +221,10 @@ def configured(node_id: str, kind: str, plugin_id: str) -> bool:
         return False
     if kind == "cli" and plugin_id == "feishu":
         from mino_scout.plugins.feishu_auth import local_ready
-        if local_ready():
-            return True
+        # Feishu CLI readiness is the locally installed authorization state.
+        # Application credentials cannot prove the remote authorization still
+        # exists, so they must not turn an idle/revoked CLI into ready.
+        return local_ready()
     for field in row["fields"]:
         key = str(field.get("key") or "")
         if field.get("optional"):

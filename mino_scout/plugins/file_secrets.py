@@ -20,6 +20,82 @@ _ROOT_MODE = 0o700
 _FILE_MODE = 0o600
 
 
+def _windows_secure_path(path: Path, *, directory: bool) -> None:
+    """Replace inherited Windows ACLs with full control for this user only."""
+    if os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class _SidAndAttributes(ctypes.Structure):
+        _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+
+    class _TokenUser(ctypes.Structure):
+        _fields_ = [("User", _SidAndAttributes)]
+
+    token = wintypes.HANDLE()
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p),
+    ]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    advapi32.SetFileSecurityW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
+    advapi32.SetFileSecurityW.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+        raise ValueError("Cannot open the current Windows process token")
+    sid_text = ctypes.c_wchar_p()
+    descriptor = ctypes.c_void_p()
+    try:
+        needed = wintypes.DWORD(0)
+        advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(needed))
+        if not needed.value:
+            raise ValueError("Cannot determine the current Windows user SID")
+        storage = ctypes.create_string_buffer(needed.value)
+        if not advapi32.GetTokenInformation(
+            token, 1, ctypes.cast(storage, ctypes.c_void_p), needed, ctypes.byref(needed)
+        ):
+            raise ValueError("Cannot read the current Windows user SID")
+        user = ctypes.cast(storage, ctypes.POINTER(_TokenUser)).contents
+        if not advapi32.ConvertSidToStringSidW(user.User.Sid, ctypes.byref(sid_text)):
+            raise ValueError("Cannot format the current Windows user SID")
+        sddl = f"D:P(A;;FA;;;{sid_text.value})"
+        if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl, 1, ctypes.byref(descriptor), None
+        ):
+            raise ValueError("Cannot build the private Windows ACL")
+        if not advapi32.SetFileSecurityW(str(path), 0x00000004, descriptor):
+            raise ValueError(f"Cannot secure Windows credential path ({ctypes.get_last_error()})")
+    finally:
+        if descriptor:
+            kernel32.LocalFree(descriptor)
+        if sid_text:
+            kernel32.LocalFree(ctypes.cast(sid_text, ctypes.c_void_p))
+        if token:
+            kernel32.CloseHandle(token)
+
+
 def root() -> Path:
     """Return the profile-scoped private storage directory."""
     from mino_scout.plugins.paths import data_dir
@@ -53,7 +129,8 @@ def _ensure_root(directory: Path) -> None:
     if os.name == "nt":
         try:
             directory.chmod(_ROOT_MODE)
-        except OSError as exc:
+            _windows_secure_path(directory, directory=True)
+        except (OSError, ValueError) as exc:
             raise ValueError("Credential storage permissions cannot be secured") from exc
         return
     try:
@@ -111,6 +188,7 @@ def _windows_lock(directory: Path, name: str):
     fd = os.open(path, flags, _FILE_MODE)
     try:
         os.chmod(path, _FILE_MODE)
+        _windows_secure_path(path, directory=False)
         if os.fstat(fd).st_size == 0:
             os.write(fd, b"\0")
             os.fsync(fd)
@@ -152,6 +230,7 @@ class Entry:
                 return False, None
             if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
                 raise ValueError("Credential storage type is unsafe")
+            _windows_secure_path(self.path, directory=False)
             fd = os.open(self.path, os.O_RDONLY)
         else:
             try:
@@ -186,6 +265,7 @@ class Entry:
             temp_path = self.directory / temporary
             fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _FILE_MODE)
             os.chmod(temp_path, _FILE_MODE)
+            _windows_secure_path(temp_path, directory=False)
         else:
             fd = os.open(
                 temporary,
@@ -209,6 +289,7 @@ class Entry:
                 os.fsync(stream.fileno())
             if self.directory_fd is None:
                 os.replace(temp_path, target)
+                _windows_secure_path(target, directory=False)
             else:
                 os.replace(
                     temporary,
