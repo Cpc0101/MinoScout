@@ -26,7 +26,6 @@ def _need(node_id: str, kind: str, plugin_id: str, hint: str) -> None:
 
 
 def feishu_read_doc(node_id: str, url: str) -> dict[str, Any]:
-    _need(node_id, "cli", "feishu", "请在这台 Scout 节点的飞书 CLI 页面完成扫码授权")
     link = str(url or "").strip()
     if not link:
         raise PluginCallError("url 不能为空")
@@ -35,6 +34,7 @@ def feishu_read_doc(node_id: str, url: str) -> dict[str, Any]:
         data = feishu_auth.run_json(["docs", "+fetch", "--doc", link, "--doc-format", "markdown", "--as", "user"])
         import json
         return {"content": json.dumps(data, ensure_ascii=False), "title": "", "source": "cli"}
+    _need(node_id, "cli", "feishu", "请在这台 Scout 节点的飞书 CLI 页面完成扫码授权")
     cli = None  # 手动应用凭据使用 OpenAPI；官方 CLI 不支持历史 read_doc 子命令。
     if cli is not None:
         text = _run_cli(node_id, "cli", "feishu", cli, ["read_doc", link])

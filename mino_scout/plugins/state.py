@@ -221,8 +221,8 @@ def configured(node_id: str, kind: str, plugin_id: str) -> bool:
     if item.get("import_blocked"):
         return False
     if kind == "cli" and plugin_id == "feishu":
-        from mino_scout.plugins.feishu_auth import ready
-        if ready():
+        from mino_scout.plugins.feishu_auth import local_ready
+        if local_ready():
             return True
     for field in row["fields"]:
         key = str(field.get("key") or "")

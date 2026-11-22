@@ -244,13 +244,13 @@ def read_sheets(node_id, params):
     from urllib.parse import quote
     from mino_scout.plugins.calls import PluginCallError, _need, _FEISHU, _feishu_tenant_token, _json
     from mino_scout.plugins.state import plain_value, secret_value
+    from mino_scout.plugins import feishu_auth
+    if feishu_auth.ready():
+        return _read_sheets_cli(params)
     try:
         _need(node_id, "cli", "feishu", "飞书插件尚未配置")
     except PluginCallError:
         raise ValueError("source_sheets_not_configured") from None
-    from mino_scout.plugins import feishu_auth
-    if feishu_auth.ready():
-        return _read_sheets_cli(params)
     try:
         token = _feishu_tenant_token(plain_value("cli", "feishu", "app_id"), secret_value(node_id, "cli", "feishu", "app_secret"))
     except PluginCallError:

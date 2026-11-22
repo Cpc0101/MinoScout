@@ -38,6 +38,23 @@ def _save(home: Path, data: dict) -> None:
     tmp.chmod(0o600)
     tmp.replace(home / "mino-status.json")
 
+
+def local_ready() -> bool:
+    """Return cached authorization state without invoking the CLI.
+
+    Status collection runs on every heartbeat. The Feishu CLI may resolve
+    secrets from the operating-system keychain while verifying credentials, so
+    background status checks must never execute it.
+    """
+    from mino_scout.plugins.state import _item, installed
+    if _item("cli", "feishu").get("import_blocked") or not installed("cli", "feishu"):
+        return False
+    home = root()
+    if not (home / "config.json").is_file():
+        return False
+    return _read(home).get("state") == "authorized"
+
+
 def ready(identity: str = "") -> bool:
     """CLI 可用性。用户态扫码或 bot 应用凭据任一已验证即可。"""
     from mino_scout.plugins.state import _item, installed
@@ -46,7 +63,7 @@ def ready(identity: str = "") -> bool:
     home = root()
     if not (home / "config.json").is_file():
         return False
-    if _read(home).get("state") == "authorized":
+    if local_ready():
         return True
     # bot 身份不经过用户扫码状态文件；用 auth status 验证应用凭据是否已生效。
     if identity in ("", "bot"):

@@ -284,7 +284,12 @@ def _meego_api(node_id: str, command: list[str], options: dict) -> dict | None:
 def call(node_id: str, plugin_id: str, params: dict) -> dict:
     if plugin_id not in ('feishu', 'meego'):
         raise PluginCallError('仅支持飞书和 Meego CLI')
-    _need(node_id, 'cli', plugin_id, '请先在该 Scout 下载并配置对应 CLI')
+    if plugin_id == 'feishu':
+        from mino_scout.plugins import feishu_auth
+        if not feishu_auth.ready():
+            _need(node_id, 'cli', plugin_id, '请先在该 Scout 下载并配置对应 CLI')
+    else:
+        _need(node_id, 'cli', plugin_id, '请先在该 Scout 下载并配置对应 CLI')
     try:
         command, options, mode = _arguments(params)
     except PluginCallError as exc:
