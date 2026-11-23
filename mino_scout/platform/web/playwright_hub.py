@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import threading
+from contextlib import contextmanager
 import time
 import traceback
 from pathlib import Path
@@ -195,6 +196,13 @@ def is_playwright_closed_noise(message: str, *, extra: str = "", exc_name: str =
     return False
 
 
+def is_playwright_closed_exception(exc: Exception) -> bool:
+    """Whether a close operation failed only because the target was already gone."""
+    return is_playwright_closed_noise(
+        str(exc), extra=repr(exc), exc_name=type(exc).__name__
+    )
+
+
 class _PlaywrightClosedFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         extra_parts: list[str] = []
@@ -272,6 +280,67 @@ class PlaywrightHub:
         # key_down is intentionally cross-event state.  It belongs to the
         # actor/context lease and is released before that context is closed.
         self._pressed_keys: dict[str, set[str]] = {}
+        self._pressed_key_owners: dict[str, int] = {}
+        # Serialize state checks together with Playwright keyboard/page actions.
+        # Each entry is retained until the last concurrent user exits so an
+        # operation can never hold a detached lock object.
+        self._session_guards: dict[str, dict[str, Any]] = {}
+        # Timeout retirement happens off the owning Playwright thread. Keep
+        # those page/context handles and held keys for closure on the owning
+        # thread instead of dropping evidence or touching Playwright cross-thread.
+        self._retired_sessions: list[dict[str, Any]] = []
+
+    def _retain_session_guard(self, session: str) -> dict[str, Any]:
+        with self._lock:
+            state = self._session_guards.get(session)
+            if state is None:
+                state = {"lock": threading.RLock(), "users": 0}
+                self._session_guards[session] = state
+            state["users"] = int(state.get("users") or 0) + 1
+            return state
+
+    def _drop_session_guard(self, session: str, state: dict[str, Any]) -> None:
+        with self._lock:
+            state["users"] = max(0, int(state.get("users") or 0) - 1)
+            if state["users"]:
+                return
+            if session in self._sessions or session in self._pressed_keys:
+                return
+            if self._session_guards.get(session) is state:
+                self._session_guards.pop(session, None)
+
+    @contextmanager
+    def _session_guard(self, session: str):
+        state = self._retain_session_guard(session)
+        lock = state["lock"]
+        lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+            self._drop_session_guard(session, state)
+
+    @staticmethod
+    def _held_keys(row: dict[str, Any]) -> set[str]:
+        return {str(key) for key in (row.get("_held_keys") or set()) if str(key)}
+
+    def _retire_rows_locked(self, rows: list[tuple[str, dict[str, Any] | None]]) -> None:
+        """Move invalidated sessions off the active table without losing cleanup.
+
+        This method never invokes Playwright and therefore may run on the timeout
+        coordinator. The owning Playwright thread releases retained keys while
+        closing the row in shutdown_thread().
+        """
+        for session, row in rows:
+            held = set(self._pressed_keys.pop(session, set()) or set())
+            owner = int(self._pressed_key_owners.pop(session, 0) or 0)
+            if not row and not held:
+                continue
+            retired = dict(row or {})
+            retired["_session_key"] = session
+            retired["_held_keys"] = held
+            retired["owner_thread"] = int(retired.get("owner_thread") or owner)
+            self._retired_sessions.append(retired)
 
     def _playwright(self):
         pw = getattr(self._local, "pw", None)
@@ -430,7 +499,7 @@ class PlaywrightHub:
             if credential and isinstance(exc, Exception):
                 raise RuntimeError("web_auth_restore_failed") from None
             raise
-        self._publish_session(
+        published = self._publish_session(
             key,
             {
                 "context": context,
@@ -447,6 +516,15 @@ class PlaywrightHub:
             },
             run_id=str(run_id or ""),
         )
+        if not published:
+            # The lane may expire while navigation/auth restoration is in flight.
+            # This result is not owned by any session, so close it on the thread
+            # that created it instead of returning a page that can never be found.
+            try:
+                context.close()
+            except Exception:
+                pass
+            raise RuntimeError("web_lane_expired")
         SLog.i(TAG, f"case context ready sn={key} resolution={resolution} url={url or 'about:blank'}")
         return page
 
@@ -463,18 +541,19 @@ class PlaywrightHub:
         self._bump_runs([str(run_id or "")])
 
     def retire_owner(self, owner: int) -> None:
-        """这条线程上打开的页面都作废。同一条 shard 上的其它 run 也不能再用它的 page。"""
+        """Invalidate every page generation opened by a timed-out worker."""
         ident = int(owner or 0)
         if not ident:
             return
         with self._lock:
             run_ids = []
+            rows: list[tuple[str, dict[str, Any] | None]] = []
             for key, row in list(self._sessions.items()):
                 if int(row.get("owner_thread") or 0) != ident:
                     continue
                 run_ids.append(str(row.get("run_id") or ""))
-                self._pressed_keys.pop(key, None)
-                self._sessions.pop(key, None)
+                rows.append((key, self._sessions.pop(key, None)))
+            self._retire_rows_locked(rows)
         self._bump_runs(run_ids)
 
     def _bump_runs(self, run_ids: list[str]) -> None:
@@ -483,13 +562,17 @@ class PlaywrightHub:
                 rid = str(rid or "")
                 self._run_tokens[rid] = int(self._run_tokens.get(rid, 0)) + 1
                 if not rid:
-                    self._sessions.clear()
-                    self._pressed_keys.clear()
+                    rows = [(key, self._sessions.pop(key, None))
+                            for key in list(self._sessions)]
+                    self._retire_rows_locked(rows)
+                    for key in list(self._pressed_keys):
+                        if key not in self._sessions:
+                            self._retire_rows_locked([(key, None)])
                     continue
-                for key in [k for k, row in self._sessions.items()
-                            if str(row.get("run_id") or "") == rid]:
-                    self._pressed_keys.pop(key, None)
-                    self._sessions.pop(key, None)
+                rows = [(key, self._sessions.pop(key, None))
+                        for key, row in list(self._sessions.items())
+                        if str(row.get("run_id") or "") == rid]
+                self._retire_rows_locked(rows)
 
     def release_this_lane(self) -> bool:
         """只关本线程启动的浏览器。别的线程上的页面不动。"""
@@ -504,30 +587,33 @@ class PlaywrightHub:
         with self._lock:
             return int(self._run_tokens.get(rid, 0)) == int(local_token)
 
-    def _replace_page(self, key: str, page: Any, *, run_id: str) -> None:
+    def _replace_page(self, key: str, page: Any, *, run_id: str) -> bool:
         if not self._lane_open(run_id):
-            return
+            SLog.w(TAG, f"丢弃过期 Tab 写入 sn={key}")
+            return False
         token = int(getattr(self._local, "lane_token", 0) or 0)
         with self._lock:
             row = self._sessions.get(key)
-            if not row:
-                return
-            if int(row.get("lane_token") or 0) != token:
-                return
+            if not row or int(row.get("lane_token") or 0) != token:
+                SLog.w(TAG, f"丢弃无主 Tab 写入 sn={key}")
+                return False
             row["page"] = page
             row["owner_thread"] = threading.get_ident()
+            return True
 
-    def _publish_session(self, key: str, row: dict[str, Any], *, run_id: str) -> None:
+    def _publish_session(self, key: str, row: dict[str, Any], *, run_id: str) -> bool:
         rid = str(run_id or "")
         if not self._lane_open(rid):
             SLog.w(TAG, f"丢弃过期页面写入 sn={key}")
-            return
+            return False
         row["owner_thread"] = threading.get_ident()
         row["lane_token"] = int(getattr(self._local, "lane_token", 0) or 0)
         with self._lock:
             if int(self._run_tokens.get(rid, 0)) != int(row["lane_token"]):
-                return
+                SLog.w(TAG, f"丢弃过期页面写入 sn={key}")
+                return False
             self._sessions[key] = row
+            return True
 
     def current_page(
         self,
@@ -563,17 +649,31 @@ class PlaywrightHub:
         """Press and retain one key for the actor/context lease."""
         actor_v, context_v, page_v = normalize_web_identity(actor, context_id, page_id)
         session = _session_key(sn, run_id, actor=actor_v, context_id=context_v, page_id=page_v)
-        with self._lock:
-            row = dict(self._sessions.get(session) or {})
-            held = set(self._pressed_keys.get(session) or set())
-        page = row.get("page")
-        if page is None:
-            raise RuntimeError("web_session_missing")
-        if key in held:
-            raise RuntimeError("web_key_already_down")
-        page.keyboard.down(key)
-        with self._lock:
-            self._pressed_keys.setdefault(session, set()).add(key)
+        with self._session_guard(session):
+            with self._lock:
+                row = dict(self._sessions.get(session) or {})
+                held = set(self._pressed_keys.get(session) or set())
+            page = row.get("page")
+            if page is None:
+                raise RuntimeError("web_session_missing")
+            if key in held:
+                raise RuntimeError("web_key_already_down")
+            # Record before the Playwright call so a timeout retirement racing a
+            # blocked key_down still knows which key must be released on cleanup.
+            with self._lock:
+                self._pressed_keys.setdefault(session, set()).add(key)
+                self._pressed_key_owners[session] = threading.get_ident()
+            try:
+                page.keyboard.down(key)
+            except BaseException:
+                with self._lock:
+                    values = self._pressed_keys.get(session)
+                    if values is not None:
+                        values.discard(key)
+                        if not values:
+                            self._pressed_keys.pop(session, None)
+                            self._pressed_key_owners.pop(session, None)
+                raise
 
     def keyboard_up(
         self,
@@ -588,21 +688,23 @@ class PlaywrightHub:
         """Release a key that this lease explicitly pressed."""
         actor_v, context_v, page_v = normalize_web_identity(actor, context_id, page_id)
         session = _session_key(sn, run_id, actor=actor_v, context_id=context_v, page_id=page_v)
-        with self._lock:
-            row = dict(self._sessions.get(session) or {})
-            held = set(self._pressed_keys.get(session) or set())
-        if key not in held:
-            raise RuntimeError("web_key_not_down")
-        page = row.get("page")
-        if page is None:
-            raise RuntimeError("web_session_missing")
-        page.keyboard.up(key)
-        with self._lock:
-            values = self._pressed_keys.get(session)
-            if values is not None:
-                values.discard(key)
-                if not values:
-                    self._pressed_keys.pop(session, None)
+        with self._session_guard(session):
+            with self._lock:
+                row = dict(self._sessions.get(session) or {})
+                held = set(self._pressed_keys.get(session) or set())
+            if key not in held:
+                raise RuntimeError("web_key_not_down")
+            page = row.get("page")
+            if page is None:
+                raise RuntimeError("web_session_missing")
+            page.keyboard.up(key)
+            with self._lock:
+                values = self._pressed_keys.get(session)
+                if values is not None:
+                    values.discard(key)
+                    if not values:
+                        self._pressed_keys.pop(session, None)
+                        self._pressed_key_owners.pop(session, None)
 
     def release_pressed_keys(
         self,
@@ -616,10 +718,21 @@ class PlaywrightHub:
         """Best-effort release for every key held by this actor/context lease."""
         actor_v, context_v, page_v = normalize_web_identity(actor, context_id, page_id)
         session = _session_key(sn, run_id, actor=actor_v, context_id=context_v, page_id=page_v)
-        with self._lock:
-            keys = set(self._pressed_keys.pop(session, set()) or set())
-            row = dict(self._sessions.get(session) or {})
-        return self._release_key_set(row.get("page"), keys)
+        with self._session_guard(session):
+            with self._lock:
+                keys = set(self._pressed_keys.get(session, set()) or set())
+                row = dict(self._sessions.get(session) or {})
+            failures = self._release_key_set(row.get("page"), keys)
+            released = keys - set(failures)
+            if released:
+                with self._lock:
+                    values = self._pressed_keys.get(session)
+                    if values is not None:
+                        values.difference_update(released)
+                        if not values:
+                            self._pressed_keys.pop(session, None)
+                            self._pressed_key_owners.pop(session, None)
+            return failures
 
     @staticmethod
     def _release_key_set(page: Any, keys: set[str]) -> list[str]:
@@ -629,7 +742,9 @@ class PlaywrightHub:
         for key in sorted(keys):
             try:
                 page.keyboard.up(key)
-            except Exception:
+            except Exception as exc:
+                if is_playwright_closed_exception(exc):
+                    continue
                 failures.append(key)
         return failures
 
@@ -803,46 +918,52 @@ class PlaywrightHub:
     ) -> Any:
         actor_v, context_v, page_v = normalize_web_identity(actor, context_id, page_id)
         key = _session_key(sn, run_id, actor=actor_v, context_id=context_v, page_id=page_v)
-        with self._lock:
-            row = self._sessions.get(key) or {}
-        ctx = row.get("context")
-        if ctx is None:
-            raise RuntimeError("无浏览器上下文")
-        pages = list(ctx.pages)
-        target = None
-        if tab_index is not None:
-            idx = int(tab_index)
-            if 0 <= idx < len(pages):
-                target = pages[idx]
-        needle_url = str(url_contains or "").strip()
-        needle_title = str(title_contains or "").strip()
-        if target is None and (needle_url or needle_title):
-            for pg in pages:
+        with self._session_guard(key):
+            with self._lock:
+                row = self._sessions.get(key) or {}
+            ctx = row.get("context")
+            if ctx is None:
+                raise RuntimeError("无浏览器上下文")
+            pages = list(ctx.pages)
+            target = None
+            if tab_index is not None:
+                idx = int(tab_index)
+                if 0 <= idx < len(pages):
+                    target = pages[idx]
+            needle_url = str(url_contains or "").strip()
+            needle_title = str(title_contains or "").strip()
+            if target is None and (needle_url or needle_title):
+                for pg in pages:
+                    try:
+                        if needle_url and needle_url not in str(pg.url or ""):
+                            continue
+                        if needle_title and needle_title not in str(pg.title() or ""):
+                            continue
+                        target = pg
+                        break
+                    except Exception:
+                        continue
+            if target is None:
+                raise RuntimeError("未找到目标 Tab")
+            # Keyboard state is page-scoped in Playwright. Keep the same
+            # session guard from release through publishing the new page.
+            self.release_pressed_keys(
+                sn, run_id=run_id, actor=actor_v, context_id=context_v, page_id=page_v
+            )
+            try:
+                target.bring_to_front()
+            except Exception:
+                pass
+            if not self._replace_page(key, target, run_id=str(run_id or "")):
                 try:
-                    if needle_url and needle_url not in str(pg.url or ""):
-                        continue
-                    if needle_title and needle_title not in str(pg.title() or ""):
-                        continue
-                    target = pg
-                    break
+                    ctx.close()
                 except Exception:
-                    continue
-        if target is None:
-            raise RuntimeError("未找到目标 Tab")
-        # Keyboard state is page-scoped in Playwright. Release it on the outgoing
-        # page before changing the active tab.
-        self.release_pressed_keys(
-            sn, run_id=run_id, actor=actor_v, context_id=context_v, page_id=page_v
-        )
-        try:
-            target.bring_to_front()
-        except Exception:
-            pass
-        self._replace_page(key, target, run_id=str(run_id or ""))
-        self.current_observability(
-            sn, run_id=run_id, actor=actor_v, context_id=context_v, page_id=page_v
-        )
-        return target
+                    pass
+                raise RuntimeError("web_lane_expired")
+            self.current_observability(
+                sn, run_id=run_id, actor=actor_v, context_id=context_v, page_id=page_v
+            )
+            return target
 
     def open_tab(
         self,
@@ -856,33 +977,39 @@ class PlaywrightHub:
     ) -> Any:
         actor_v, context_v, page_v = normalize_web_identity(actor, context_id, page_id)
         key = _session_key(sn, run_id, actor=actor_v, context_id=context_v, page_id=page_v)
-        with self._lock:
-            row = self._sessions.get(key) or {}
-        ctx = row.get("context")
-        if ctx is None:
-            raise RuntimeError("无浏览器上下文")
-        self.release_pressed_keys(
-            sn, run_id=run_id, actor=actor_v, context_id=context_v, page_id=page_v
-        )
-        raw_dest = str(url or "").strip()
-        dest = normalize_goto_url(raw_dest)
-        if raw_dest and not dest:
-            raise ValueError("web_uri_invalid")
-        page = ctx.new_page()
-        try:
-            if dest:
-                goto_url(page, dest)
-        except BaseException:
+        with self._session_guard(key):
+            with self._lock:
+                row = self._sessions.get(key) or {}
+            ctx = row.get("context")
+            if ctx is None:
+                raise RuntimeError("无浏览器上下文")
+            self.release_pressed_keys(
+                sn, run_id=run_id, actor=actor_v, context_id=context_v, page_id=page_v
+            )
+            raw_dest = str(url or "").strip()
+            dest = normalize_goto_url(raw_dest)
+            if raw_dest and not dest:
+                raise ValueError("web_uri_invalid")
+            page = ctx.new_page()
             try:
-                page.close()
-            except Exception:
-                pass
-            raise
-        self._replace_page(key, page, run_id=str(run_id or ""))
-        self.current_observability(
-            sn, run_id=run_id, actor=actor_v, context_id=context_v, page_id=page_v
-        )
-        return page
+                if dest:
+                    goto_url(page, dest)
+            except BaseException:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+                raise
+            if not self._replace_page(key, page, run_id=str(run_id or "")):
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+                raise RuntimeError("web_lane_expired")
+            self.current_observability(
+                sn, run_id=run_id, actor=actor_v, context_id=context_v, page_id=page_v
+            )
+            return page
 
     def a11y_text(
         self,
@@ -923,30 +1050,94 @@ class PlaywrightHub:
         out = [k for k in keys if k == bare or k.startswith(prefix)]
         return out
 
-    def _close_keys(self, keys: list[str]) -> bool:
-        with self._lock:
-            rows = [(key, self._sessions.pop(key, None)) for key in keys]
-        closed = True
-        for session, row in rows:
-            if not row:
-                with self._lock:
-                    self._pressed_keys.pop(session, None)
-                continue
-            page = row.get("page")
-            ctx = row.get("context")
-            obs = row.get("observability")
+    def _close_session_row(self, session: str, row: dict[str, Any] | None) -> bool:
+        if not row:
             with self._lock:
-                held = set(self._pressed_keys.pop(session, set()) or set())
-            self._release_key_set(page, held)
-            if obs is not None:
+                # A key set without a row is incomplete cleanup evidence; retain
+                # it so a later owner-thread shutdown can report it truthfully.
+                held = set(self._pressed_keys.get(session) or set())
+            return not held
+        page = row.get("page")
+        ctx = row.get("context")
+        obs = row.get("observability")
+        with self._lock:
+            held = set(self._pressed_keys.pop(session, set()) or set())
+            self._pressed_key_owners.pop(session, None)
+        failures = self._release_key_set(page, held)
+        closed = not failures
+        if obs is not None:
+            try:
                 obs.flush_summary()
-            for obj in (page, ctx):
+            except Exception as exc:
+                if not is_playwright_closed_exception(exc):
+                    closed = False
+        for obj in (page, ctx):
+            if obj is None:
+                continue
+            try:
+                obj.close()
+            except Exception as exc:
+                if not is_playwright_closed_exception(exc):
+                    closed = False
+        if not closed:
+            row["_session_key"] = session
+            row["_held_keys"] = failures
+            with self._lock:
+                self._retired_sessions.append(row)
+        return closed
+
+    def _close_keys(self, keys: list[str]) -> bool:
+        closed = True
+        for session in dict.fromkeys(keys):
+            with self._session_guard(session):
+                with self._lock:
+                    row = self._sessions.pop(session, None)
+                closed = self._close_session_row(session, row) and closed
+        return closed
+
+    def _close_retired_sessions(self, owner: int | None = None) -> bool:
+        with self._lock:
+            selected = []
+            retained = []
+            for row in self._retired_sessions:
+                if owner is not None and int(row.get("owner_thread") or 0) != int(owner):
+                    retained.append(row)
+                else:
+                    selected.append(row)
+            self._retired_sessions = retained
+        closed = True
+        for row in selected:
+            session = str(row.get("_session_key") or "")
+            held = self._held_keys(row)
+            failures = self._release_key_set(row.get("page"), held)
+            row_closed = not failures
+            obs = row.get("observability")
+            if obs is not None:
+                try:
+                    obs.flush_summary()
+                except Exception as exc:
+                    if not is_playwright_closed_exception(exc):
+                        row_closed = False
+            for obj in (row.get("page"), row.get("context")):
                 if obj is None:
                     continue
                 try:
                     obj.close()
-                except Exception:
-                    closed = False
+                except Exception as exc:
+                    if not is_playwright_closed_exception(exc):
+                        row_closed = False
+            if not row_closed:
+                # There is no usable page generation to retry through normal
+                # calls; retain the row for shutdown diagnostics until the
+                # browser process itself is confirmed closed.
+                row["_held_keys"] = failures
+                with self._lock:
+                    self._retired_sessions.append(row)
+            closed = row_closed and closed
+            if session:
+                with self._lock:
+                    self._pressed_keys.pop(session, None)
+                    self._pressed_key_owners.pop(session, None)
         return closed
 
     def close_case(
@@ -987,13 +1178,23 @@ class PlaywrightHub:
                 continue
             try:
                 browser.close()
+            except Exception as exc:
+                if not is_playwright_closed_exception(exc):
+                    # Retain the handle for final shutdown/review; losing it would
+                    # make a later cleanup falsely report that no browser remains.
+                    continue
+            try:
                 if not browser.is_connected():
                     browsers.pop(key, None)
                     modes.pop(key, None)
-            except Exception:
-                # Retain the handle for final shutdown/review; losing it would
-                # make a later cleanup falsely report that no browser remains.
-                pass
+            except Exception as exc:
+                if is_playwright_closed_exception(exc):
+                    browsers.pop(key, None)
+                    modes.pop(key, None)
+                else:
+                    # Retain ordinary failures for final shutdown/review; losing
+                    # the handle would hide a browser that is still alive.
+                    continue
 
     def release_run(self, run_id: str) -> bool:
         """任务 cancel / 结束：关闭该 run_id 下所有会话并返回关闭回执。"""
@@ -1007,11 +1208,15 @@ class PlaywrightHub:
 
     def shutdown_thread(self) -> bool:
         closed = True
+        owner = threading.get_ident()
         with self._lock:
             keys = [key for key, row in self._sessions.items()
-                    if int(row.get("owner_thread") or 0) == threading.get_ident()]
+                    if int(row.get("owner_thread") or 0) == owner]
         closed = self._close_keys(keys) and closed
+        closed = self._close_retired_sessions(owner) and closed
         browsers: dict = getattr(self._local, "browsers", None) or {}
+        pw = getattr(self._local, "pw", None)
+        had_resources = bool(browsers or pw is not None)
         remaining = {}
         for sn, browser in list(browsers.items()):
             try:
@@ -1020,20 +1225,35 @@ class PlaywrightHub:
                 if browser.is_connected():
                     remaining[sn] = browser
                     closed = False
-            except Exception:
-                remaining[sn] = browser
-                closed = False
+            except Exception as exc:
+                if not is_playwright_closed_exception(exc):
+                    remaining[sn] = browser
+                    closed = False
         self._local.browsers = remaining
         self._local.browser_headed = {key: value for key, value in
             (getattr(self._local, "browser_headed", None) or {}).items() if key in remaining}
-        pw = getattr(self._local, "pw", None)
+        playwright_closed = True
         if pw is not None:
             try:
                 pw.stop()
                 self._local.pw = None
-            except Exception:
-                closed = False
+            except Exception as exc:
+                if is_playwright_closed_exception(exc):
+                    self._local.pw = None
+                else:
+                    playwright_closed = False
+                    closed = False
             SLog.i(TAG, f"playwright stopped thread={threading.get_ident()}")
+        if had_resources and not remaining and playwright_closed:
+            # page/context/flush errors are progressive diagnostics. Once the
+            # owning browser and Playwright instance are confirmed gone, their
+            # retained rows no longer describe a live resource.
+            with self._lock:
+                self._retired_sessions = [
+                    row for row in self._retired_sessions
+                    if int(row.get("owner_thread") or 0) != int(owner)
+                ]
+            return True
         return closed
 
 

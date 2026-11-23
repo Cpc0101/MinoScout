@@ -181,7 +181,7 @@ Scout 重装保留 `scout_id` 和已有长期 token，先以 `pending_install_to
 `plugins` 可省略。省略表示这台 Scout 还不认识插件状态，网页显示「需更新后才能配置插件」。每项必有 `class` / `id` / `installed` / `configured`。非密钥明文放在 `values`（如 Gmail `inbox_address`），已写入本机私有凭据文件的字段名放在 `saved_secrets`。密钥值不上报。`class` 为 `cli` / `mcp` / `bot` / `mail`。`REGISTER` 使用同一份列表。
 
 
-`runtime_capabilities` 可省略。省略表示这台正在运行的进程没有上报输入契约，Nexus 不凭版本号猜测它是否支持当前焦点输入。列表只含执行器实际实现的组合：`id`、`executor`、`platform`、`contract_version`、`supported_combinations`（`target_mode` + `write_modes`）。`REGISTER` 与 `HEARTBEAT` 使用同一份列表；心跳带上它，重启后的新进程才会被当成支持新契约。
+`runtime_capabilities` 可省略。省略表示这台正在运行的进程没有上报输入契约，Nexus 不凭版本号猜测它是否支持当前焦点输入。列表只含执行器实际实现的组合；`REGISTER` 与 `HEARTBEAT` 使用同一份列表，心跳带上它，重启后的新进程才会被当成支持新契约。输入合同使用 `supported_combinations`（`target_mode` + `write_modes`）；Web 执行合同必须恰好有一条 `id=web.capabilities`、`executor=playwright`、`platform=web`、整数 `contract_version=1` 的记录。`features` 必须是至多 20 项的非空字符串列表，不得重复，且必须与协议中的完整 Web 能力集合精确相等（当前 17 项）；不能只声明请求所需子集。合同缺失、重复、格式畸形或字段不合法时返回 `web_runtime_capability_required`；能力集合不完整、含未知项或无法满足当前请求时返回 `web_runtime_capability_unsupported`。两者都在设备动作前以 `execution_started=no` 拒绝，不能靠 Scout 版本号猜测支持。
 
 `device_delta` 只报**变化**的设备；无变化时可省略。Nexus 据此更新连通性，并在下一次组装菜单时生效。权威设备状态以心跳为准；`EXECUTE node.device_*` 是即时通知。
 
@@ -1325,7 +1325,9 @@ Scout `app.network.expect_response` 在动作前注册期望，动作后等待�
 
 ## Web 交互执行契约
 
-Web 脚本能力清单固定为 `auth_snapshot`、`uri_direct`、`network_observation`、`browser_errors`、`page_clock`、`drag`、`keyboard_focus`、`key_down`、`key_up`、`clipboard`、`permissions`、`geolocation`、`locale_timezone`、`navigation`、`multi_actor`。`keyboard_focus` 负责输入焦点，`key_down` / `key_up` 显式按下和释放单个按键；退出或异常时必须释放按住状态。拖拽同样在结束或异常路径清理鼠标按键与中间状态。
+Web 脚本能力清单固定为 `auth_snapshot`、`uri_direct`、`network_observation`、`browser_errors`、`page_clock`、`drag`、`keyboard_focus`、`key_down`、`key_up`、`clipboard`、`permissions`、`geolocation`、`locale_timezone`、`navigation`、`multi_actor`、`javascript_execution`、`file_upload`。`keyboard_focus` 负责输入焦点，`key_down` / `key_up` 显式按下和释放单个按键；退出或异常时必须释放按住状态。拖拽同样在结束或异常路径清理鼠标按键与中间状态。
+
+`app.exec()` 进入 `exec_script` 前必须显式授予 `javascript_execution`；`open_tab` / `switch_tab` 需要 `navigation`，`upload_file` 需要 `file_upload`。这些入口与专用 Web API 相同，未授权时返回 `web_capability_not_granted`、`status=blocked`、`execution_started=no`，且不得调用渠道或设备。
 
 actor、browser context 和 page/tab 在一条用例内隔离，不得跨用例共享可变页面句柄。直接 URI 导航按应用 URL 解析，只允许相同 scheme/host/port 的 HTTP(S) 地址，可携带 query/hash；非同源返回 `web_uri_origin_mismatch`。首次业务导航可以直达脚本指定 URI，不要求先进入站点根目录。
 
@@ -1370,6 +1372,7 @@ actor、browser context 和 page/tab 在一条用例内隔离，不得跨用例�
     "cases_scanned": 0,
     "groups": 0,
     "stable_repeated_failures": 0,
+    "recurrent_failures": 0,
     "fail_then_pass": 0,
     "single_failures": 0,
     "incomparable_observations": 0,
@@ -1379,4 +1382,4 @@ actor、browser context 和 page/tab 在一条用例内隔离，不得跨用例�
 }
 ```
 
-失败组分类固定为 `stable_repeated_failure`、`fail_then_pass`、`single_failure`。文本签名前必须把 UUID、时间、request id 和端口等易变片段规范化；签名相同且可比的历史才归入同一组。比较兼容性至少核对 app、platform、environment baseline、env profile、env surface、tested build、execution mode、case identity 和 fixture digest。任一关键字段缺失或变化时，观测进入 `incomparable` 并附 `reason_codes`，不能推断为稳定失败或已恢复。
+失败组分类固定为 `stable_repeated_failure`、`recurrent_failure`、`fail_then_pass`、`single_failure`。`recurrent_failure` 表示同一签名先失败、出现过通过、随后再次失败；不能归为已恢复。文本签名前必须把失败阶段纳入规范化，并把 UUID、时间、request id、端口、带业务前缀的 ID 和路径中的稳定对象 ID 等易变片段规范化；HTTP 3 位状态码必须保留，`404` 与 `500` 不得合并。签名相同且可比的历史才归入同一组。比较兼容性至少核对 app、platform、environment baseline、env profile、env surface、tested build、execution mode、case identity 和 fixture digest。任一关键字段缺失或变化时，观测进入 `incomparable` 并附 `reason_codes`，不能推断为稳定失败或已恢复。

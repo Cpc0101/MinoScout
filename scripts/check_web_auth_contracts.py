@@ -68,7 +68,7 @@ def check():
     hub = playwright_hub.PlaywrightHub.__new__(playwright_hub.PlaywrightHub)
     hub.close_case = lambda *a, **k: calls.append("close_case")
     hub._browser = lambda *a, **k: Browser()
-    hub._publish_session = lambda *a, **k: calls.append("publish")
+    hub._publish_session = lambda *a, **k: calls.append("publish") or True
     uri = "https://example.test/orders/123#detail"
     assert hub.open_case("webfixture", run_id="fixture", base_url=uri, credential=credential) is page
     assert calls.index("new_context") < calls.index("new_page") < calls.index("Page.addScriptToEvaluateOnNewDocument") < calls.index("goto:" + uri)
@@ -88,8 +88,10 @@ def check():
 
     account = SimpleNamespace(slot="default", id="account-a", app_id="app-a", project_id="project-a",
         platform="web", target_package=base, username="fixture-user")
+    required_capabilities = []
     case = SimpleNamespace(_platform="web", app_id="app-a", _accounts_by_slot={"default": account},
                            _sn="webfixture", run_id="fixture", _latched_error=None)
+    case._require_web_capability = required_capabilities.append
     app = App.__new__(App)
     app._case, app._url, app._package, app._web_resolution = case, base, base, ""
     app._guard = lambda: None
@@ -149,6 +151,7 @@ def check():
         assert "credential" not in devices[-1][1]
         app.launch()
         assert devices[-1][1]["url"] == base  # Backward compatibility.
+        assert "uri_direct" in required_capabilities and "auth_snapshot" in required_capabilities
     finally:
         script.observe_control, playwright_hub.get_hub = old_observe, old_hub
 
@@ -165,6 +168,9 @@ def check():
     class ProbeCase:
         def __init__(self):
             self.rows, self._latched_error = [], None
+            self.web_capabilities = []
+        def _require_web_capability(self, capability):
+            self.web_capabilities.append(capability)
         def _assert(self, checker, status, **evidence):
             row = {"checker": checker, "status": status, **evidence}
             self.rows.append(row)
@@ -262,6 +268,7 @@ def check():
     app = ProbeApp([ActionResult(ok=True, status="pass", summary="focused", data={})])
     web_api._Expectation(app).focused("form.email")
     assert app._case.rows[-1]["status"] == "pass"
+    assert app._case.web_capabilities == ["keyboard_focus"]
     app = ProbeApp([ActionResult(ok=False, status="fail", summary="目标控件没有焦点", data={})])
     try:
         web_api._Expectation(app).focused("form.email")
@@ -273,6 +280,7 @@ def check():
 
     clock_app = App.__new__(App)
     clock_case = SimpleNamespace(_platform="web")
+    clock_case._require_web_capability = lambda capability: None
     clock_app._case, clock_app._url, clock_app._package, clock_app._platform = clock_case, base, base, "web"
     clock_app._web_resolution = ""
     clock_actions = []

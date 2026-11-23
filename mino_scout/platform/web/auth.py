@@ -83,6 +83,10 @@ def launch(app, uri, account, auth, identity_control, identity_field, ready_cont
     timeout_ms = _timeout(timeout_ms)
     if not isinstance(auth, str) or auth not in {"none", "required"}:
         raise _abort("auth 必须为 none/required", "web_auth_policy_invalid")
+    if uri:
+        app._case._require_web_capability("uri_direct")
+    if auth != "none":
+        app._case._require_web_capability("auth_snapshot")
     try:
         url = resolve_uri(app._url, uri) if uri else app._url
     except ValueError as exc:
@@ -163,6 +167,7 @@ def register_secrets(value):
 def save(app, account, identity_control, identity_field, ttl_seconds, timeout_ms):
     started = time.monotonic()
     app._guard()
+    app._case._require_web_capability("auth_snapshot")
     lease = _account(app, account)
     if type(ttl_seconds) is not int or not 60 <= ttl_seconds <= 604800:
         raise _abort("ttl_seconds 必须为 60–604800", "web_auth_ttl_invalid")

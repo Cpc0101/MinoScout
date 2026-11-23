@@ -31,6 +31,34 @@ _RUN_LOCK = threading.Lock()
 
 _WEB_PERMISSIONS = {"geolocation", "notifications", "clipboard-read", "clipboard-write"}
 
+_WEB_DEVICE_CAPABILITIES = {
+    "read_web_auth": "auth_snapshot",
+    "network_expect_register": "network_observation",
+    "network_expect_wait": "network_observation",
+    "network_expect_cancel": "network_observation",
+    "read_browser_errors": "browser_errors",
+    "read_web_environment": "locale_timezone",
+    "set_page_time": "page_clock",
+    "drag_control": "drag",
+    "focus_element": "keyboard_focus",
+    "check_focused": "keyboard_focus",
+    "read_focused": "keyboard_focus",
+    "key_down": "key_down",
+    "key_up": "key_up",
+    "set_clipboard": "clipboard",
+    "read_clipboard": "clipboard",
+    "assert_clipboard": "clipboard",
+    "set_web_permission": "permissions",
+    "set_geolocation": "geolocation",
+    "reload_page": "navigation",
+    "forward_page": "navigation",
+    "navigate_page": "navigation",
+    "open_tab": "navigation",
+    "switch_tab": "navigation",
+    "upload_file": "file_upload",
+    "exec_script": "javascript_execution",
+}
+
 
 def _normalize_web_options(value: dict[str, Any] | None) -> dict[str, Any]:
     """Validate the stable browser environment contract shared with Nexus."""
@@ -653,6 +681,7 @@ class Case:
         self.run_id = str(payload.run_id)
         self.session_id = str(payload.session_id)
         self._source_context = dict(getattr(payload, "source_context", {}) or {})
+        self._web_capabilities = frozenset(getattr(payload, "web_capabilities", ()) or ())
         self._sn = str(payload.sn)
         self._platform = str(payload.platform)
         self._hint = dict(getattr(payload, "device_hint", None) or {})
@@ -806,6 +835,17 @@ class Case:
         actor_v = context_v = page_v = ""
         options: dict[str, Any] = {}
         if ref.platform == "web":
+            if any(str(value or "").strip() for value in (actor, context_id, page_id)):
+                self._require_web_capability("multi_actor")
+            if isinstance(web_options, dict):
+                if web_options.get("permissions") not in (None, {}):
+                    self._require_web_capability("permissions")
+                if web_options.get("geolocation") is not None:
+                    self._require_web_capability("geolocation")
+                if any(str(web_options.get(key) or "").strip() for key in ("locale", "timezone_id", "region")):
+                    self._require_web_capability("locale_timezone")
+                if web_options.get("page_clock") is not None:
+                    self._require_web_capability("page_clock")
             try:
                 resolution = normalize_web_resolution(web_resolution)
             except ValueError as exc:
@@ -901,6 +941,25 @@ class Case:
         requests = getattr(self.core, "_requests", None)
         if requests is not None and self.run_id and requests.stopped(self.run_id):
             raise ScriptHalt("运行已取消", reason_code="cancelled")
+
+    def _require_web_capability(self, capability: str) -> None:
+        """Enforce the frozen per-run Web capability grant before any effect."""
+        if self._platform != "web" or capability in self._web_capabilities:
+            return
+        self._guard()
+        error = ScriptAbort(
+            f"当前用例未授权 Web 能力 {capability}",
+            reason_code="web_capability_not_granted",
+            status="blocked",
+            details={
+                "capability": capability,
+                "granted": sorted(self._web_capabilities),
+                "phase": "admission",
+                "execution_started": "no",
+            },
+        )
+        self._latched_error = self._latched_error or error
+        raise error
 
 
 def _shared(name: str) -> property:
@@ -1010,6 +1069,10 @@ class App:
         if uri or account is not None or auth != "none":
             if self._platform != "web":
                 raise ScriptAbort("URI 与认证预置仅支持 Web", reason_code="web_auth_platform_invalid", status="blocked")
+            if uri:
+                self._case._require_web_capability("uri_direct")
+            if auth != "none":
+                self._case._require_web_capability("auth_snapshot")
             from mino_scout.platform.web.auth import launch
             try:
                 return launch(self, uri, account, auth, identity_control, identity_field, ready_control, timeout_ms)
@@ -1025,6 +1088,7 @@ class App:
     def save_auth(self, account, *, identity_control: str, identity_field: str = "username",
                   ttl_seconds: int = 3600, timeout_ms: int = 20000) -> ActionResult:
         """Explicit preparation only: verify the leased identity, then save its snapshot."""
+        self._case._require_web_capability("auth_snapshot")
         from mino_scout.platform.web.auth import save
         return save(self, account, identity_control, identity_field, ttl_seconds, timeout_ms)
 
@@ -1180,6 +1244,7 @@ class App:
         """Focus one Web control through its published locator contract."""
         if self._platform != "web":
             raise ScriptAbort("焦点控件操作仅支持 Web", reason_code="web_capability_platform_invalid", status="blocked")
+        self._case._require_web_capability("keyboard_focus")
         return self._device("focus_element", self._locate(str(control or ""), "focus_element"))
 
     def drag_control(self, source: str, target: str, *, mode: str = "mouse",
@@ -1194,6 +1259,7 @@ class App:
             raise ScriptAbort("duration_ms 必须是 0..120000 的整数", reason_code="drag_invalid", status="blocked")
         if type(steps) is not int or not 0 <= steps <= 500:
             raise ScriptAbort("steps 必须是 0..500 的整数", reason_code="drag_invalid", status="blocked")
+        self._case._require_web_capability("drag")
         source_params = self._locate(str(source or ""), "drag_control")
         target_params = self._locate(str(target or ""), "drag_control")
         params: dict[str, Any] = {
@@ -1310,6 +1376,8 @@ class App:
         return self._device("switch_tab", {"tab_index": int(index)})
 
     def upload(self, path: str, control: str = "") -> ActionResult:
+        if self._platform == "web":
+            self._case._require_web_capability("file_upload")
         params = self._locate(str(control), "upload") if control else {}
         params["file_path"] = str(path or "")
         return self._device("upload_file", params)
@@ -1473,6 +1541,15 @@ class App:
             self._guard()
         else:
             self._case._active_identity = self._web_identity()
+        required = _WEB_DEVICE_CAPABILITIES.get(capability)
+        if self._platform == "web" and capability == "launch_app" and (params.get("credential") or params.get("fresh_context")):
+            required = "auth_snapshot"
+        if self._platform == "web" and capability == "press_key":
+            key = str(params.get("key") or "").strip().lower()
+            if params.get("browser_back", True) is not False and key in {"back", "browser_back"}:
+                required = "navigation"
+        if required:
+            self._case._require_web_capability(required)
         executor = self._require_channel()
         if not executor.supports(capability):
             raise ScriptAbort(f"{self._platform} 渠道不支持 {capability}", reason_code="declined")

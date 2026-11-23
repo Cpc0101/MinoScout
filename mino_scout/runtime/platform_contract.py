@@ -173,6 +173,8 @@ def native_request_platform(request: dict, *, node_id: str, host_system: str) ->
 
 def runtime_capabilities_contract(rows, *, system):
     """Validate nested declarations before they can influence routing or revision."""
+    from mino_scout.server_comm import protocol as P
+
     if not isinstance(rows, list) or len(rows) > 256:
         raise PlatformContractError("runtime_capabilities_invalid")
     seen = set()
@@ -214,6 +216,19 @@ def runtime_capabilities_contract(rows, *, system):
                 raise PlatformContractError("executor_platform_conflict")
             if executor in {"adb", "playwright", "ios_wda"} and p != {"adb": "android", "playwright": "web", "ios_wda": "ios"}[executor]:
                 raise PlatformContractError("executor_platform_conflict")
+        if cap == "web.capabilities":
+            features = row.get("features")
+            if (
+                type(row.get("contract_version")) is not int
+                or row["contract_version"] != 1
+                or not isinstance(features, list)
+                or len(features) > 20
+                or any(not isinstance(item, str) or not item for item in features)
+                or len(features) != len(set(features))
+                or set(features) != set(P.WEB_CAPABILITIES)
+            ):
+                raise PlatformContractError("web_capabilities_contract_invalid")
+            continue
         if cap != "input_text":
             continue
         if type(row.get("contract_version")) is not int or row["contract_version"] != 2:

@@ -290,12 +290,14 @@ WEB_CAPABILITIES = (
     "locale_timezone",
     "navigation",
     "multi_actor",
+    "javascript_execution",
+    "file_upload",
 )
 _WEB_CAPABILITY_SET = frozenset(WEB_CAPABILITIES)
 CASE_TAG_MAX_COUNT = 32
 CASE_TAG_MAX_LENGTH = 64
 CASE_TAG_SKIP_REASONS = frozenset({"tag_excluded", "tag_not_included"})
-FAILURE_CLASSIFICATIONS = frozenset({"stable_repeated_failure", "fail_then_pass", "single_failure"})
+FAILURE_CLASSIFICATIONS = frozenset({"stable_repeated_failure", "recurrent_failure", "fail_then_pass", "single_failure"})
 CASE_RESULT_HISTORY_MIN = 1
 CASE_RESULT_HISTORY_MAX = 100
 RECORD_API_VERSION = 1

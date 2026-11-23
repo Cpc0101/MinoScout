@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from mino_scout.server_comm.protocol import WEB_CAPABILITIES
+
 
 def runtime_input_capabilities() -> list[dict[str, Any]]:
     import platform
@@ -51,6 +53,13 @@ def runtime_input_capabilities() -> list[dict[str, Any]]:
         "contract_version": 1, "features": ["fixed_build", "status", "rollback"]})
     rows.append({"id": "node.source_read", "executor": "core", "platform_scope": "all", "platforms": [],
         "contract_version": 1, "features": ["csv", "xlsx", "sheets", "case_api", "complete_snapshot"]})
+    rows.append({
+        "id": "web.capabilities",
+        "executor": "playwright",
+        "platform": "web",
+        "contract_version": 1,
+        "features": list(WEB_CAPABILITIES),
+    })
     from mino_scout.tools.update.app_version import process_build_identity
     for row in rows:
         row["build"] = process_build_identity()

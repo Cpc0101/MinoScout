@@ -355,6 +355,7 @@ class _Expectation:
 
     def focused(self, control: str):
         _require_web(self.app)
+        self.app._case._require_web_capability("keyboard_focus")
         params = self.app._locate(str(control or ""), "check_focused")
         result = self.app._device("check_focused", params, allow_failed=True)
         actual = dict(result.data or {})

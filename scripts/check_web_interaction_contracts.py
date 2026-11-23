@@ -15,6 +15,8 @@ from mino_scout.platform.web.playwright_observability import validate_context_op
 from mino_scout.platform.web.web_keyboard import normalize_key, normalize_key_value
 from mino_scout.platform.web.web_url import parse_http_url, resolve_uri
 from mino_scout.runtime import script_exec
+from mino_scout.runtime.input_contract import runtime_input_capabilities
+from mino_scout.runtime.platform_contract import runtime_capabilities_contract
 from mino_scout.schemas import EventStatus, PlanEvent
 
 
@@ -148,6 +150,196 @@ def check_keyboard_cleanup() -> None:
             pass
         else:
             raise AssertionError(f"non-single key accepted: {invalid}")
+
+
+def check_keyboard_serialization() -> None:
+    import threading
+
+    common = dict(sn="webfixture", run_id="fixture-run", actor="alice", context_id="shared", page_id="main")
+    key = playwright_hub._session_key(**common)
+    down_entered = threading.Event()
+    allow_down = threading.Event()
+    up_entered = threading.Event()
+    calls: list[str] = []
+
+    class Keyboard:
+        def down(self, name):
+            calls.append(f"down:{name}")
+            down_entered.set()
+            assert allow_down.wait(2)
+
+        def up(self, name):
+            calls.append(f"up:{name}")
+            up_entered.set()
+
+    class Page:
+        keyboard = Keyboard()
+
+    hub = playwright_hub.PlaywrightHub.__new__(playwright_hub.PlaywrightHub)
+    hub._lock = threading.Lock()
+    hub._run_tokens = {"fixture-run": 0}
+    hub._pressed_keys = {}
+    hub._pressed_key_owners = {}
+    hub._session_guards = {}
+    hub._retired_sessions = []
+    hub._local = SimpleNamespace(lane_run="fixture-run", lane_token=0)
+    page = Page()
+    hub._sessions = {key: {"page": page, "context": SimpleNamespace(), "run_id": "fixture-run",
+                            "lane_token": 0, "owner_thread": threading.get_ident()}}
+
+    down_thread = threading.Thread(target=hub.keyboard_down, kwargs={"key": "Shift", **common})
+    up_thread = threading.Thread(target=hub.keyboard_up, kwargs={"key": "Shift", **common})
+    down_thread.start()
+    assert down_entered.wait(2)
+    up_thread.start()
+    if up_entered.wait(0.05):
+        raise AssertionError("key_up interleaved with an in-flight key_down")
+    allow_down.set()
+    down_thread.join(2)
+    up_thread.join(2)
+    assert not down_thread.is_alive() and not up_thread.is_alive()
+    assert calls == ["down:Shift", "up:Shift"]
+    assert hub._pressed_keys == {}
+
+    def fail_up(name):
+        raise RuntimeError("up failed")
+
+    hub._sessions[key]["page"] = SimpleNamespace(keyboard=SimpleNamespace(up=fail_up))
+    hub._pressed_keys[key] = {"Control"}
+    assert hub.release_pressed_keys(**common) == ["Control"]
+    assert hub._pressed_keys[key] == {"Control"}
+
+
+def check_web_capability_admission() -> None:
+    case = script_exec.Case.__new__(script_exec.Case)
+    case._platform = "web"
+    case._web_capabilities = frozenset()
+    case._latched_error = None
+    case._recorder = None
+    case.core = SimpleNamespace()
+    case.run_id = "fixture-run"
+    case.stop = None
+    case.deadline = 0
+    try:
+        case._require_web_capability("drag")
+    except script_exec.ScriptAbort as exc:
+        assert exc.reason_code == "web_capability_not_granted"
+        assert exc.status == "blocked"
+        assert exc.details == {
+            "capability": "drag",
+            "granted": [],
+            "phase": "admission",
+            "execution_started": "no",
+        }
+    else:
+        raise AssertionError("unlisted Web capability was admitted")
+    assert case._latched_error is not None
+
+    case._web_capabilities = frozenset({"drag"})
+    case._require_web_capability("drag")
+    case._platform = "android"
+    case._require_web_capability("clipboard")
+
+
+def check_web_runtime_contract() -> None:
+    from mino_scout.runtime.platform_contract import PlatformContractError
+    from mino_scout.server_comm.protocol import WEB_CAPABILITIES
+
+    rows = runtime_input_capabilities()
+    web_rows = [
+        row for row in rows
+        if row.get("id") == "web.capabilities"
+        and row.get("executor") == "playwright"
+        and row.get("platform") == "web"
+        and row.get("contract_version") == 1
+    ]
+    assert len(web_rows) == 1
+    assert set(web_rows[0]["features"]) == set(WEB_CAPABILITIES)
+    assert {"javascript_execution", "file_upload"} <= set(web_rows[0]["features"])
+    runtime_capabilities_contract(rows, system="mac")
+
+    full_web = dict(web_rows[0])
+    malformed_features = (
+        [],
+        list(WEB_CAPABILITIES)[:-1],
+        list(WEB_CAPABILITIES)[:-1] + ["unknown_capability"],
+        tuple(WEB_CAPABILITIES),
+        list(WEB_CAPABILITIES)[:-1] + [""],
+        list(WEB_CAPABILITIES)[:-1] + ["navigation"],
+        list(WEB_CAPABILITIES) + ["unknown_capability"] * 4,
+    )
+    for features in malformed_features:
+        row = {**full_web, "features": features}
+        try:
+            runtime_capabilities_contract([row], system="mac")
+        except PlatformContractError as exc:
+            assert exc.code == "web_capabilities_contract_invalid", (features, str(exc))
+        else:
+            raise AssertionError(f"malformed Web feature contract accepted: {features!r}")
+
+    for version in (None, 0, 2, "1"):
+        row = {**full_web, "contract_version": version}
+        try:
+            runtime_capabilities_contract([row], system="mac")
+        except PlatformContractError as exc:
+            assert exc.code == "web_capabilities_contract_invalid", (version, str(exc))
+        else:
+            raise AssertionError(f"invalid Web contract version accepted: {version!r}")
+
+    try:
+        runtime_capabilities_contract([full_web, dict(full_web)], system="mac")
+    except PlatformContractError as exc:
+        assert exc.code == "runtime_capability_duplicate"
+    else:
+        raise AssertionError("duplicate Web capability contract rows accepted")
+
+    expected = (
+        ("exec", lambda app: app.exec("return 1"), "javascript_execution"),
+        ("focus", lambda app: app.focus("login.submit"), "keyboard_focus"),
+        ("drag_control", lambda app: app.drag_control("login.email", "login.submit"), "drag"),
+        ("open_tab", lambda app: app.open_tab("https://example.test/secondary"), "navigation"),
+        ("switch_tab", lambda app: app.switch_tab(1), "navigation"),
+        ("upload", lambda app: app.upload("/tmp/fixture.txt"), "file_upload"),
+        ("upload_control", lambda app: app.upload("/tmp/fixture.txt", control="login.avatar"), "file_upload"),
+        ("expect_focused", lambda app: app.expect.focused("login.submit"), "keyboard_focus"),
+        ("clipboard_set", lambda app: app.clipboard.set("fixture"), "clipboard"),
+    )
+    for name, invoke, capability in expected:
+        class DeniedCase:
+            def _require_web_capability(self, requested):
+                assert requested == capability
+                raise script_exec.ScriptAbort(
+                    "denied",
+                    reason_code="web_capability_not_granted",
+                    status="blocked",
+                    details={
+                        "capability": requested,
+                        "granted": [],
+                        "phase": "admission",
+                        "execution_started": "no",
+                    },
+                )
+
+        app = script_exec.App.__new__(script_exec.App)
+        app._case = DeniedCase()
+        app._platform = "web"
+        app._url = "https://example.test/app/"
+        app._guard = lambda: None
+        app._locate = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError(f"{name} reached the locator before capability admission")
+        )
+        app._require_channel = lambda: (_ for _ in ()).throw(
+            AssertionError(f"{name} reached the device channel before capability admission")
+        )
+        try:
+            invoke(app)
+        except script_exec.ScriptAbort as exc:
+            assert exc.status == "blocked"
+            assert exc.reason_code == "web_capability_not_granted"
+            assert exc.details["capability"] == capability
+            assert exc.details["execution_started"] == "no"
+        else:
+            raise AssertionError(f"{name} bypassed Web capability admission")
 
 
 def check_url_and_forward() -> None:
@@ -323,6 +515,8 @@ def check_actor_tab_isolation() -> None:
     hub._lock = threading.Lock()
     hub._run_tokens = {"fixture-run": 0}
     hub._pressed_keys = {}
+    hub._session_guards = {}
+    hub._retired_sessions = []
     hub._local = SimpleNamespace(lane_run="fixture-run", lane_token=0)
     hub._sessions = {
         main_key: {"context": Context([a1, a2]), "page": a1, "run_id": "fixture-run", "lane_token": 0},
@@ -344,10 +538,13 @@ def check_actor_tab_isolation() -> None:
 def check() -> None:
     check_drag_release()
     check_keyboard_cleanup()
+    check_keyboard_serialization()
+    check_web_capability_admission()
+    check_web_runtime_contract()
     check_url_and_forward()
     check_clipboard_and_permission()
     check_actor_tab_isolation()
-    print("PASS: Web drag/keyboard cleanup, strict URL/forward, permission blocking, clipboard and actor/tab isolation")
+    print("PASS: Web cleanup/serialization, capability/runtime admission, strict URL/forward, permission blocking, clipboard and actor/tab isolation")
 
 
 if __name__ == "__main__":
