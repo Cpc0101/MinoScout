@@ -334,6 +334,21 @@ def _run_locked(core, payload, root: Path, *, deadline: float, stop) -> dict[str
                     {"debug_origin": origin, "debug_origin_matched": matched})
             if not matched:
                 raise ScriptAbort("正式源码与已验证调试版本不一致", reason_code="debug_version_mismatch", status="blocked")
+        from mino_scout.runtime.account_literals import find_account_literals
+        try:
+            source_text = (root / str(payload.script_path)).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            source_text = ""
+        hits = find_account_literals(source_text) if source_text else []
+        if hits:
+            line, kind = hits[0]
+            label = {"email": "邮箱", "phone": "手机号", "password": "密码"}.get(kind, kind)
+            raise ScriptAbort(
+                f"脚本第 {line} 行硬编码了{label}，账号只能通过 case.nexus.account(...) 从 Nexus 号池租用；"
+                "页面文案断言需保留字面量时在该行写 # account-literal-ok: 原因",
+                reason_code="hardcoded_account_literal", status="blocked",
+                details={"execution_started": "no", "phase": "admission", "line": line, "kind": kind},
+            )
         if str(payload.platform) == "web":
             from mino_scout.platform.web.playwright_hub import get_hub
             get_hub().note_lane(str(payload.run_id or ""))

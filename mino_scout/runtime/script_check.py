@@ -49,7 +49,8 @@ def check_repo(root: Path, *, require_cases: bool = False) -> list[Hint]:
         if _SKIP_DIRS.intersection(rel.parts):
             continue
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source)
         except SyntaxError as exc:
             hints.append(Hint(str(rel), int(exc.lineno or 1), "syntax", exc.msg))
             continue
@@ -61,6 +62,11 @@ def check_repo(root: Path, *, require_cases: bool = False) -> list[Hint]:
             hints.append(Hint(str(rel), line, code, text))
         if "tests" in rel.parts:
             hints.extend(_prep_required(tree, str(rel)))
+            from mino_scout.runtime.account_literals import find_account_literals
+            for line, kind in find_account_literals(source):
+                hints.append(Hint(str(rel), line, "hardcoded_account",
+                    f"Do not hardcode {kind}: rent the account via case.nexus.account(...) and read fields from it; "
+                    "add `# account-literal-ok: <reason>` only when the text is page copy under assertion"))
         for key, line in _config_uses(tree):
             used.setdefault(key, (str(rel), line))
     if keys is not None:
