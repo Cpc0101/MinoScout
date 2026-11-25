@@ -9,7 +9,10 @@ import base64
 import json
 import os
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as _futures_wait
 import urllib.error
 import urllib.request
 from typing import Any
@@ -232,7 +235,22 @@ class WdaClient:
 _CLIENTS: dict[str, WdaClient] = {}
 _LINKS: dict[str, dict[str, Any]] = {}
 _TUNNEL_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-_TUNNEL_TTL_SEC = 20.0
+# udid -> (下次可重试的 monotonic 时刻, 上次退避秒数)
+_TUNNEL_FAILURES: dict[str, tuple[float, float]] = {}
+_TUNNEL_TTL_SEC = 60.0
+# 单台 `device info details` 实测 5–20s（隧道未建立时更久）。串行探测三台就能
+# 吃掉 30s+，所以这里做有界并发 + 短超时 + 失败退避，绝不让探测无限拖长。
+_DETAIL_TIMEOUT_SEC = 8.0
+_DETAIL_TOTAL_BUDGET_SEC = 12.0
+_DETAIL_CONCURRENCY = 4
+_DETAIL_BACKOFF_INITIAL_SEC = 60.0
+_DETAIL_BACKOFF_MAX_SEC = 600.0
+
+_DEVICE_LIST_TIMEOUT_SEC = 10.0
+_DEVICE_LIST_STALE_TTL_SEC = 300.0
+_DEVICE_LIST_LOCK = threading.Lock()
+_DEVICE_LIST_SNAPSHOT: list[dict[str, Any]] = []
+_DEVICE_LIST_SNAPSHOT_AT = 0.0
 
 
 def client_for(udid: str) -> WdaClient:
@@ -276,13 +294,17 @@ def list_attached_devices() -> list[dict[str, Any]]:
     的条目只是历史配对残留，会上报成假在线、下发必挂。
     """
     rows = _devicectl_devices()
-    out: list[dict[str, Any]] = []
+    items: list[dict[str, Any]] = []
     for row in rows:
         item = _row_to_link(row)
         if not item:
             continue
-        if item.get("state") == "connected":
-            item = _enrich_tunnel(item)
+        items.append(item)
+    enriched = _enrich_tunnels([item for item in items if item.get("state") == "connected"])
+    by_udid = {str(item.get("udid") or ""): item for item in enriched}
+    out: list[dict[str, Any]] = []
+    for item in items:
+        item = by_udid.get(str(item.get("udid") or ""), item)
         out.append(item)
         _LINKS[str(item["udid"])] = item
         hw = str(item.get("hardware_udid") or "").strip()
@@ -291,11 +313,47 @@ def list_attached_devices() -> list[dict[str, Any]]:
     return out
 
 
-def _enrich_tunnel(link: dict[str, Any]) -> dict[str, Any]:
+def _enrich_tunnels(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """并行补齐隧道信息，总耗时封顶在 ``_DETAIL_TOTAL_BUDGET_SEC``。"""
+    if not items:
+        return []
+    out = list(items)
+    loop_now = time.monotonic()
+    deadline = loop_now + _DETAIL_TOTAL_BUDGET_SEC
+    pool = ThreadPoolExecutor(
+        max_workers=min(_DETAIL_CONCURRENCY, len(items)),
+        thread_name_prefix="ios-details",
+    )
+    try:
+        futures = {pool.submit(_enrich_tunnel, item, deadline): idx for idx, item in enumerate(items)}
+        done, pending = _futures_wait(futures, timeout=max(0.0, deadline - time.monotonic()))
+        for fut in done:
+            idx = futures[fut]
+            try:
+                out[idx] = fut.result()
+            except Exception as exc:
+                SLog.w(TAG, f"details 并行探测异常: {type(exc).__name__}: {exc}")
+        for fut in pending:
+            fut.cancel()
+    finally:
+        # 不等待仍卡在 devicectl 里的线程；它们返回的结果只丢给缓存，不能阻塞心跳。
+        pool.shutdown(wait=False, cancel_futures=True)
+    return out
+
+
+def _note_detail_failure(udid: str, detail: Any) -> None:
+    prev_at, prev_backoff = _TUNNEL_FAILURES.get(udid, (0.0, 0.0))
+    backoff = min(_DETAIL_BACKOFF_MAX_SEC, max(_DETAIL_BACKOFF_INITIAL_SEC, prev_backoff * 2))
+    _TUNNEL_FAILURES[udid] = (time.monotonic() + backoff, backoff)
+    SLog.w(TAG, f"details {udid} 失败: {detail}; {backoff:.0f}s 内不再探测")
+
+
+def _enrich_tunnel(link: dict[str, Any], deadline: float | None = None) -> dict[str, Any]:
     """``list devices`` often omits tunnelIP until the CoreDevice tunnel is up.
 
     Pull ``device info details`` for connected phones so LAN WDA can use
-    ``http://[tunnelIP]:8100`` without usbmux.
+    ``http://[tunnelIP]:8100`` without usbmux. 失败按 udid 指数退避，避免每次
+    心跳都对同一台不可达的手机重跑 8s 超时。
     """
     if str(link.get("tunnel_ip") or "").strip():
         return link
@@ -308,32 +366,43 @@ def _enrich_tunnel(link: dict[str, Any]) -> dict[str, Any]:
         merged = dict(link)
         merged.update(cached[1])
         return merged
+    retry_at = _TUNNEL_FAILURES.get(udid, (0.0, 0.0))[0]
+    if now < retry_at:
+        return link
+    if deadline is None:
+        deadline = now + _DETAIL_TIMEOUT_SEC
+    timeout = min(_DETAIL_TIMEOUT_SEC, max(0.5, deadline - now))
     try:
         proc = subprocess.run(
             ["xcrun", "devicectl", "device", "info", "details", "--device", udid, "--json-output", "-"],
-            capture_output=True, text=True, timeout=12,
+            capture_output=True, text=True, timeout=timeout,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
-        SLog.w(TAG, f"details {udid} 失败: {exc}")
+        _note_detail_failure(udid, exc)
         return link
     if proc.returncode != 0:
+        _note_detail_failure(udid, f"退出 {proc.returncode}")
         return link
     try:
         payload = json.loads(proc.stdout[proc.stdout.find("{"):] if proc.stdout else "{}")
     except json.JSONDecodeError:
+        _note_detail_failure(udid, "输出不是 JSON")
         return link
     result = payload.get("result") if isinstance(payload, dict) else {}
     if not isinstance(result, dict):
+        _note_detail_failure(udid, "缺少 result")
         return link
     # details result *is* the device object
     enriched = _row_to_link(result)
     if not enriched:
+        _note_detail_failure(udid, "details 结果无 identifier")
         return link
     patch = {
         key: enriched[key]
         for key in ("tunnel_ip", "tunnel_state", "transport", "hardware_udid", "hostnames", "os_version")
         if enriched.get(key)
     }
+    _TUNNEL_FAILURES.pop(udid, None)
     _TUNNEL_CACHE[udid] = (now, patch)
     merged = dict(link)
     merged.update(patch)
@@ -409,24 +478,40 @@ def _device_state(conn: dict[str, Any]) -> str:
 
 
 def _devicectl_devices() -> list[dict[str, Any]]:
+    global _DEVICE_LIST_SNAPSHOT, _DEVICE_LIST_SNAPSHOT_AT
+    failure = ""
     try:
         proc = subprocess.run(
             ["xcrun", "devicectl", "list", "devices", "--json-output", "-"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=_DEVICE_LIST_TIMEOUT_SEC,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
-        SLog.w(TAG, f"devicectl list devices 失败: {exc}")
-        return []
-    if proc.returncode != 0:
-        SLog.w(TAG, f"devicectl list devices 退出 {proc.returncode}")
-        return []
-    try:
-        payload = json.loads(proc.stdout or "{}")
-    except json.JSONDecodeError:
-        return []
-    result = payload.get("result") if isinstance(payload, dict) else {}
-    rows = result.get("devices") if isinstance(result, dict) else []
-    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+        failure = str(exc)
+    else:
+        if proc.returncode != 0:
+            failure = f"退出 {proc.returncode}"
+        else:
+            payload = _parse_devicectl(proc.stdout)
+            result = payload.get("result") if isinstance(payload, dict) else {}
+            rows = result.get("devices") if isinstance(result, dict) else None
+            if not isinstance(rows, list):
+                failure = "输出缺少 devices"
+            else:
+                rows = [row for row in rows if isinstance(row, dict)]
+                with _DEVICE_LIST_LOCK:
+                    _DEVICE_LIST_SNAPSHOT = list(rows)
+                    _DEVICE_LIST_SNAPSHOT_AT = time.monotonic()
+                return rows
+    SLog.w(TAG, f"devicectl list devices 失败: {failure}")
+    with _DEVICE_LIST_LOCK:
+        snapshot = list(_DEVICE_LIST_SNAPSHOT)
+        age = time.monotonic() - _DEVICE_LIST_SNAPSHOT_AT
+    # 一次 `list devices` 抖动不能把整张 iOS 设备表清空：那会让 Nexus 把正在
+    # 跑任务的手机标成 disconnected。只有真的列出空表才算设备都拔了。
+    if snapshot and age < _DEVICE_LIST_STALE_TTL_SEC:
+        SLog.w(TAG, f"复用 {age:.0f}s 前的 iOS 设备表（{len(snapshot)} 台），保留设备状态")
+        return snapshot
+    return []
 
 
 def device_online(udid: str) -> tuple[bool, str]:

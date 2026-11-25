@@ -33,8 +33,17 @@ TAG = "NodeTransport"
 
 _BACKOFF_START = 1.0
 _BACKOFF_MAX = 30.0
+# 定时全量重发设备表：心跳只带增量，一旦某条增量帧在 Nexus 侧丢失/部分应用，
+# 设备表会一直停在旧状态。定期把「当前设备 + 已消失设备的墓碑」整体重发一次，
+# 让 Nexus 自愈，而不需要重连。
+_DEVICE_FULL_SYNC_MIN_SEC = 300.0
+_DEVICE_TOMBSTONE_MAX = 64
 # 单帧上限（协议 §1）。超了要降质重发而不是分片 —— 这里只负责拦住并报错。
 _MAX_FRAME_BYTES = 32 * 1024 * 1024
+
+
+class _HeartbeatSendTimeout(asyncio.TimeoutError):
+    """心跳发不出去且连接已被主动断开：必须重连，不能带着半开连接继续跑。"""
 
 
 def _now_iso() -> str:
@@ -136,6 +145,30 @@ class NodeTransport:
         self._intentional_stop = False
         self._seen_register = False
         self._last_devices: dict[str, P.DeviceManifest] = {}
+        # 设备发现是阻塞 IO（adb / devicectl 单台最慢可到 20s+）。它绝不能跑在
+        # 心跳路径上：心跳只带上一轮缓存，发现放独立单线程后台任务，超时就放弃
+        # 本轮结果。单线程 + 任务去重保证卡住的探针不会越堆越多。
+        self._device_refresh_task: Optional[asyncio.Task] = None
+        self._device_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scout-device-probe")
+        # run_in_executor 的超时只放弃等待，不会打断仍卡在 adb/devicectl 里的线程。
+        # 单独标记「底层探针仍在跑」，否则每次心跳都会再排一个任务，队列越积越长。
+        self._device_probe_inflight = False
+        # 探针开始时刻与代次：卡死看门狗换池后，旧探针的完成回调不能清新探针的状态。
+        self._device_probe_started_at = 0.0
+        self._device_probe_token = 0
+        # 还没确认送达的设备变化。心跳发送成功后清空，失败就留到下一拍重发。
+        self._pending_device_delta: list[P.DeviceManifest] = []
+        self._delta_generation = 0
+        self._pending_delta_is_full = False
+        # 消失的设备保留成 disconnected 墓碑，全量同步时一起发，Nexus 才能把它
+        # 标成离线而不是一直显示 connected。
+        self._device_tombstones: dict[str, P.DeviceManifest] = {}
+        self._next_full_sync_at = 0.0
+        # 心跳与后台重探都可能发设备状态；串行化发送，避免较早的快照晚到后
+        # 把 Nexus 的设备表覆盖回旧状态。
+        self._heartbeat_send_lock = asyncio.Lock()
+        # 收据重传是网络请求，不能占着心跳节拍。
+        self._record_sync_task: Optional[asyncio.Task] = None
         # msg_id -> 等待应答的 future
         self._waiters: dict[str, asyncio.Future] = {}
         # 在途的请求处理任务。必须持强引用，否则会被 GC（见 _on_frame）
@@ -229,7 +262,10 @@ class NodeTransport:
                 self.core.shutdown()
             except Exception as exc:
                 SLog.w(TAG, f"playwright 退出清理: {exc}")
+            await self._cancel_device_refresh()
+            await self._cancel_record_sync()
             self._execution_pool.shutdown(wait=False)
+            self._device_pool.shutdown(wait=False)
             guard.release(HOLDER_NEXUS)
 
     def _keep_power(self) -> None:
@@ -260,6 +296,17 @@ class NodeTransport:
             await ws.close()
         except Exception:
             pass
+
+    @staticmethod
+    def _abort_transport(ws: Any) -> None:
+        """websockets 的 close() 卡住时直接掐 TCP；recv 才会立刻醒来去重连。"""
+        transport = getattr(ws, "transport", None)
+        abort = getattr(transport, "abort", None)
+        if callable(abort):
+            try:
+                abort()
+            except Exception:
+                pass
 
     async def _connect_once(self) -> None:
         import ssl
@@ -315,6 +362,8 @@ class NodeTransport:
                     records.connection(False)
                 self.core.binding_guard.set_connection("")
                 self._connection("disconnected")
+                await self._cancel_device_refresh()
+                await self._cancel_record_sync()
 
     async def _recv_loop(self, ws: Any) -> None:
         async for raw in ws:
@@ -448,6 +497,15 @@ class NodeTransport:
             await self._emit_device_delta(self._last_devices, devices)
         self._seen_register = True
         self._last_devices = {d.sn: d for d in devices}
+        # REGISTER 已带完整设备表；作废旧连接上未送达的增量，避免重连后把
+        # 注册快照又覆盖回旧状态。
+        self._delta_generation += 1
+        self._pending_device_delta = []
+        self._pending_delta_is_full = False
+        self._device_tombstones.clear()
+        self._next_full_sync_at = time.monotonic() + max(
+            _DEVICE_FULL_SYNC_MIN_SEC, 20.0 * float(self.heartbeat_sec),
+        )
 
     async def _emit_device_delta(
         self, prev: dict[str, P.DeviceManifest], now: list[P.DeviceManifest],
@@ -522,63 +580,314 @@ class NodeTransport:
         await self._send_framework("node.shutting_down", detail=f"active_runs={runs}")
 
     async def _heartbeat_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        next_at = loop.time() + float(self.heartbeat_sec)
         while not self._stop.is_set():
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=self.heartbeat_sec)
+                await asyncio.wait_for(self._stop.wait(), timeout=max(0.0, next_at - loop.time()))
                 return
             except asyncio.TimeoutError:
                 pass
+            started = loop.time()
             try:
                 await self._tick_heartbeat()
+            except _HeartbeatSendTimeout:
+                # 发送通道已经停滞，继续每拍重试只会把节点拖着不发心跳；
+                # 交给连接循环重建 WebSocket。
+                raise
             except Exception as exc:
                 # 单次失败不能停掉整轮心跳，否则只会剩 REGISTER 后的瘦心跳，
                 # Hub 上的 CPU/内存采样永远写不进去。
                 SLog.w(TAG, f"心跳发送失败: {exc}")
+            # 固定节拍而非「上一轮结束后再等 15s」：单轮慢一点不会把周期越拖越长。
+            period = max(1.0, float(self.heartbeat_sec))
+            next_at = started + period
+            if next_at <= loop.time():
+                next_at = loop.time() + period
 
     async def _tick_heartbeat(self) -> None:
-        """心跳时重探 adb / 本机设备，把热插拔放进 device_delta。"""
+        """先发缓存心跳，再后台重探设备。
+
+        设备发现（`adb devices` / `xcrun devicectl`）是同步阻塞调用，单次可达
+        20s+，曾经直接跑在这里，导致心跳间隔超过 Nexus 的存活窗口、节点被判离线。
+        现在心跳只发上一轮缓存，发现结果回来后再补一条带 device_delta 的心跳。
+        """
 
         def _reexec_if_stale() -> bool:
             from mino_scout.tools.update.stale_process import ensure_process_matches_app_layer
 
             return ensure_process_matches_app_layer(log_tag=TAG)
 
-        if await asyncio.to_thread(_reexec_if_stale):
+        try:
+            restarting = await asyncio.wait_for(asyncio.to_thread(_reexec_if_stale), timeout=5.0)
+        except asyncio.TimeoutError:
+            SLog.w(TAG, "检查进程是否过期超过 5s，本轮跳过（不影响心跳）")
+            restarting = False
+        except Exception as exc:
+            SLog.w(TAG, f"检查进程是否过期失败: {type(exc).__name__}")
+            restarting = False
+        if restarting:
             self.request_shutdown()
             return
 
         self._keep_power()
-        devices: Optional[list[P.DeviceManifest]]
-        try:
-            devices = await asyncio.to_thread(self.core.discover_devices)
-        except Exception as exc:
-            SLog.w(TAG, f"心跳重探设备失败: {exc}")
-            devices = None
-        delta: list[P.DeviceManifest] = []
-        if devices is not None:
-            delta = changed_devices(self._last_devices, devices)
-        hb = await asyncio.to_thread(self._heartbeat_payload, devices, device_delta=delta)
-        await self._send(P.MsgType.HEARTBEAT, hb)
-        await self._sync_records()
+        cached = list(self._last_devices.values()) or None
+        async with self._heartbeat_send_lock:
+            generation, delta = self._delta_to_send()
+            hb = await asyncio.to_thread(self._heartbeat_payload, cached, device_delta=delta)
+            await self._send_heartbeat(hb)
+            if generation:
+                self._mark_delta_sent(generation)
+        self._start_device_refresh()
+        self._start_record_sync()
         # _connection already persists the sidecar, including build diagnostics.
         await asyncio.to_thread(self._connection, "heartbeat", connected=True, registered=True)
+
+    def _device_probe_timeout(self) -> float:
+        # adb 列表 10s + iOS 列表 10s + details 共享 12s，再加一点调度余量。
+        return max(20.0, float(self.heartbeat_sec) * 3.0)
+
+    def _device_probe_watchdog(self) -> float:
+        # 线程内的 adb/devicectl 自己都有超时；到这个量级仍不返回就是真卡死了。
+        # 换掉线程池恢复设备表刷新，避免一次卡死让设备状态永久停更。
+        return max(90.0, 4.0 * self._device_probe_timeout())
+
+    def _heartbeat_send_timeout(self) -> float:
+        # 对端不读、TCP 半开时 ws.send 可能永久挂起，心跳循环会就此停摆。
+        return max(5.0, float(self.heartbeat_sec))
+
+    async def _send_heartbeat(self, hb: P.Heartbeat) -> None:
+        timeout = self._heartbeat_send_timeout()
+        try:
+            await asyncio.wait_for(self._send(P.MsgType.HEARTBEAT, hb), timeout=timeout)
+        except asyncio.TimeoutError:
+            SLog.w(TAG, f"心跳发送超过 {timeout:.1f}s，主动断开重连")
+            ws = self._ws
+            if ws is not None:
+                try:
+                    await asyncio.wait_for(self._abort_ws(ws), timeout=2.0)
+                except Exception:
+                    # close() 可能卡在同一张半开连接上；直接 abort 底层传输，
+                    # 否则 recv 等不到 EOF，连接循环永远不会重连。
+                    self._abort_transport(ws)
+            raise _HeartbeatSendTimeout(f"heartbeat send stalled > {timeout:.1f}s") from None
+
+    def _queue_delta(self, delta: list[P.DeviceManifest]) -> int:
+        """把未送达的设备变化并入待发集合，返回本次发送代次。
+
+        复查期间设备可能连续插拔，不能直接用新 delta 覆盖上一帧未送达的状态；
+        按 SN 合并后，Nexus 只会看到这件事的最终状态。
+        """
+        if not delta:
+            return 0
+        merged = {d.sn: d for d in self._pending_device_delta}
+        for device in delta:
+            merged[device.sn] = device
+        self._pending_device_delta = list(merged.values())
+        self._delta_generation += 1
+        return self._delta_generation
+
+    def _delta_to_send(self) -> tuple[int, Optional[list[P.DeviceManifest]]]:
+        """取本拍要捎带的设备状态：未送达增量优先，否则到点发一次全量。
+
+        返回 0 表示本拍只有普通心跳。全量快照只在发送成功后推进下一周期，
+        所以发送失败不会把自愈机会直接跳过一整个周期。
+        """
+        if self._pending_device_delta:
+            return self._delta_generation, list(self._pending_device_delta)
+        if not self._last_devices and not self._device_tombstones:
+            return 0, None
+        now = time.monotonic()
+        if now < self._next_full_sync_at:
+            return 0, None
+        current = set(self._last_devices)
+        snapshot = list(self._last_devices.values())
+        snapshot.extend(device for sn, device in self._device_tombstones.items() if sn not in current)
+        self._pending_device_delta = snapshot
+        self._pending_delta_is_full = True
+        self._delta_generation += 1
+        return self._delta_generation, list(snapshot)
+
+    def _mark_delta_sent(self, generation: int) -> None:
+        """只确认自己发出的那一代；期间并入的新变化留给下一拍。"""
+        if not generation or generation != self._delta_generation:
+            return
+        was_full = self._pending_delta_is_full
+        self._pending_device_delta = []
+        self._pending_delta_is_full = False
+        if was_full:
+            interval = max(_DEVICE_FULL_SYNC_MIN_SEC, 20.0 * float(self.heartbeat_sec))
+            self._next_full_sync_at = time.monotonic() + interval
+
+    def _note_tombstones(
+        self, prev: dict[str, P.DeviceManifest], devices: list[P.DeviceManifest],
+    ) -> None:
+        """记住消失的设备，供下一轮全量同步把 Nexus 的旧缓存纠正为 disconnected。"""
+        current = {device.sn for device in devices}
+        for sn, old in prev.items():
+            if sn in current:
+                continue
+            self._device_tombstones.pop(sn, None)
+            self._device_tombstones[sn] = replace(
+                old, channels={ch: "disconnected" for ch in (old.channels or {})},
+            )
+        for sn in current:
+            self._device_tombstones.pop(sn, None)
+        while len(self._device_tombstones) > _DEVICE_TOMBSTONE_MAX:
+            oldest = next(iter(self._device_tombstones))
+            self._device_tombstones.pop(oldest, None)
+
+    def _start_device_refresh(self) -> None:
+        if not self._seen_register:
+            return
+        if self._device_probe_inflight:
+            stuck = time.monotonic() - self._device_probe_started_at
+            if stuck <= self._device_probe_watchdog():
+                return
+            SLog.w(TAG, f"设备探针卡死 {stuck:.0f}s，重建探针线程池")
+            self._retire_device_pool()
+        running = self._device_refresh_task
+        if running is not None and not running.done():
+            return
+        task = asyncio.create_task(self._device_refresh())
+        self._device_refresh_task = task
+        task.add_done_callback(self._device_refresh_done)
+
+    def _retire_device_pool(self) -> None:
+        old = self._device_pool
+        self._device_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scout-device-probe")
+        # 旧线程之后返回时，它的完成回调会带着旧 token，不能清新探针的 inflight。
+        self._device_probe_token += 1
+        self._device_probe_inflight = False
+        self._device_probe_started_at = 0.0
+        old.shutdown(wait=False, cancel_futures=True)
+
+    def _device_probe_done(self, token: int) -> None:
+        if token == self._device_probe_token:
+            self._device_probe_inflight = False
+
+    def _device_refresh_done(self, task: asyncio.Task) -> None:
+        if self._device_refresh_task is task:
+            self._device_refresh_task = None
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            SLog.w(TAG, f"后台重探设备失败: {type(exc).__name__}: {exc}")
+
+    async def _cancel_device_refresh(self) -> None:
+        task = self._device_refresh_task
+        self._device_refresh_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    def _start_record_sync(self) -> None:
+        if not self._seen_register or self._ws is None:
+            return
+        if getattr(self.core, "_script_records", None) is None:
+            return
+        running = self._record_sync_task
+        if running is not None and not running.done():
+            return
+        task = asyncio.create_task(self._record_sync_once())
+        self._record_sync_task = task
+        task.add_done_callback(self._record_sync_done)
+
+    def _record_sync_done(self, task: asyncio.Task) -> None:
+        if self._record_sync_task is task:
+            self._record_sync_task = None
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            SLog.w(TAG, f"后台同步收据失败: {type(exc).__name__}: {exc}")
+
+    async def _record_sync_once(self) -> None:
+        try:
+            await self._sync_records()
+        except (OSError, ValueError, RuntimeError, asyncio.TimeoutError) as exc:
+            SLog.w(TAG, f"后台同步收据失败: {type(exc).__name__}: {exc}")
+
+    async def _cancel_record_sync(self) -> None:
+        task = self._record_sync_task
+        self._record_sync_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def _device_refresh(self) -> None:
+        """后台重探设备；超时只丢本轮结果，心跳照常发。"""
+        loop = asyncio.get_running_loop()
+        if self._device_probe_inflight:
+            return
+        self._device_probe_inflight = True
+        self._device_probe_started_at = time.monotonic()
+        self._device_probe_token += 1
+        token = self._device_probe_token
+        probe = loop.run_in_executor(self._device_pool, self.core.discover_devices)
+        probe.add_done_callback(lambda _fut, token=token: self._device_probe_done(token))
+        try:
+            devices = await asyncio.wait_for(
+                asyncio.shield(probe), timeout=self._device_probe_timeout(),
+            )
+        except asyncio.TimeoutError:
+            SLog.w(TAG, f"设备重探超过 {self._device_probe_timeout():.1f}s，放弃本轮（心跳不受影响）")
+            return
+        except Exception as exc:
+            SLog.w(TAG, f"设备重探失败，保留上一轮设备表: {type(exc).__name__}: {exc}")
+            return
         if devices is None:
             return
-        from mino_scout.core import serials_adb_just_connected
-
-        reconnect = serials_adb_just_connected(self._last_devices, devices)
-        if reconnect:
-            SLog.i(TAG, f"adb 重连，检查输入法 {reconnect}")
-            await asyncio.to_thread(
-                self.core.ensure_adb_keyboard_for_serials,
-                reconnect,
-                reason="adb_reconnect",
-            )
-        await asyncio.to_thread(self.core.ensure_adb_keyboard_drift_check, devices)
+        delta = changed_devices(self._last_devices, devices)
+        prev = self._last_devices
+        self._last_devices = {d.sn: d for d in devices}
+        self._note_tombstones(prev, devices)
+        sent = False
         if delta:
             SLog.i(TAG, f"心跳设备变化 {[d.sn for d in delta]}")
-            await self._emit_device_delta(self._last_devices, devices)
-        self._last_devices = {d.sn: d for d in devices}
+            if self._ws is not None:
+                # 权威状态用心跳 delta，先发；框架事件要等 Nexus 回执，不能挡在前面。
+                async with self._heartbeat_send_lock:
+                    generation = self._queue_delta(delta)
+                    pending = list(self._pending_device_delta)
+                    hb = await asyncio.to_thread(self._heartbeat_payload, devices, device_delta=pending)
+                    try:
+                        await self._send_heartbeat(hb)
+                    except Exception as exc:
+                        # 不丢变化：留到下一拍心跳重发，避免一次网络抖动让 Nexus 永久停在旧表。
+                        SLog.w(TAG, f"设备变化心跳发送失败，下一拍重试: {type(exc).__name__}: {exc}")
+                    else:
+                        self._mark_delta_sent(generation)
+                        sent = True
+        if delta and sent:
+            try:
+                await asyncio.wait_for(self._emit_device_delta(prev, devices), timeout=15.0)
+            except Exception as exc:
+                SLog.w(TAG, f"设备变化事件发送失败（已由心跳 delta 兜底）: {type(exc).__name__}: {exc}")
+        # 输入法维护是 adb shell 同步调用，只放在后台任务里，且失败不影响心跳。
+        from mino_scout.core import serials_adb_just_connected
+
+        try:
+            reconnect = serials_adb_just_connected(prev, devices)
+            if reconnect:
+                SLog.i(TAG, f"adb 重连，检查输入法 {reconnect}")
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.core.ensure_adb_keyboard_for_serials,
+                        reconnect,
+                        reason="adb_reconnect",
+                    ),
+                    timeout=30.0,
+                )
+            await asyncio.wait_for(
+                asyncio.to_thread(self.core.ensure_adb_keyboard_drift_check, devices),
+                timeout=30.0,
+            )
+        except Exception as exc:
+            SLog.w(TAG, f"后台输入法维护失败: {type(exc).__name__}: {exc}")
 
     # ---------------- 收帧 ----------------
 

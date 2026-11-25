@@ -51,6 +51,13 @@ _IDLE_RUN_SEC = 90.0
 # adb 已连接但默认输入法被改回系统键盘时，心跳里复检（手机重启后常见）。
 _ADB_IME_DRIFT_CHECK_SEC = 300.0
 
+# `adb devices` 瞬时失败（daemon 重启、USB 抖动）不能把整张 Android 设备表清空，
+# 否则 Nexus 会把正在跑任务的手机标成 disconnected。保留上一轮结果一小段时间。
+_ADB_LIST_STALE_TTL_SEC = 300.0
+_ADB_LIST_LOCK = threading.Lock()
+_ADB_LIST_SNAPSHOT: list[P.DeviceManifest] = []
+_ADB_LIST_SNAPSHOT_AT = 0.0
+
 _NODE_COMMANDS = {
     "node.stop": "stop",
     "node.restart": "restart",
@@ -1566,28 +1573,49 @@ def _discover_devices(executors: dict[str, Executor], *, scout_id: str) -> list[
 def _discover_adb_devices() -> list[P.DeviceManifest]:
     import subprocess
 
+    global _ADB_LIST_SNAPSHOT, _ADB_LIST_SNAPSHOT_AT
+    failure = ""
     try:
         proc = subprocess.run(["adb", "devices", "-l"], capture_output=True, text=True, timeout=10)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
-        SLog.w(TAG, f"adb devices 失败: {exc}")
-        return []
-    out: list[P.DeviceManifest] = []
-    for line in (proc.stdout or "").splitlines()[1:]:
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split()
-        serial, state = parts[0], (parts[1] if len(parts) > 1 else "")
-        model = ""
-        for p in parts[2:]:
-            if p.startswith("model:"):
-                model = p.split(":", 1)[1]
-        out.append(
-            P.DeviceManifest(
-                sn=serial, platform="android", model=model,
-                channels={"adb": {"device": "connected",
-                                  "unauthorized": "unauthorized",
-                                  "offline": "disconnected"}.get(state, "disconnected")},
-            )
-        )
-    return out
+        failure = str(exc)
+    else:
+        if proc.returncode != 0:
+            failure = f"退出 {proc.returncode}"
+        elif "List of devices attached" not in (proc.stdout or ""):
+            # adb server 重启中的半截输出；不能当成「一台设备都没有」。
+            failure = "输出缺少设备表头"
+        else:
+            out: list[P.DeviceManifest] = []
+            lines = (proc.stdout or "").splitlines()
+            header = next(i for i, line in enumerate(lines) if "List of devices attached" in line)
+            # daemon 启动提示可能排在表头前，不能简单丢掉第一行。
+            for line in lines[header + 1:]:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                serial, state = parts[0], (parts[1] if len(parts) > 1 else "")
+                model = ""
+                for p in parts[2:]:
+                    if p.startswith("model:"):
+                        model = p.split(":", 1)[1]
+                out.append(
+                    P.DeviceManifest(
+                        sn=serial, platform="android", model=model,
+                        channels={"adb": {"device": "connected",
+                                          "unauthorized": "unauthorized",
+                                          "offline": "disconnected"}.get(state, "disconnected")},
+                    )
+                )
+            with _ADB_LIST_LOCK:
+                _ADB_LIST_SNAPSHOT = list(out)
+                _ADB_LIST_SNAPSHOT_AT = time.monotonic()
+            return out
+    SLog.w(TAG, f"adb devices 失败: {failure}；保留上一轮结果")
+    with _ADB_LIST_LOCK:
+        snapshot = list(_ADB_LIST_SNAPSHOT)
+        age = time.monotonic() - _ADB_LIST_SNAPSHOT_AT
+    if snapshot and age < _ADB_LIST_STALE_TTL_SEC:
+        return snapshot
+    return []
