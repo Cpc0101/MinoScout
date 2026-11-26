@@ -774,8 +774,18 @@ class PlaywrightExecutor:
                     timeout = int((event.params or {}).get("timeout_ms") or 30000)
                 except (TypeError, ValueError):
                     timeout = 30000
-                page.set_default_timeout(max(1000, min(timeout, 60000)))
-                value = page.evaluate("(source) => eval(source)", script)
+                try:
+                    page.set_default_timeout(max(1000, min(timeout, 60000)))
+                except Exception as exc:
+                    result = self._fail(event, started_at, t0, "页面脚本准备失败", execution_started="no")
+                    result.raw_response["executor_failure"] = _script_failure(exc, phase="preflight")
+                    return result
+                try:
+                    value = page.evaluate("(source) => eval(source)", script)
+                except Exception as exc:
+                    result = self._write_unknown(event, started_at, t0, RuntimeError("页面脚本执行异常"))
+                    result.raw_response["executor_failure"] = _script_failure(exc, phase="evaluate")
+                    return result
                 text = "" if value is None else str(value)[:2000]
                 return make_event_result(
                     event, status=EventStatus.PASS, executor_used=self.id, started_at=started_at,
@@ -1711,3 +1721,21 @@ class PlaywrightExecutor:
             summary=msg, error=error or msg,
             raw_response={"sensitive": bool(event.params.get("sensitive")), "execution": execution},
         )
+
+
+def _script_failure(exc: Exception, *, phase: str) -> dict:
+    """Persist bounded error categories, never JavaScript source or page contents."""
+    message = str(exc)
+    category = "executor_error"
+    for name in ("SyntaxError", "ReferenceError", "TypeError", "RangeError"):
+        if name + ":" in message:
+            category = name
+            break
+    else:
+        if "TargetClosedError" in type(exc).__name__ or "Target page, context or browser has been closed" in message:
+            category = "target_closed"
+        elif "TimeoutError" in type(exc).__name__:
+            category = "timeout"
+        elif "Execution context was destroyed" in message:
+            category = "context_destroyed"
+    return {"contract": "executor_failure.v1", "phase": phase, "category": category}

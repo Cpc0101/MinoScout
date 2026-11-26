@@ -1,3 +1,9 @@
+## 0.1.172 — 2026-11-26
+
+- Page script failures retain credential-free executor_failure categories and phases in sealed action evidence; JavaScript source, exception messages and page contents are not copied into diagnostics.
+- Timeout setup failures before evaluate report execution_started=no. Errors after entering evaluate remain unknown and isolated, including JavaScript SyntaxError; no replay or automatic release.
+- CI runs Web interaction smoke checks covering preparation versus execution failures, diagnostic redaction and preserved unknown-write fences.
+
 ## 0.1.171 — 2026-11-26
 
 - Note accepts a positional message alongside a text field, preserving legacy keyword messages and sensitive-field filtering.

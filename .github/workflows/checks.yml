@@ -18,3 +18,4 @@ jobs:
       - run: python -B scripts/check_case_lifecycle.py
       - run: python -B scripts/check_web_auth_contracts.py
       - run: python -B scripts/check_web_observation_contracts.py
+      - run: python -B scripts/check_web_interaction_contracts.py

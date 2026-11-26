@@ -535,7 +535,55 @@ def check_actor_tab_isolation() -> None:
     assert hub._sessions[other_actor]["page"] is b1
 
 
+def check_script_failure_evidence() -> None:
+    from mino_scout.runtime.execution_boundary import normalize_ui_result
+    class Page:
+        def __init__(self, phase):
+            self.phase, self.evaluations = phase, 0
+        def set_default_timeout(self, timeout):
+            if self.phase == "preflight":
+                raise RuntimeError("credential-secret")
+        def evaluate(self, source, script):
+            self.evaluations += 1
+            raise RuntimeError("SyntaxError: invalid secret-source")
+    for phase, boundary in (("preflight", "no"), ("evaluate", "unknown")):
+        page = Page(phase)
+        hub = SimpleNamespace(current_page=lambda *a, **k: page,
+                              release_pressed_keys=lambda *a, **k: None)
+        original = playwright_executor.get_hub
+        playwright_executor.get_hub = lambda: hub
+        try:
+            result = playwright_executor.PlaywrightExecutor().execute(
+                _event("exec_script", {"script": "invalid-source"}), _ctx())
+        finally:
+            playwright_executor.get_hub = original
+        result = normalize_ui_result(result, capability_id="exec_script", run_id="fixture", step_idx=54)
+        assert result.raw_response["execution"]["execution_started"] == boundary
+        assert result.raw_response["executor_failure"]["phase"] == phase
+        assert page.evaluations == (phase == "evaluate")
+        assert "secret" not in str(result.raw_response)
+        assert result.status is (EventStatus.FAIL if phase == "preflight" else EventStatus.BLOCKED)
+
+    for message, category in (("SyntaxError: invalid secret-source", "SyntaxError"),
+                              ("TypeError: token-secret", "TypeError"),
+                              ("Execution context was destroyed", "context_destroyed"),
+                              ("Target page, context or browser has been closed", "target_closed"),
+                              ("credential-secret", "executor_error")):
+        diagnostic = playwright_executor._script_failure(RuntimeError(message), phase="evaluate")
+        assert diagnostic["category"] == category
+        assert "secret" not in str(diagnostic)
+        result = playwright_executor.PlaywrightExecutor()._write_unknown(
+            _event("exec_script"), "", 0, RuntimeError("页面脚本执行异常"))
+        result.raw_response["executor_failure"] = diagnostic
+        result = normalize_ui_result(result, capability_id="exec_script", run_id="fixture", step_idx=54)
+        assert result.status is EventStatus.BLOCKED
+        assert result.raw_response["execution"]["execution_started"] == "unknown"
+        assert result.raw_response["executor_failure"] == diagnostic
+        assert result.raw_response["execution_control"]["resource_isolated"] is True
+
+
 def check() -> None:
+    check_script_failure_evidence()
     check_drag_release()
     check_keyboard_cleanup()
     check_keyboard_serialization()
@@ -544,7 +592,7 @@ def check() -> None:
     check_url_and_forward()
     check_clipboard_and_permission()
     check_actor_tab_isolation()
-    print("PASS: Web cleanup/serialization, capability/runtime admission, strict URL/forward, permission blocking, clipboard and actor/tab isolation")
+    print("PASS: script failure phase/category without source leakage; Web cleanup/serialization, capability/runtime admission, strict URL/forward, permission blocking, clipboard and actor/tab isolation")
 
 
 if __name__ == "__main__":
