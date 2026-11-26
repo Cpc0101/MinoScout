@@ -227,16 +227,25 @@ class NodeTransport:
         try:
             backoff = _BACKOFF_START
             while not self._stop.is_set():
+                self._connection_registered = False
                 try:
                     await self._connect_once()
                     backoff = _BACKOFF_START  # 成功连过一次就重置
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    from mino_scout.tools.keep_alive.runtime_sidecar import read_runtime_sidecar
-                    prior = (read_runtime_sidecar(expect_pid=__import__("os").getpid()).get("connection") or {}).get("last_error")
-                    self._connection("disconnected", error=str(prior or f"连接失败: {type(exc).__name__}"))
-                    SLog.w(TAG, f"连接断开/失败: {type(exc).__name__}: {exc}")
+                    self._connection("disconnected", error=f"连接失败: {type(exc).__name__}")
+                    from mino_scout.runtime.secret_redaction import sanitize
+                    cause = exc.__cause__ or exc.__context__
+                    diagnostic = {**getattr(self, "_last_disconnect", {}),
+                        "exception_type": type(exc).__name__,
+                        "cause_type": type(cause).__name__ if cause else "",
+                        "cause_errno": getattr(cause, "errno", None),
+                        "received_close_code": getattr(getattr(exc, "rcvd", None), "code", None),
+                        "sent_close_code": getattr(getattr(exc, "sent", None), "code", None)}
+                    SLog.w(TAG, f"连接断开/失败: {sanitize(str(exc))[:300]} diagnostic={json.dumps(diagnostic, sort_keys=True)}")
+                if self._connection_registered:
+                    backoff = _BACKOFF_START
                 if self._stop.is_set():
                     break
                 # 加抖动，避免多节点同时重连打爆 Nexus
@@ -321,7 +330,9 @@ class NodeTransport:
         connect_kw: dict[str, Any] = {"max_size": _MAX_FRAME_BYTES}
         if str(self.nexus_url or "").startswith("wss://"):
             connect_kw["ssl"] = ssl.create_default_context(cafile=certifi.where())
+        self._last_disconnect = {}
         async with websockets.connect(self.nexus_url, **connect_kw) as ws:
+            connected_at = time.monotonic()
             self._ws = ws
             self._connection("registering", connected=True)
             # 顺序要紧：**先起接收循环，再 REGISTER**。
@@ -356,11 +367,20 @@ class NodeTransport:
                         task.cancel()
                 # Drain every task even when REGISTER, shutdown or recv failed.
                 await asyncio.gather(*connection_tasks, return_exceptions=True)
+                self._last_disconnect = {
+                    "connected_seconds": round(time.monotonic() - connected_at, 3),
+                    "registered": bool(getattr(self, "_connection_registered", False)),
+                    "ping_latency_seconds": getattr(ws, "latency", None)}
                 self._ws = None
                 records = getattr(self.core, "_script_records", None)
                 if records:
                     records.connection(False)
                 self.core.binding_guard.set_connection("")
+                # Pending callbacks belong to this connection, not the next one.
+                from mino_scout.server_comm.nexus_link import NexusCallbackError
+                for waiter in list(self._waiters.values()):
+                    if not waiter.done():
+                        waiter.set_exception(NexusCallbackError("nexus_disconnected"))
                 self._connection("disconnected")
                 await self._cancel_device_refresh()
                 await self._cancel_record_sync()
@@ -469,7 +489,9 @@ class NodeTransport:
         from mino_scout.server_comm.script_records import bind as bind_records
         records = await asyncio.to_thread(bind_records, self.core, reg.owner_user_id, self.nexus_url)
         records.connection(True)
+        self._connection_registered = True
         self._connection("registered", connected=True, registered=True)
+        self._start_record_sync()
         from mino_scout.tools.keep_alive.runtime_sidecar import note_plugin_access
 
         try:
@@ -1030,11 +1052,25 @@ class NodeTransport:
                 response = await self._request(P.MsgType.EXECUTE, request, timeout=2)
                 result = getattr(response, "payload", None)
                 if result is None or str(getattr(result.status, "value", result.status)) != "pass":
+                    SLog.w(TAG, f"record.sync pending task={summary['task_id']} attempt={summary['attempt_id']} "
+                           f"version={summary['summary_version']} cause={'no_reply' if result is None else 'rejected'}")
                     return
+                from mino_scout.server_comm.nexus_link import validate_reply
+                validate_reply(request, result)
                 ack = dict(result.data or {})
-                if ack.get("attempt_id") == summary["attempt_id"] and int(ack.get("ack_version", 0)) >= summary["summary_version"]:
+                if (ack.get("attempt_id") == summary["attempt_id"]
+                        and type(ack.get("ack_version")) is int
+                        and ack["ack_version"] >= summary["summary_version"]):
                     await asyncio.to_thread(records.store.acknowledge, summary["task_id"], summary["attempt_id"], summary["summary_version"])
-            except (OSError, ValueError, RuntimeError, asyncio.TimeoutError):
+                    SLog.i(TAG, f"record.sync ack task={summary['task_id']} attempt={summary['attempt_id']} "
+                           f"sent_version={summary['summary_version']} ack_version={ack['ack_version']} "
+                           f"status={summary['status']} sealed={summary['sealed']}")
+                else:
+                    SLog.w(TAG, f"record.sync pending task={summary['task_id']} attempt={summary['attempt_id']} "
+                           f"version={summary['summary_version']} cause=ack_mismatch")
+            except (OSError, ValueError, TypeError, RuntimeError, asyncio.TimeoutError) as exc:
+                SLog.w(TAG, f"record.sync pending task={summary['task_id']} attempt={summary['attempt_id']} "
+                       f"version={summary['summary_version']} cause={type(exc).__name__}")
                 return
 
         await asyncio.gather(*(send_summary(summary) for summary in pending))
@@ -1057,20 +1093,34 @@ class NodeTransport:
             SLog.e(TAG, f"回 RESULT 失败（等待方按执行模式处理结果缺失）: {exc}")
 
     def ask_nexus(self, req: P.Execute, timeout: float | None = None):
-        """工作线程里向 Nexus 发一条 EXECUTE 并等待 RESULT。连不上或超时返回 None。"""
+        """Send once from a worker; preserve transport failures without replay."""
+        from mino_scout.server_comm.nexus_link import NexusCallbackError, callback_budget, validate_reply
+        budget = callback_budget(timeout if timeout is not None else req.timeout_sec)
+        from concurrent.futures import TimeoutError as FutureTimeout
         loop = getattr(self, "_loop", None)
         if loop is None or not loop.is_running():
-            return None
-        budget = float(timeout if timeout is not None else req.timeout_sec or 15.0)
+            raise NexusCallbackError("nexus_unreachable")
+        if self._ws is None or not self.core.binding_guard.connection_generation:
+            raise NexusCallbackError("nexus_disconnected")
         future = asyncio.run_coroutine_threadsafe(self._request(P.MsgType.EXECUTE, req, timeout=budget), loop)
         try:
             env = future.result(timeout=budget + 2)
+        except FutureTimeout:
+            future.cancel()
+            raise NexusCallbackError("nexus_timeout") from None
+        except NexusCallbackError:
+            raise
         except Exception:
-            return None
+            future.cancel()
+            raise NexusCallbackError("nexus_transport_error") from None
+        if env is None:
+            raise NexusCallbackError("nexus_timeout")
         payload = getattr(env, "payload", None)
-        return payload if isinstance(payload, P.Result) else None
+        return validate_reply(req, payload)
 
     async def _request(self, mtype: P.MsgType, payload: Any, *, timeout: float = 30.0):
+        from mino_scout.server_comm.nexus_link import callback_budget
+        timeout = callback_budget(timeout)
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         msg_id = _msg_id()

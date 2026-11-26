@@ -293,12 +293,13 @@ class ScriptRecords:
             stop = ctx.Event()
             connected = ctx.Event()
             connected.set()
+            connection_changed = ctx.Event()
             parent_pipe, child_pipe = ctx.Pipe()
-            process = ctx.Process(target=_worker, args=(str(self.store.root), asdict(payload), asdict(worker_req), child_pipe, stop, connected), daemon=True,
+            process = ctx.Process(target=_worker, args=(str(self.store.root), asdict(payload), asdict(worker_req), child_pipe, stop, connected, connection_changed), daemon=True,
                                   name="scout-script-" + payload.attempt_id[:16])
             job = {"task_id": payload.task_id, "attempt_id": payload.attempt_id, "run_id": payload.run_id,
                    "sn": payload.sn, "platform": payload.platform, "execution_kind": payload.execution_kind,
-                   "stop": stop, "connected": connected, "process": process, "lane_key": lane_key,
+                   "stop": stop, "connected": connected, "connection_changed": connection_changed, "process": process, "lane_key": lane_key,
                    "lane_index": lane_index, "claim_state": claim_state}
             self.jobs[payload.attempt_id] = job
             try:
@@ -344,10 +345,14 @@ class ScriptRecords:
                         ask = getattr(self.core, "nexus_call", None)
                         try:
                             reply = ask(P.Execute(**message["request"]), message["timeout"]) if callable(ask) else None
-                            pipe.send({"reply": asdict(reply) if reply is not None else None})
-                        except Exception:
+                            pipe.send({"reply": asdict(reply) if reply is not None else None,
+                                       "callback_request_id": message.get("callback_request_id")})
+                        except Exception as exc:
+                            from mino_scout.server_comm.nexus_link import NexusCallbackError
+                            code = exc.code if isinstance(exc, NexusCallbackError) else "nexus_transport_error"
                             try:
-                                pipe.send({"reply": None})
+                                pipe.send({"reply": None, "callback_error": code,
+                                           "callback_request_id": message.get("callback_request_id")})
                             except (BrokenPipeError, OSError):
                                 pass
                 if debugging:
@@ -438,7 +443,11 @@ class ScriptRecords:
     def connection(self, connected):
         with self.lock:
             for job in self.jobs.values():
-                job["connected"].set() if connected else job["connected"].clear()
+                if not connected:
+                    job["connection_changed"].set()
+                    job["connected"].clear()
+                else:
+                    job["connected"].set()
 
     def cancel_run(self, run_id):
         with self.lock:
@@ -496,7 +505,7 @@ def _terminate(process):
             pass  # No browser-closed receipt is invented for forced cleanup.
 
 
-def _worker(store_root, payload_raw, request_raw, pipe, stop, connected):
+def _worker(store_root, payload_raw, request_raw, pipe, stop, connected, connection_changed):
     """Spawn entry point: module-level for frozen Windows/macOS launchers."""
     from mino_scout.cli import build_core
     from mino_scout.runtime import script_repo, script_exec
@@ -529,13 +538,11 @@ def _worker(store_root, payload_raw, request_raw, pipe, stop, connected):
         core = build_core()
         core._recording = Recorder(store, payload.task_id, payload.attempt_id)
         core._record_connection = connected
+        core._record_connection_changed = connection_changed
 
         def call(request, timeout):
-            pipe.send({"kind": "call", "request": asdict(request), "timeout": timeout})
-            if not pipe.poll(timeout + 2):
-                return None
-            raw = pipe.recv().get("reply")
-            return P.Result(**raw) if raw else None
+            from mino_scout.server_comm.nexus_link import pipe_call
+            return pipe_call(pipe, request, timeout)
 
         core.nexus_call = call
         _lease(core, payload)

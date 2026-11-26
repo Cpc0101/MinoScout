@@ -1577,7 +1577,11 @@ class App:
                            executor_order=[_EXECUTOR[self._platform]], selected_impl={"executor": _EXECUTOR[self._platform]})
         started = time.perf_counter()
         router = getattr(self.core, "router", None)
-        shared = {"write_stopped": lambda: bool(self._case._latched_error),
+        shared = {"write_stopped": lambda: bool(self._case._latched_error)
+                  or (getattr(self.core, "_record_connection_changed", None) is not None
+                      and self.core._record_connection_changed.is_set())
+                  or (getattr(self.core, "_record_connection", None) is not None
+                      and not self.core._record_connection.is_set()),
                   "web_observer_sink": self._web_observer_sink,
                   "network_guard": self._network_guard}
         if router is not None:
@@ -1619,14 +1623,57 @@ class App:
                 "association": "timing_only", **data,
             })
 
+    def _guard_write_connection(self):
+        self._guard()
+        if self._case._debug_write_error:
+            raise self._case._debug_write_error
+        if self._case._latched_error:
+            raise self._case._latched_error
+        connection = getattr(self.core, "_record_connection", None)
+        changed = getattr(self.core, "_record_connection_changed", None)
+        if ((connection is not None and not connection.is_set())
+                or (changed is not None and changed.is_set())):
+            error = ScriptAbort("写边界的连接身份未重新验证，禁止新增写操作",
+                reason_code="node_connection_revalidation_required", status="blocked",
+                details={"phase": "admission", "execution_started": "no"})
+            self._case._latched_error = error
+            raise error
+
     def _begin_action(self, capability: str, params: dict):
         from mino_scout.runtime.execution_boundary import ui_write
         self._seq += 1
         writing = ui_write(capability)
         if writing:
+            if self._case._debug_write_error:
+                raise self._case._debug_write_error
+            if self._case._latched_error:
+                raise self._case._latched_error
             connection = getattr(self.core, "_record_connection", None)
-            if connection is not None and not connection.is_set():
-                raise ScriptAbort("节点已断线，暂停新增设备写操作", reason_code="node_disconnected", status="blocked")
+            waited_for_connection = connection is not None and not connection.is_set()
+            if waited_for_connection:
+                # Admission precedes tool/call; no device write has started here.
+                wait_until = time.monotonic() + 60.0
+                while not connection.is_set():
+                    self._guard()
+                    if self._case._debug_write_error:
+                        raise self._case._debug_write_error
+                    if self._case._latched_error:
+                        raise self._case._latched_error
+                    remaining = wait_until - time.monotonic()
+                    if remaining <= 0:
+                        raise ScriptAbort("等待节点恢复连接超时，设备写操作尚未开始",
+                            reason_code="node_disconnected", status="blocked",
+                            details={"phase": "admission", "execution_started": "no", "wait_timeout_sec": 60})
+                    connection.wait(min(0.1, remaining))
+                self._guard()
+            changed = getattr(self.core, "_record_connection_changed", None)
+            if waited_for_connection or (changed is not None and changed.is_set()):
+                # A wakeup proves reachability, not a renewed owner/lane binding.
+                error = ScriptAbort("连接已改变，无法重新验证 owner/资源 epoch/generation，禁止新增写操作",
+                    reason_code="node_connection_revalidation_required", status="blocked",
+                    details={"phase": "admission", "execution_started": "no"})
+                self._case._latched_error = self._case._latched_error or error
+                raise self._case._latched_error
             if self._case._debug_write_error:
                 raise self._case._debug_write_error
             if self._case._latched_error:

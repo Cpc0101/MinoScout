@@ -89,6 +89,7 @@ def act(case, kind: str, params: dict, text: str = ""):
             viewport = page.viewport_size or {}
             if not (0 <= x < viewport.get("width", 0) and 0 <= y < viewport.get("height", 0)):
                 raise ScriptAbort("OCR 坐标超出当前视口", reason_code="observation_stale", status="blocked")
+            case._guard_write_connection()
             case.touched = True
             page.mouse.click(x, y)
             if kind != "tap":
@@ -115,6 +116,7 @@ def act(case, kind: str, params: dict, text: str = ""):
                 "execution": {"execution_started": "no", "phase": "preflight", "reason_code": "preflight_failed"}})
             case._report(capability, action, "playwright", int((time.perf_counter() - started) * 1000))
             raise ScriptAbort(f"控件预检失败: {type(exc).__name__}", reason_code="preflight_failed") from exc
+        case._guard_write_connection()
         case.touched = True
         if kind == "tap":
             loc.click(timeout=5000)
@@ -124,7 +126,11 @@ def act(case, kind: str, params: dict, text: str = ""):
             summary = f"输入 {len(text)} 字"
         action = ActionResult(ok=True, summary=summary, status="pass", data={
             "execution": {"execution_started": "yes", "phase": "completed", "source": "playwright.native.v1"}})
-    except ScriptAbort:
+    except ScriptAbort as exc:
+        if exc.reason_code == "node_connection_revalidation_required":
+            action = ActionResult(ok=False, summary=str(exc), status="blocked", data={
+                "execution": {"execution_started": "no", "phase": "admission", "reason_code": exc.reason_code}})
+            case._report(capability, action, "playwright", int((time.perf_counter() - started) * 1000))
         raise
     except Exception as exc:
         action = ActionResult(ok=False, summary="页面动作失败", status="blocked", data={
