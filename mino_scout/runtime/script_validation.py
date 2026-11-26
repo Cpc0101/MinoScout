@@ -226,6 +226,15 @@ def validate_sources(root: Path, trees: dict[Path, ast.Module], *, require_cases
             add(path, 1, "source_invalid", str(exc))
             continue
         if binding is not None:
+            from mino_scout.runtime.script_source import GROUPS
+            for call in calls:
+                ref_node = next((kw.value for kw in call.keywords if kw.arg == "source_ref"), None)
+                ref = _literal(ref_node)
+                if ref_node is not None and ref is None:
+                    add(path, call.lineno, "source_dynamic", "A dynamic source_ref cannot be confirmed statically; verify coverage at runtime", "warning")
+                elif ref and not ref.startswith(GROUPS[_ROLES[_scope(call)]]):
+                    add(path, call.lineno, "source_role_mismatch",
+                        f"{ref} cannot be used in {_scope(call)}; Feishu {_ROLES[_scope(call)]} IDs must start with {GROUPS[_ROLES[_scope(call)]]}")
             if spec_path.is_file():
                 add(path, 1, "source_conflict", "CASE_SOURCE and a same-name YAML snapshot cannot coexist; remove the duplicate snapshot")
             add(path, 1, "source_remote", "The Feishu source is read before execution; static checks only validate source configuration, while item mapping and coverage require runtime verification", "info")
