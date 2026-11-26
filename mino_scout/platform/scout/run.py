@@ -88,9 +88,9 @@ def on_page(case, page_key: str):
     return result
 
 
-def note(app, text: str, **fields) -> None:
+def note(app, *messages: str, **fields) -> None:
     """记一条证据。expect 用它标出这次判定用的是哪一种依据。"""
-    app.case.nexus.note(text, **fields)
+    app.case.nexus.note(*messages, **fields)
 
 
 def expect(app, *, page: str = "", prompt: str = "", verdict: str = "pass", allow_model: bool = False) -> str:

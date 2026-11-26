@@ -335,11 +335,19 @@ def vlm_frame(case, index: int, prompt: str, verdict: str = "") -> str:
     return _visual_assertion(case, prompt, verdict, see, index=int(index))
 
 
-def note(case, text: str, **fields: Any) -> None:
+def note(case, *messages: str, **fields: Any) -> None:
     from mino_scout.runtime.script_exec import _HIDDEN
 
+    if len(messages) > 1:
+        raise TypeError("note accepts one message")
+    if messages:
+        message = messages[0]
+    elif "text" in fields:
+        message = fields.pop("text")
+    else:
+        raise TypeError("note requires a message")
     case._guard()
-    body = str(text or "")[:500]
+    body = str(message or "")[:500]
     safe = {str(key): value for key, value in fields.items()
             if str(key) not in _HIDDEN and (isinstance(value, (str, int, float, bool)) or value is None)}
     case._callback("script.callback", {"op": "note", "text": body, "fields": safe}, 15)

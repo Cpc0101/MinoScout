@@ -364,7 +364,7 @@ def _run_locked(core, payload, root: Path, *, deadline: float, stop) -> dict[str
     except ScriptAbort as exc:
         return _failure(exc, case)
     except Exception as exc:
-        return _failure(ScriptAbort(f"{type(exc).__name__}: {exc}", reason_code="script_failed"), case)
+        return _failure(ScriptAbort(f"{type(exc).__name__}: {exc}", reason_code="script_failed", status="blocked"), case)
 
 
 def _failure(exc: BaseException, case: Case | None) -> dict[str, Any]:
@@ -673,10 +673,10 @@ class _Nexus:
         if not passed:
             raise self._case._latched_error
 
-    def note(self, text: str, **fields: Any) -> None:
+    def note(self, *messages: str, **fields: Any) -> None:
         from mino_scout.server_comm.callbacks import note
 
-        return note(self._case, text, **fields)
+        return note(self._case, *messages, **fields)
 
     def fail(self, message: str) -> None:
         from mino_scout.platform.scout.run import fail

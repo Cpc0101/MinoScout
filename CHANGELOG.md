@@ -1,3 +1,8 @@
+## 0.1.171 — 2026-11-26
+
+- Note accepts a positional message alongside a text field, preserving legacy keyword messages and sensitive-field filtering.
+- Unhandled script exceptions are BLOCKED with script_failed, not product assertion FAIL. Explicit assertion failures remain FAIL.
+
 # Changelog
 
 ## 0.1.170 — 2026-11-26

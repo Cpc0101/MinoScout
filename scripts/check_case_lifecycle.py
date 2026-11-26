@@ -65,12 +65,12 @@ def runtime_smoke(base):
     (root / "pretest.py").write_text("def pretest(case):\n    case.nexus.note('project_pre')\n", encoding="utf-8")
     (root / "posttest.py").write_text("def posttest(case):\n    case.nexus.note('project_post')\n", encoding="utf-8")
     good = """def pretest(case):
-    case.nexus.note('case_pre')
+    case.nexus.note('case_pre', text='redacted input', count=1)
 def run(case):
     with case.nexus.check('expected', source_ref='E1'):
         case.nexus.assert_equal(1, 1)
 def posttest(case):
-    case.nexus.note('case_post')
+    case.nexus.note(text='case_post')
 """
     path = source(root, good)
     store = RecordStore(base / "execution")
@@ -80,6 +80,8 @@ def posttest(case):
     expected_notes = notes(store, payload)
     assert expected_notes == ["project_pre", "case_pre", "case_post", "project_post"], expected_notes
     formal_failures = [
+        ("def run(case):\n    raise TypeError('fixture argument conflict')\n", "blocked", "script_failed"),
+        ("def run(case):\n    raise ValueError('fixture invalid selector')\n", "blocked", "script_failed"),
         ("def run(case):\n    with case.nexus.check('empty', source_ref='E1'):\n        pass\n", "blocked", "check_empty"),
         (good.replace("assert_equal(1, 1)", "assert_equal(1, 2)"), "fail", "assertion_failed"),
         ("def run(case):\n    case.nexus.account(data_need='fixture')\n", "blocked", "nexus_rejected"),
@@ -130,7 +132,7 @@ def posttest(case):
         assert result["reason_code"] == "check_empty" and result["status"] == "blocked", result
         result = execute(good, ("E1", "E2"))
         assert result["reason_code"] == "source_coverage_missing", result
-        bad_post = good.replace("case.nexus.note('case_post')", "case.nexus.note('case_post')\n    raise ValueError('cleanup_failed')")
+        bad_post = good.replace("case.nexus.note(text='case_post')", "case.nexus.note(text='case_post')\n    raise ValueError('cleanup_failed')")
         result = execute(bad_post)
         assert result["status"] == "failed" and notes(store, payload)[-1] == "project_post", result
         result = execute(bad_post.replace("assert_equal(1, 1)", "assert_equal(1, 2)"))
