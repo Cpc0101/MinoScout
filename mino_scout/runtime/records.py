@@ -184,6 +184,17 @@ class RecordStore:
         public_state = "interrupted" if state == "interrupted" else "completed" if state in TERMINAL else state
         if row["cancel_requested"] and state not in TERMINAL:
             public_state = "cancel_requested"
+        debug = {}
+        if meta.get("execution_kind") == "debug":
+            from mino_scout.runtime.debug_commands import projection
+            now = time.time()
+            command = projection(db, row["attempt_id"], now=now)
+            age = int(max(0, (row["finished_at"] or now) - row["started_at"]) * 1000) if row["started_at"] else 0
+            debug = {"session_state": "closed" if state in TERMINAL else "closing" if row["cancel_requested"] else
+                "executing" if command and command["state"] == "running" else "queued" if command and command["state"] == "queued" else
+                "ready" if state == "running" and meta.get("debug_state") in {"ready", "executing", "write_stopped"} else "starting", "session_age_ms": age, "command": command,
+                "active_command": command if command and command["state"] in {"queued", "running"} else None}
+            debug["debug_state"] = "write_stopped" if state not in TERMINAL and command and command["result"].get("write_stopped") else debug["session_state"]
         return {"task_id": task_id, "attempt_id": row["attempt_id"],
                 **{k: meta.get(k, "") for k in ("run_id", "session_id", "case_id", "node_id", "sn", "platform", "owner_user_id", "revision", "script_path")},
                 "state": public_state, "status": status, "reason_code": row["reason_code"],
@@ -195,14 +206,15 @@ class RecordStore:
                 "elapsed_ms": int(max(0, (row["finished_at"] or time.time()) - row["started_at"]) * 1000) if row["started_at"] else 0,
                 "run_purpose": meta.get("run_purpose", "unclassified"),
                 **{k: meta[k] for k in ("execution_kind", "workspace", "execution_workspace", "source_workspace", "output_workspace", "debug_state", "debug_last_command", "workspace_hash", "debug_origin", "debug_origin_matched") if k in meta},
-                "execution_started": meta.get("execution_started", "no"),
+                "execution_started": meta.get("execution_started", "unknown" if meta.get("execution_kind") == "debug" else "no"),
                 **{key: meta[key] for key in ("execution_stopped", "browser_closed", "scout_process_generation") if key in meta},
+                **({"otp_wait": meta["otp_wait"]} if "otp_wait" in meta else {}),
                 "data_outputs": meta.get("data_outputs", {}), "data_missing": meta.get("data_missing", []),
                 "source_hash": meta.get("source_hash", ""), "source_coverage": meta.get("source_coverage", {}),
                 **({"test_report": meta["test_report"]} if "test_report" in meta else {}),
                 "cancel_requested": bool(row["cancel_requested"]),
                 "sync_state": "acked" if row["acked_version"] >= row["summary_version"] else "pending",
-                "record_ref": {"task_id": task_id, "attempt_id": row["attempt_id"], "node_id": meta.get("node_id", "")}}
+                "record_ref": {"task_id": task_id, "attempt_id": row["attempt_id"], "node_id": meta.get("node_id", "")}, **debug}
 
     def _publish(self, db, task_id, attempt_id):
         summary = self._summary(db, task_id, self._row(db, attempt_id))
@@ -212,6 +224,7 @@ class RecordStore:
 
     def status(self, task_id, attempt_id):
         with self._db(task_id) as db:
+            db.execute("BEGIN")
             return self._summary(db, task_id, self._row(db, attempt_id))
 
     def metadata(self, task_id, attempt_id):

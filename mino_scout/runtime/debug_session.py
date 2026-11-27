@@ -12,6 +12,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from urllib.parse import quote
 
 from mino_scout.runtime import debug_commands as commands
 from mino_scout.runtime import script_exec as runtime
@@ -86,7 +87,9 @@ def run(core, payload, store, stop):
     root = authoring_workspace(payload.workspace, store.root)
     work = attempt_workspace(store, payload.task_id, payload.attempt_id)
     output = work / "output"
-    output.mkdir(exist_ok=True)
+    if output.is_symlink() or not output.resolve().is_relative_to(work.resolve()):
+        raise ValueError("debug_output_workspace_invalid")
+    output.mkdir(exist_ok=True, mode=0o700)
     os.chdir(output)
     recorder = core._recording
     case = runtime.Case(core, payload, root, deadline=0, stop=stop, debug_source="RUN_PURPOSE = 'authoring'\n")
@@ -107,8 +110,13 @@ def run(core, payload, store, stop):
             stop.wait(0.1)
             continue
         request = command["request_id"]
+        fragment_output = output / quote(request, safe="-_.")
+        if fragment_output.is_symlink() or not fragment_output.resolve().is_relative_to(output.resolve()):
+            raise ValueError("debug_output_workspace_invalid")
+        fragment_output.mkdir(exist_ok=True, mode=0o700)
+        os.chdir(fragment_output)
         case.stop = FragmentStop(stop, store, payload.task_id, payload.attempt_id, request)
-        case.deadline = time.monotonic() + command["timeout_sec"]
+        case.deadline = time.monotonic() + max(0, command["started_at"] + command["timeout_sec"] - time.time())
         case._latched_error = None
         case._failure_role = case._failure_ref = case._failure_title = ""
         case._source_ref = case._step_id = case._role = ""
@@ -174,11 +182,14 @@ def run(core, payload, store, stop):
             outcome.update(workspace_hash=workspace_hash, code_hash=code_hash)
             fragment = {"request_id": request, "workspace_hash": workspace_hash, "file_hashes": hashes,
                         "source_snapshot": case._source_snapshot, "source_hash": case._source_hash,
-                        "code_hash": code_hash, "script_path": command["script_path"], "first_action_seq": action_start + 1}
+                        "code_hash": code_hash, "script_path": command["script_path"], "first_action_seq": action_start + 1,
+                        "started_at": command["started_at"], "timeout_sec": command["timeout_sec"],
+                        "deadline_at": command["started_at"] + command["timeout_sec"], "output_workspace": str(fragment_output)}
             recorder.append("debug/started", fragment)
             store.update_metadata(payload.task_id, payload.attempt_id, {
                 "debug_state": "executing", "workspace_hash": workspace_hash,
-                "debug_last_command": {"request_id": request, "state": "running", "code_hash": code_hash}})
+                "debug_last_command": commands.current(store, payload.task_id, payload.attempt_id, request),
+                "output_workspace": str(fragment_output), "execution_started": "yes"})
             def trace(frame, event, arg):
                 if event == "line" and frame.f_code.co_filename.startswith(str(root)):
                     case._guard()

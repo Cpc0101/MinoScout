@@ -133,7 +133,8 @@ class ScriptRecords:
                 raise ValueError("debug_session_required")
             if capability == "debug.status":
                 from mino_scout.runtime.debug_checkpoints import progress
-                return {**self.store.status(task_id, attempt_id), "authoring_progress": progress(self.store, task_id, attempt_id), "command": debug_commands.current(self.store, task_id, attempt_id, params.get("client_request_id", ""))}
+                return {**debug_commands.status(self.store, task_id, attempt_id, params.get("client_request_id", "")),
+                        "authoring_progress": progress(self.store, task_id, attempt_id)}
             if capability == "debug.checkpoint_get":
                 from mino_scout.runtime.debug_checkpoints import get
                 return get(self.store, task_id, attempt_id, params.get("checkpoint_id", ""))
@@ -349,6 +350,7 @@ class ScriptRecords:
         debugging = job.get("execution_kind") == "debug"
         deadline = float("inf") if debugging else time.monotonic() + timeout
         fragment_stopping = None
+        stop_reason = ""
         stopping = None
         outcome = None
         from mino_scout.runtime.worker_stop import WorkerTree
@@ -400,12 +402,14 @@ class ScriptRecords:
                     overdue = command and command["state"] == "running" and time.time() >= command["started_at"] + command["timeout_sec"]
                     cancelled = command and command["state"] == "running" and command["cancel_requested"]
                     if overdue or cancelled:
+                        stop_reason = "cancelled" if cancelled else "script_timeout"
                         fragment_stopping = fragment_stopping or time.monotonic()
                         if time.monotonic() - fragment_stopping >= 2:
                             stop_proof = tree.terminate(process)
                             break
                     else:
                         fragment_stopping = None
+                        stop_reason = ""
                 if self.closed or job["stop"].is_set() or time.monotonic() >= deadline:
                     job["stop"].set()
                     stopping = stopping or time.monotonic()
@@ -427,11 +431,11 @@ class ScriptRecords:
             if stop_proof is None:
                 stop_proof = tree.terminate(process)
             if outcome is None:
-                timed_out = time.monotonic() >= deadline
+                timed_out = stop_reason == "script_timeout" or time.monotonic() >= deadline
                 outcome = {"status": "blocked", "reason_code": "script_timeout" if timed_out else "worker_interrupted",
                            "summary": "执行进程已停止，最后动作需要核验", "execution_started": "unknown",
                            "resource_isolated": True, "failure_stage": "execution"}
-                if job["stop"].is_set() and not timed_out:
+                if (stop_reason == "cancelled" or job["stop"].is_set()) and not timed_out:
                     outcome.update(status="cancelled", reason_code="cancelled")
             # store.start is the first durable operation before any execution or callback.
             current = self.store.status(job["task_id"], job["attempt_id"])
@@ -448,7 +452,11 @@ class ScriptRecords:
                 command = debug_commands.current(self.store, job["task_id"], job["attempt_id"])
                 if command and command["state"] in {"queued", "running"}:
                     receipt = debug_commands.finish(self.store, job["task_id"], job["attempt_id"], command["request_id"],
-                        {"status": "interrupted", "reason_code": "worker_interrupted", "write_stopped": True})
+                        {"status": "cancelled" if command["cancel_requested"] or outcome["reason_code"] == "cancelled" else
+                            "failed" if outcome["reason_code"] == "script_timeout" else "interrupted",
+                         "reason_code": "cancelled" if command["cancel_requested"] else outcome["reason_code"],
+                         "execution_started": "no" if command["state"] == "queued" else "unknown",
+                         "write_stopped": command["state"] != "queued"})
                     self.store.update_metadata(job["task_id"], job["attempt_id"], {"debug_last_command": receipt})
                 self.store.update_metadata(job["task_id"], job["attempt_id"], {"debug_state": "closed"})
             if stop_proof is not None:

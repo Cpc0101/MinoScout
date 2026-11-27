@@ -76,6 +76,10 @@ def run() -> int:
                     notes = [event for event in events if event['type'] == 'script/note']
                     if len(notes) != 2 or any(event['type'] == 'tool/call' for event in events):
                         raise RuntimeError('worker_probe_evidence_invalid')
+                from mino_scout.runtime.otp_probe import run as otp_probe
+                otp_probe()
+                from mino_scout.runtime.debug_probe import run as debug_probe
+                debug_probe()
                 print('PASS: real ScriptRecords.submit -> spawn -> 6 retained debug fragments -> close; forced GC; no network/device actions')
                 return 0
             finally:

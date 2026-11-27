@@ -315,9 +315,10 @@ def _literals_by_uid(rows) -> dict[bytes, bytes]:
 
 def _single_literal(rows, uid: bytes) -> Optional[bytes]:
     """单封 UID FETCH 的字面量。应答里认不出 UID 时，只有一段字面量就用它。"""
-    found = _literals_by_uid(rows).get(uid)
-    if found is not None:
-        return found
+    indexed = _literals_by_uid(rows)
+    if indexed:
+        # An explicit different UID cannot satisfy this request boundary.
+        return indexed.get(uid)
     literals = [bytes(row[1]) for row in (rows or [])
                 if isinstance(row, tuple) and len(row) >= 2 and isinstance(row[1], (bytes, bytearray))]
     return literals[0] if len(literals) == 1 else None
@@ -331,10 +332,10 @@ def _mailbox_number(mail, field: str) -> int:
 
 
 def capture_otp_boundary(*, inbox_address: str, imap_host: str, app_password: str,
-                         should_stop=None, max_wait_ms: int = 15000) -> dict:
+                         should_stop=None, max_wait_ms: int = 15000, progress: Optional[dict] = None) -> dict:
     """Read UIDVALIDITY/UIDNEXT before the script requests a new code. Never sends mail."""
     end = time.monotonic() + max(0, max_wait_ms) / 1000
-    stats = {}
+    stats = progress if progress is not None else {}
     mail = None
     def check():
         if should_stop and should_stop():
@@ -394,11 +395,16 @@ def _poll_inbox(
         guard(mail)
     typ, data = mail.uid("SEARCH", f"(UID {min_uid}:* SINCE {_imap_since_date(since_ts)})")
     stats["polls"] = stats.get("polls", 0) + 1
-    if typ != "OK" or not data or not data[0]:
+    if typ != "OK":
+        raise imaplib.IMAP4.error("UID SEARCH failed")
+    if not data or not data[0]:
         return ""
     # Bound each batch, not the entire search window. Later polls continue past
     # already classified mail, including messages for other shared-inbox users.
-    fresh = sorted((uid for uid in data[0].split() if uid not in seen and int(uid) >= min_uid), key=int, reverse=True)[:_SCAN_LIMIT]
+    candidates = data[0].split()
+    if any(not uid.isdigit() or int(uid) < 1 for uid in candidates):
+        raise imaplib.IMAP4.error("UID SEARCH returned invalid identifiers")
+    fresh = sorted((uid for uid in candidates if uid not in seen and int(uid) >= min_uid), key=int, reverse=True)[:_SCAN_LIMIT]
     if not fresh:
         return ""
     guard(mail)
@@ -406,7 +412,7 @@ def _poll_inbox(
     typ, rows = mail.uid("FETCH", b",".join(fresh).decode("ascii"),
                          f"(BODY.PEEK[HEADER.FIELDS ({_HEADER_FIELDS})])")
     if typ != "OK":
-        return ""
+        raise imaplib.IMAP4.error("UID header FETCH failed")
     headers = _literals_by_uid(rows)
     for uid in sorted(fresh, key=int, reverse=True):
         raw = headers.get(uid)
@@ -431,7 +437,9 @@ def _poll_inbox(
         stats["matched"] = len(matched)
         guard(mail)
         typ, rows = mail.uid("FETCH", uid.decode("ascii"), "(BODY.PEEK[])")
-        body = _single_literal(rows, uid) if typ == "OK" else None
+        if typ != "OK":
+            raise imaplib.IMAP4.error("UID body FETCH failed")
+        body = _single_literal(rows, uid)
         if not body:
             continue  # 正文没取回来：不下结论，下一轮再取
         seen.add(uid)
@@ -439,10 +447,12 @@ def _poll_inbox(
         if consumed_messages is not None and fingerprint in consumed_messages:
             continue
         full_message = email.message_from_bytes(body)
+        guard(mail)
         code = extract_otp_from_text(
             _collect_text_parts(full_message), subject=_decode_mime_header(full_message.get("Subject") or ""),
         )
         if code:
+            guard(mail)
             if consumed_messages is not None:
                 consumed_messages.add(fingerprint)
             return code
@@ -462,6 +472,7 @@ def fetch_otp_via_imap(
     max_wait_ms: int = 90_000,
     should_stop=None,
     deadline_ts: Optional[float] = None,
+    deadline_monotonic: Optional[float] = None,
     diagnostics: Optional[dict] = None,
     progress: Optional[dict] = None,
     consumed_messages: Optional[set[str]] = None,
@@ -481,9 +492,11 @@ def fetch_otp_via_imap(
         raise MailOtpError("otp_mailbox_boundary_invalid")
     interval = max(0.2, int(poll_interval_ms or 200) / 1000.0)
     deadline = time.time() + max(0.0, int(max_wait_ms) / 1000.0)
-    if deadline_ts:
+    if deadline_ts is not None:
         deadline = min(deadline, float(deadline_ts))
     monotonic_end = time.monotonic() + max(0.0, deadline - time.time())
+    if deadline_monotonic is not None:
+        monotonic_end = min(monotonic_end, float(deadline_monotonic))
     def remaining():
         return min(deadline - time.time(), monotonic_end - time.monotonic())
     def check():
@@ -492,6 +505,7 @@ def fetch_otp_via_imap(
         if remaining() <= 0:
             raise _WindowExpired()
     def io_timeout():
+        check()
         return max(0.001, min(_IO_TIMEOUT_S, remaining()))
     def guard(mail):
         check()
@@ -500,10 +514,10 @@ def fetch_otp_via_imap(
     password = normalize_app_password(app_password)
     try:
         host, port = parse_imap_host(imap_host or DEFAULT_IMAP_HOST)
-    except ValueError as exc:
-        raise MailOtpError("IMAP 服务器配置无效") from exc
+    except ValueError:
+        raise MailOtpError("otp_imap_host_invalid") from None
     if not inbox_address or not password:
-        raise MailOtpError("收信邮箱未配置")
+        raise MailOtpError("otp_environment_unavailable")
     stats = progress if progress is not None else {}
     stats.update(polls=0, messages=0, matched=0)
     diagnostics = diagnostics if diagnostics is not None else {}
@@ -515,9 +529,11 @@ def fetch_otp_via_imap(
     matched: set = set()
     mail = None
     try:
+        if should_stop and should_stop():
+            raise MailOtpError("otp_wait_stopped")
         while remaining() > 0:
             if should_stop and should_stop():
-                raise MailOtpError("任务已取消或已超过用例时间")
+                raise MailOtpError("otp_wait_stopped")
             delay = interval
             try:
                 check()
@@ -540,8 +556,7 @@ def fetch_otp_via_imap(
                     min_uid=mailbox_boundary["min_uid"] if mailbox_boundary else 1,
                 )
                 if code:
-                    if should_stop and should_stop():
-                        raise MailOtpError("otp_wait_stopped")
+                    check()
                     return code
                 last_error_code = ""
             except _WindowExpired:
@@ -569,14 +584,14 @@ def fetch_otp_via_imap(
             slept = 0.0
             while slept < delay and remaining() > 0:
                 if should_stop and should_stop():
-                    raise MailOtpError("任务已取消或已超过用例时间")
+                    raise MailOtpError("otp_wait_stopped")
                 step = max(0.0, min(0.5, delay - slept, remaining()))
                 time.sleep(step)
                 slept += step
     finally:
         _close(mail)
     if should_stop and should_stop():
-        raise MailOtpError("任务已取消或已超过用例时间")
+        raise MailOtpError("otp_wait_stopped")
     if last_error_code:
         raise MailOtpError(last_error_code, diagnostics=diagnostics)
     if stats.get('matched'):

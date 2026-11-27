@@ -121,52 +121,72 @@ def _gmail_code(case, policy=None, *, to_address=None, account_id="", request=No
     import time
 
     from mino_scout.plugins.mail_otp import MailOtpError, fetch_otp_via_imap
-    from mino_scout.server_comm.mail_requests import consume
+    from mino_scout.server_comm.mail_requests import consume, finish
+    from mino_scout.server_comm.otp_progress import Progress
     from mino_scout.runtime.script_exec import ScriptAbort
+    from mino_scout.runtime.secret_redaction import remember
 
     case._guard()
     policy = policy if isinstance(policy, dict) else {}
+    try:
+        wait_ms = int(policy.get("otp_max_wait_ms", _OTP_WAIT_DEFAULT_MS))
+        poll_ms = int(policy.get("otp_poll_interval_ms", 200))
+        if wait_ms <= 0 or poll_ms <= 0:
+            raise ValueError()
+    except (TypeError, ValueError, OverflowError):
+        raise ScriptAbort("验证码轮询预算无效", reason_code="otp_policy_invalid", status="blocked") from None
     recipient = str(getattr(case, "_mail_to", "") if to_address is None else to_address).strip()
     config, window = consume(case, policy, recipient, account_id, request)
-    # 等待窗口以 Nexus 登录策略为准；上限与 plugin.gmail.fetch_otp 一致，并受用例截止时间约束。
-    remain_ms = min(int(policy.get("otp_max_wait_ms") or _OTP_WAIT_DEFAULT_MS), _OTP_WAIT_CEILING_MS)
-    remain_ms = max(0, min(remain_ms, int((window["expires"] - time.monotonic()) * 1000)))
+    t0 = time.monotonic()
+    end = min(window["expires"], t0 + min(wait_ms, _OTP_WAIT_CEILING_MS) / 1000)
     if case.deadline:
-        remain_ms = max(0, min(remain_ms, int((case.deadline - time.monotonic()) * 1000)))
-    if remain_ms <= 0:
-        raise ScriptAbort("没有取到验证码", reason_code="otp_environment_unavailable", status="blocked")
+        end = min(end, case.deadline)
+    remain_ms = max(0, int((end - t0) * 1000))
+    tracker = Progress(case, state='waiting', deadline=end, request=request).start()
+    diagnostics, progress = tracker.diagnostics, tracker.stats
 
     def stopped() -> bool:
         case._guard()
         return False
 
-    diagnostics: dict = {}
-    progress: dict = {}
-    t0 = time.monotonic()
     try:
+        if remain_ms <= 0:
+            raise MailOtpError('otp_request_expired')
         code = fetch_otp_via_imap(
-            **config,
-            since_ts=window["started"],
-            mailbox_boundary=window["boundary"],
+            **config, since_ts=window["started"], mailbox_boundary=window["boundary"],
             from_allowlist=list(policy.get("otp_from_allowlist") or []),
             subject_contains=str(policy.get("otp_subject_contains") or ""),
-            poll_interval_ms=int(policy.get("otp_poll_interval_ms") or 200),
-            max_wait_ms=remain_ms,
-            should_stop=stopped,
-            diagnostics=diagnostics,
-            progress=progress,
+            poll_interval_ms=poll_ms, max_wait_ms=remain_ms, deadline_monotonic=end,
+            should_stop=stopped, diagnostics=diagnostics, progress=progress,
             consumed_messages=case._otp_messages.setdefault(tuple(config[key].lower() for key in
                 ("imap_host", "inbox_address", "to_address")), set()),
         )
-    except MailOtpError as exc:
-        _record_gmail_wait(case, t0, remain_ms, diagnostics, progress, error=str(exc))
-        raise ScriptAbort(str(exc), reason_code="otp_environment_unavailable", status="blocked") from exc
-    code = str(code or "").strip()
-    if not code:
-        _record_gmail_wait(case, t0, remain_ms, diagnostics, progress, error="没有取到验证码")
-        raise ScriptAbort("没有取到验证码", reason_code="otp_environment_unavailable", status="blocked")
-    _record_gmail_wait(case, t0, remain_ms, diagnostics, progress)
-    return code
+        case._guard()
+        if time.monotonic() >= end:
+            raise MailOtpError('otp_request_expired')
+        code = str(code or "").strip()
+        if not code:
+            raise MailOtpError('otp_mail_code_not_found')
+        # Register before reporting or any further callback can expose the value.
+        remember(code)
+        tracker.finish('succeeded')
+        _record_gmail_wait(case, t0, remain_ms, diagnostics, progress)
+        return code
+    except BaseException as exc:
+        reason = getattr(exc, 'reason_code', '') or (str(exc) if isinstance(exc, MailOtpError) else 'otp_wait_failed')
+        tracker.finish('cancelled' if reason == 'cancelled' else 'timed_out' if reason == 'script_timeout' else 'blocked', reason)
+        _record_gmail_wait(case, t0, remain_ms, diagnostics, progress, error=reason)
+        if isinstance(exc, MailOtpError):
+            raise ScriptAbort(str(exc), reason_code="otp_environment_unavailable", status="blocked") from None
+        raise
+    finally:
+        finish(case, window)
+
+
+def otp_status(case, *, request=None):
+    """Read existing OTP progress; never prepare a request or fetch another code."""
+    from mino_scout.server_comm.otp_progress import snapshot
+    return snapshot(case, request=request)
 
 
 def _record_gmail_wait(case, started: float, wait_ms: int, diagnostics: dict, progress: dict, error: str = "") -> None:
@@ -177,21 +197,29 @@ def _record_gmail_wait(case, started: float, wait_ms: int, diagnostics: dict, pr
     if not callable(report):
         return
     from mino_scout.runtime.script_exec import ActionResult
+    from mino_scout.server_comm.otp_progress import _ERRORS, _PHASES
 
+    error = error if not error or error in _ERRORS else "otp_wait_failed"
     data: dict[str, Any] = {"source": "gmail", "max_wait_ms": int(wait_ms)}
     for key in ("connection_attempts", "reconnects"):
         if type(diagnostics.get(key)) is int:
             data[key] = diagnostics[key]
-    for key in ("error_code", "phase"):
-        if isinstance(diagnostics.get(key), str) and diagnostics[key]:
+    for key, allowed in (("error_code", _ERRORS), ("phase", _PHASES)):
+        if isinstance(diagnostics.get(key), str) and diagnostics[key] in allowed:
             data[key] = diagnostics[key]
     for key in ("polls", "messages", "matched"):
         if type(progress.get(key)) is int:
             data[key] = progress[key]
     if error:
-        data["reason_code"] = "otp_environment_unavailable"
+        data["reason_code"] = error if error in {"cancelled", "script_timeout"} else "otp_environment_unavailable"
+        if error.startswith("otp_") and all(c in "abcdefghijklmnopqrstuvwxyz0123456789_" for c in error):
+            data["otp_error_code"] = error
     result = ActionResult(ok=not error, summary=error or "已取到验证码", status="blocked" if error else "pass", data=data)
-    report("otp", result, "core", int((time.monotonic() - started) * 1000))
+    try:
+        report("otp", result, "core", int((time.monotonic() - started) * 1000))
+    except Exception:
+        # A sealed record must not replace the original cancellation/timeout.
+        pass
 
 
 def _otp_source(case, account):

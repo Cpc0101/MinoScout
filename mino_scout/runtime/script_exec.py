@@ -600,6 +600,12 @@ class _Scout:
 
         return otp_request(self._case, account)
 
+    def otp_status(self, *, request=None) -> dict:
+        """只读已有请求进度；不准备新请求、不访问邮箱、不消费验证码。"""
+        from mino_scout.server_comm.callbacks import otp_status
+
+        return otp_status(self._case, request=request)
+
     def otp(self, account, *, request=None) -> str:
         """取验证码：账号自带码 → Nexus 登录策略 → 旧脚本仓固定码 → 人工。"""
         from mino_scout.server_comm.callbacks import otp
