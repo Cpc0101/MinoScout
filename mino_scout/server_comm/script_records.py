@@ -368,10 +368,14 @@ class ScriptRecords:
         try:
             while process.is_alive():
                 tree.capture()
-                if pipe.poll(0.1):
+                try:
+                    readable = pipe.poll(0.1)
+                except (EOFError, OSError):
+                    break
+                if readable:
                     try:
                         message = pipe.recv()
-                    except EOFError:
+                    except (EOFError, OSError):
                         break
                     if message.get("kind") == "result":
                         outcome = message["outcome"]
@@ -411,10 +415,10 @@ class ScriptRecords:
                 stop_proof = tree.terminate(process)
             if process.is_alive():
                 raise RuntimeError("worker_stop_unconfirmed")
-            if outcome is None and pipe.poll():
+            if outcome is None:
                 try:
-                    message = pipe.recv()
-                except EOFError:
+                    message = pipe.recv() if pipe.poll() else {}
+                except (EOFError, OSError):
                     message = {}
                 if message.get("kind") == "result":
                     outcome = message["outcome"]
