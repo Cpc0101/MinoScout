@@ -301,6 +301,13 @@ def main(argv: list[str] | None = None) -> int:
     configure_proxy_bypass()
 
     raw = list(argv) if argv is not None else sys.argv[1:]
+    # Parse zero-argument commands before any lifecycle dispatch or environment gate.
+    if raw and raw[0] in {'identity', 'status', 'stop', 'heavy-deps', 'run', 'start', 'probe'}:
+        parser = argparse.ArgumentParser(prog=f"mino-scout {raw[0]}")
+        try:
+            parser.parse_args(raw[1:])
+        except SystemExit as exc:
+            return int(exc.code)
     from mino_scout.config import development
     if development():
         if not raw:

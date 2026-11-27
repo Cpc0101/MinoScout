@@ -15,6 +15,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install .
+      - run: python -B scripts/check_cli_dispatch.py
       - run: python -B scripts/check_case_lifecycle.py
       - run: python -B scripts/check_worker_stop.py --callback
       - run: python -B scripts/check_web_auth_contracts.py
