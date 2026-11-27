@@ -161,10 +161,14 @@ def run() -> int:
             store=RecordStore(Path(root))
             store.create('otp-fixture','attempt-fixture',{'owner_user_id':'fixture'},'fixture-hash')
             store.start('otp-fixture','attempt-fixture')
-            c=case(); c._recorder=Recorder(store,'otp-fixture','attempt-fixture')
+            c=case(); c._debug_request_id='fixture-original-command'; c._recorder=Recorder(store,'otp-fixture','attempt-fixture')
             token=prepared(c)
             persisted=store.metadata('otp-fixture','attempt-fixture')['otp_wait']
             check('SQLite progress persisted',persisted['state']=='prepared' and 'request_ref' in persisted)
+            check('progress source command persists',persisted['command_request_id']=='fixture-original-command')
+            c._debug_request_id='fixture-next-command'
+            check('progress cannot migrate to next fragment',callbacks.otp_status(c,request=token)['command_request_id']=='fixture-original-command')
+            check('progress sample has source timing',persisted['sampled_at']>=persisted['started_at'])
             events=store.events('otp-fixture','attempt-fixture',limit=100)['items']
             check('read-only record events exposes progress',any(e['type']=='run/snapshot' and e['payload'].get('otp_wait',{}).get('state')=='prepared' for e in events))
             check('SQLite event redaction',all(x not in json.dumps(events) for x in ['fixture-secret-no-print','example.invalid',token,'654321']))

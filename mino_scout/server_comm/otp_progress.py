@@ -46,6 +46,8 @@ class Progress:
     def __init__(self, case, *, state, deadline, request=''):
         self.case, self.request = case, request
         self.started = time.monotonic()
+        self.started_at = time.time()
+        self.command_request_id = str(getattr(case, "_debug_request_id", "") or "")
         self.ended = None
         self.deadline = deadline
         self.state, self.error_code = state, ''
@@ -71,6 +73,8 @@ class Progress:
     def snapshot(self):
         with self._lock:
             data = {'state': self.state if self.state in _STATES else 'blocked',
+                    'started_at': self.started_at, 'sampled_at': time.time(),
+                    **({'command_request_id': self.command_request_id} if self.command_request_id else {}),
                     'elapsed_ms': max(0, int(((self.ended if self.ended is not None else time.monotonic()) - self.started) * 1000)),
                     'remaining_ms': max(0, int((self.deadline - time.monotonic()) * 1000)),
                     'max_wait_ms': max(0, int((self.deadline - self.started) * 1000))}

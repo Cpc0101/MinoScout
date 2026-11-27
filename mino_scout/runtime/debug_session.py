@@ -116,6 +116,7 @@ def run(core, payload, store, stop):
         fragment_output.mkdir(exist_ok=True, mode=0o700)
         os.chdir(fragment_output)
         case.output_dir = fragment_output
+        case._debug_request_id = request
         case.stop = FragmentStop(stop, store, payload.task_id, payload.attempt_id, request)
         case.deadline = time.monotonic() + max(0, command["started_at"] + command["timeout_sec"] - time.time())
         case._latched_error = None
