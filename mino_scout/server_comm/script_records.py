@@ -9,7 +9,7 @@ import hashlib
 import json
 import multiprocessing
 import os
-import signal
+import queue
 import threading
 import time
 from dataclasses import asdict, replace
@@ -191,7 +191,8 @@ class ScriptRecords:
             lane_active = self.core._web_v5.lane_index(attempt_id) is not None
             same_process = (original_generation == generation
                             and summary.get("execution_stopped") is True
-                            and summary.get("browser_closed") is True)
+                            and summary.get("browser_closed") is True
+                            and not meta.get("worker_process_stop"))
             started = process_started_at()
             finished = meta.get("finished_at")
             if not finished and summary.get("finished_at"):
@@ -213,12 +214,22 @@ class ScriptRecords:
                               and not active and not lane_active
                               and foreign_runtime_processes(summary["sn"]) == 0)
             retired = generation_retired or legacy_retired
+            from mino_scout.runtime.worker_stop import stopped as tree_stopped
+            tree_proof = meta.get("worker_process_stop")
+            terminated = (original_generation == generation and not active
+                          and tree_stopped(tree_proof))
             confirmed = (summary["platform"] == "web" and summary["sealed"]
-                         and not active and (same_process or retired))
+                         and not active and (same_process or retired or terminated))
+            if confirmed and lane_active:
+                # Only the exact external attempt claim can be cleared; no v5
+                # worker or another execution sharing a device is affected.
+                confirmed = self.core._web_v5.release_stopped_external(
+                    attempt_id, run_id=summary["run_id"], kind="script")
             return {**summary, "resource_stop": {
                 "contract": "script_resource_stop.v1", "stop_confirmed": bool(confirmed),
                 "worker_active": active, "browser_closed": bool(confirmed),
-                "mode": "same_process" if same_process else "retired_generation" if retired else "unconfirmed",
+                "mode": "terminated_attempt" if terminated else "same_process" if same_process else "retired_generation" if retired else "unconfirmed",
+                **({"process_tree_stop": tree_proof} if terminated else {}),
                 "scout_process_generation": generation, "process_started_at": started,
                 "reason_code": "web_lane_stopped" if confirmed else "stop_evidence_required",
             }}
@@ -294,8 +305,9 @@ class ScriptRecords:
             connected = ctx.Event()
             connected.set()
             connection_changed = ctx.Event()
+            launch = ctx.Event()
             parent_pipe, child_pipe = ctx.Pipe()
-            process = ctx.Process(target=_worker, args=(str(self.store.root), asdict(payload), asdict(worker_req), child_pipe, stop, connected, connection_changed), daemon=True,
+            process = ctx.Process(target=_worker, args=(str(self.store.root), asdict(payload), asdict(worker_req), child_pipe, stop, connected, connection_changed, launch), daemon=True,
                                   name="scout-script-" + payload.attempt_id[:16])
             job = {"task_id": payload.task_id, "attempt_id": payload.attempt_id, "run_id": payload.run_id,
                    "sn": payload.sn, "platform": payload.platform, "execution_kind": payload.execution_kind,
@@ -305,6 +317,11 @@ class ScriptRecords:
             try:
                 process.start()
                 child_pipe.close()
+                from mino_scout.runtime.worker_stop import WorkerTree
+                job["tree"] = WorkerTree(process.pid, contain=True)
+                if os.name == "nt" and job["tree"].job is None:
+                    raise RuntimeError("worker_containment_unavailable")
+                launch.set()
                 worker = threading.Thread(target=self._monitor, args=(job, parent_pipe, timeout), daemon=True, name="scout-script-monitor")
                 job["monitor"] = worker
                 worker.start()
@@ -332,8 +349,25 @@ class ScriptRecords:
         fragment_stopping = None
         stopping = None
         outcome = None
+        from mino_scout.runtime.worker_stop import WorkerTree
+        tree = job.get("tree") or WorkerTree(process.pid, contain=True)
+        stop_proof = None
+        replies = queue.SimpleQueue()
+        callback_thread = None
+
+        def callback(message):
+            ask = getattr(self.core, "nexus_call", None)
+            try:
+                reply = ask(P.Execute(**message["request"]), message["timeout"]) if callable(ask) else None
+                result = {"reply": asdict(reply) if reply is not None else None}
+            except Exception as exc:
+                from mino_scout.server_comm.nexus_link import NexusCallbackError
+                result = {"reply": None, "callback_error": exc.code if isinstance(exc, NexusCallbackError) else "nexus_transport_error"}
+            replies.put({**result, "callback_request_id": message.get("callback_request_id")})
+
         try:
             while process.is_alive():
+                tree.capture()
                 if pipe.poll(0.1):
                     try:
                         message = pipe.recv()
@@ -342,19 +376,18 @@ class ScriptRecords:
                     if message.get("kind") == "result":
                         outcome = message["outcome"]
                     elif message.get("kind") == "call":
-                        ask = getattr(self.core, "nexus_call", None)
-                        try:
-                            reply = ask(P.Execute(**message["request"]), message["timeout"]) if callable(ask) else None
-                            pipe.send({"reply": asdict(reply) if reply is not None else None,
-                                       "callback_request_id": message.get("callback_request_id")})
-                        except Exception as exc:
-                            from mino_scout.server_comm.nexus_link import NexusCallbackError
-                            code = exc.code if isinstance(exc, NexusCallbackError) else "nexus_transport_error"
-                            try:
-                                pipe.send({"reply": None, "callback_error": code,
-                                           "callback_request_id": message.get("callback_request_id")})
-                            except (BrokenPipeError, OSError):
-                                pass
+                        if callback_thread is not None and callback_thread.is_alive():
+                            replies.put({"reply": None, "callback_error": "nexus_callback_busy",
+                                         "callback_request_id": message.get("callback_request_id")})
+                        else:
+                            callback_thread = threading.Thread(target=callback, args=(message,), daemon=True,
+                                                               name="scout-script-callback")
+                            callback_thread.start()
+                while not replies.empty():
+                    try:
+                        pipe.send(replies.get_nowait())
+                    except (BrokenPipeError, OSError):
+                        break
                 if debugging:
                     from mino_scout.runtime import debug_commands
                     command = debug_commands.current(self.store, job["task_id"], job["attempt_id"])
@@ -363,7 +396,7 @@ class ScriptRecords:
                     if overdue or cancelled:
                         fragment_stopping = fragment_stopping or time.monotonic()
                         if time.monotonic() - fragment_stopping >= 2:
-                            _terminate(process)
+                            stop_proof = tree.terminate(process)
                             break
                     else:
                         fragment_stopping = None
@@ -371,11 +404,11 @@ class ScriptRecords:
                     job["stop"].set()
                     stopping = stopping or time.monotonic()
                     if time.monotonic() - stopping >= 2:
-                        _terminate(process)
+                        stop_proof = tree.terminate(process)
                         break
             process.join(timeout=2)
             if process.is_alive():
-                _terminate(process)
+                stop_proof = tree.terminate(process)
             if process.is_alive():
                 raise RuntimeError("worker_stop_unconfirmed")
             if outcome is None and pipe.poll():
@@ -385,6 +418,8 @@ class ScriptRecords:
                     message = {}
                 if message.get("kind") == "result":
                     outcome = message["outcome"]
+            if stop_proof is None:
+                stop_proof = tree.terminate(process)
             if outcome is None:
                 timed_out = time.monotonic() >= deadline
                 outcome = {"status": "blocked", "reason_code": "script_timeout" if timed_out else "worker_interrupted",
@@ -400,11 +435,17 @@ class ScriptRecords:
                         {"status": "interrupted", "reason_code": "worker_interrupted", "write_stopped": True})
                     self.store.update_metadata(job["task_id"], job["attempt_id"], {"debug_last_command": receipt})
                 self.store.update_metadata(job["task_id"], job["attempt_id"], {"debug_state": "closed"})
+            if stop_proof is not None:
+                self.store.update_metadata(job["task_id"], job["attempt_id"], {"worker_process_stop": stop_proof})
+            from mino_scout.runtime.worker_stop import stopped as tree_stopped
+            if stop_proof is not None and not tree_stopped(stop_proof):
+                outcome["resource_isolated"] = True
             outcome["execution_stopped"] = True
             self.store.finish(job["task_id"], job["attempt_id"], outcome)
         except Exception as exc:
-            _terminate(process)
+            stop_proof = tree.terminate(process)
             try:
+                self.store.update_metadata(job["task_id"], job["attempt_id"], {"worker_process_stop": stop_proof})
                 self.store.finish(job["task_id"], job["attempt_id"], {"status": "blocked", "reason_code": "record_unavailable",
                     "summary": type(exc).__name__, "execution_started": "unknown", "resource_isolated": True})
             except Exception:
@@ -415,7 +456,8 @@ class ScriptRecords:
             if lane_key and job.get("claim_state") == "created":
                 browser_closed = bool(outcome and outcome.get("browser_closed") is True)
                 stopped = not process.is_alive()
-                if stopped and browser_closed:
+                from mino_scout.runtime.worker_stop import stopped as tree_stopped
+                if stopped and (tree_stopped(stop_proof) if stop_proof is not None else browser_closed):
                     self.core._web_v5.release_external(lane_key)
                 else:
                     self.core._web_v5.quarantine_external(lane_key)
@@ -470,57 +512,65 @@ class ScriptRecords:
 
 
 def _terminate(process):
-    if not process.is_alive():
-        return
-    # Capture identities while the worker still owns its children. Reparented
-    # browsers must not survive a timeout/cancel after the worker exits first.
-    children = []
-    try:
-        import psutil
-        children = psutil.Process(process.pid).children(recursive=True)
-        for child in children:
-            child.create_time()
-    except Exception:
-        pass
-    if os.name != "nt":
-        try:
-            if os.getpgid(process.pid) == process.pid:
-                os.killpg(process.pid, signal.SIGTERM)
-            else:
-                process.terminate()
-        except ProcessLookupError:
-            pass
-    else:
-        process.terminate()
-    process.join(timeout=1)
-    if process.is_alive():
-        process.kill()
-        process.join(timeout=1)
-    for child in reversed(children):
-        try:
-            if child.is_running():
-                child.kill()
-                child.wait(timeout=1)
-        except Exception:
-            pass  # No browser-closed receipt is invented for forced cleanup.
+    if process.pid is not None:
+        from mino_scout.runtime.worker_stop import WorkerTree
+        return WorkerTree(process.pid).terminate(process)
 
 
-def _worker(store_root, payload_raw, request_raw, pipe, stop, connected, connection_changed):
+def _worker(store_root, payload_raw, request_raw, pipe, stop, connected, connection_changed, launch):
     """Spawn entry point: module-level for frozen Windows/macOS launchers."""
-    from mino_scout.cli import build_core
-    from mino_scout.runtime import script_repo, script_exec
-    from mino_scout.server_comm.script_dispatch import _lease, _missing
+    if not launch.wait(15):
+        pipe.close()
+        return
     if os.name != "nt":
         os.setsid()
     parent = multiprocessing.parent_process()
     def watch_parent():
+        from mino_scout.runtime.worker_stop import WorkerTree, _live
+        import psutil
+        tree = WorkerTree(os.getpid())
         while parent is not None and parent.is_alive():
+            tree.capture()
             time.sleep(0.5)
         if parent is not None:
             stop.set()
             time.sleep(2)
-            os._exit(70)  # Durable intent is recovered; orphan workers never keep writing.
+            try:
+                frozen = set()
+                for _ in range(8):
+                    tree.capture()
+                    pending = [identity for identity in tree.identities.values()
+                               if identity['pid'] != tree.pid and identity['pid'] not in frozen]
+                    if not pending:
+                        break
+                    for identity in pending:
+                        try:
+                            target = _live(identity)
+                            if target is not None:
+                                target.suspend()
+                                frozen.add(target.pid)
+                        except (psutil.Error, OSError):
+                            pass
+                for identity in reversed(list(tree.identities.values())):
+                    if identity['pid'] == tree.pid:
+                        continue
+                    try:
+                        target = _live(identity)
+                        if target is not None:
+                            target.kill()
+                    except (psutil.Error, OSError):
+                        try:
+                            target = _live(identity)
+                            if target is not None and target.pid in frozen:
+                                target.resume()
+                        except (psutil.Error, OSError):
+                            pass
+            finally:
+                os._exit(70)  # No parent remains to reap or persist a stop proof.
     threading.Thread(target=watch_parent, daemon=True, name="scout-parent-watch").start()
+    from mino_scout.cli import build_core
+    from mino_scout.runtime import script_repo, script_exec
+    from mino_scout.server_comm.script_dispatch import _lease, _missing
     store = RecordStore(Path(store_root))
     payload = P.ScriptRun(**payload_raw)
     req = P.Execute(**request_raw)

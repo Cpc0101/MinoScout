@@ -28,7 +28,7 @@ _OTP_CONTEXT_RE = re.compile(
 # 过滤只用得到这些头；命中过滤条件的邮件才取正文。
 _HEADER_FIELDS = "DATE FROM SUBJECT TO DELIVERED-TO X-ORIGINAL-TO ENVELOPE-TO"
 _SCAN_LIMIT = 40
-_IO_TIMEOUT_S = 5.0
+_IO_TIMEOUT_S = 25.0
 _UID_RE = re.compile(rb"\bUID (\d+)")
 _IMAP_HOST_RE = re.compile(r"(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?")
 _IMAP_TLS_PORT = 993

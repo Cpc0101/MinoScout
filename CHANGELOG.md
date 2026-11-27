@@ -1,3 +1,10 @@
+## 0.1.173 · 2026-11-27
+
+- 父进程独立核验取消/超时的执行进程树；同代际停止证明与原 UNKNOWN 结果分离，停止后释放准确 Web lane。
+- PID 与创建时间绑定，强杀前冻结并复核子进程，避免遗留浏览器；停止证据不足仍隔离。
+- IMAP 单次 I/O 上限由 5 秒改为 25 秒，仍受整体等待窗口限制，不重发业务操作。
+- 发布检查覆盖真实原生子进程取消/超时、历史结果不变与下一 lane 申请。
+
 ## 0.1.172 — 2026-11-26
 
 - Page script failures retain credential-free executor_failure categories and phases in sealed action evidence; JavaScript source, exception messages and page contents are not copied into diagnostics.

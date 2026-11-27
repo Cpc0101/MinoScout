@@ -345,6 +345,19 @@ class WebV5Runtime:
             self.condition.notify_all()
             return True
 
+    def release_stopped_external(self, key, *, run_id=None, kind=None):
+        """Clear the exact external claim after the record manager verifies stop."""
+        key = str(key or "").strip()
+        with self.condition:
+            lane = next((x for x in self.lanes if x["run"] == key and x["external"]), None)
+            if (lane is None
+                    or (run_id is not None and lane.get("external_run") != str(run_id))
+                    or (kind is not None and lane.get("external_kind") != str(kind))):
+                return False
+            lane.update(run="", external=False, external_run="", external_kind="", quarantined=False)
+            self.condition.notify_all()
+            return True
+
     def quarantine_external(self, key):
         """Keep the lane occupied when worker/browser termination is unconfirmed."""
         key = str(key or "").strip()

@@ -90,6 +90,8 @@ jobs:
           python -m pip install .
       - name: Check execution lifecycle contracts
         run: python -B scripts/check_case_lifecycle.py
+      - name: Check native worker stop and lane recovery
+        run: python -B scripts/check_worker_stop.py --callback
       - name: Check Web authentication contracts
         run: python -B scripts/check_web_auth_contracts.py
       - name: Web observation contracts
