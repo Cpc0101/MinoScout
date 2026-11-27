@@ -88,6 +88,8 @@ jobs:
           python -m pip install -U pip
           python -m pip install pyinstaller
           python -m pip install .
+      - name: Check actual worker submission and startup
+        run: python -B scripts/check_worker_start.py
       - name: Check lifecycle CLI argument safety
         run: python -B scripts/check_cli_dispatch.py
       - name: Check execution lifecycle contracts

@@ -311,8 +311,10 @@ class ScriptRecords:
                                   name="scout-script-" + payload.attempt_id[:16])
             job = {"task_id": payload.task_id, "attempt_id": payload.attempt_id, "run_id": payload.run_id,
                    "sn": payload.sn, "platform": payload.platform, "execution_kind": payload.execution_kind,
-                   "stop": stop, "connected": connected, "connection_changed": connection_changed, "process": process, "lane_key": lane_key,
+                   "stop": stop, "connected": connected, "connection_changed": connection_changed,
+                   "launch": launch, "process": process, "lane_key": lane_key,
                    "lane_index": lane_index, "claim_state": claim_state}
+            # Process.start drops its args; named semaphores must survive child unpickling.
             self.jobs[payload.attempt_id] = job
             try:
                 process.start()
@@ -431,6 +433,16 @@ class ScriptRecords:
                            "resource_isolated": True, "failure_stage": "execution"}
                 if job["stop"].is_set() and not timed_out:
                     outcome.update(status="cancelled", reason_code="cancelled")
+            # store.start is the first durable operation before any execution or callback.
+            current = self.store.status(job["task_id"], job["attempt_id"])
+            if current.get("started_at") is None and outcome.get("reason_code") in {
+                    "worker_interrupted", "cancelled", "script_timeout"}:
+                cancelled = bool(current.get("cancel_requested"))
+                outcome = {"status": "cancelled" if cancelled else "fail",
+                           "reason_code": "cancelled" if cancelled else "worker_start_failed",
+                           "summary": f"Worker exited before startup (exitcode={process.exitcode})",
+                           "execution_started": "no", "resource_isolated": False,
+                           "failure_stage": "admission"}
             if debugging:
                 from mino_scout.runtime import debug_commands
                 command = debug_commands.current(self.store, job["task_id"], job["attempt_id"])

@@ -302,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
 
     raw = list(argv) if argv is not None else sys.argv[1:]
     # Parse zero-argument commands before any lifecycle dispatch or environment gate.
-    if raw and raw[0] in {'identity', 'status', 'stop', 'heavy-deps', 'run', 'start', 'probe'}:
+    if raw and raw[0] in {'identity', 'status', 'stop', 'heavy-deps', 'run', 'start', 'probe', 'worker-check'}:
         parser = argparse.ArgumentParser(prog=f"mino-scout {raw[0]}")
         try:
             parser.parse_args(raw[1:])
@@ -344,6 +344,9 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             print(str(exc), file=sys.stderr)
             return 2
+    if sub == "worker-check":
+        from mino_scout.runtime.worker_probe import run
+        return run()
     if sub == "check":
         return cmd_check(raw[1:])
     if sub == "identity":

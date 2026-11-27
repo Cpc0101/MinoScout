@@ -11,7 +11,7 @@ from mino_scout import cli
 
 
 def main():
-    commands = ('identity', 'status', 'stop', 'heavy-deps', 'run', 'start', 'probe')
+    commands = ('identity', 'status', 'stop', 'heavy-deps', 'run', 'start', 'probe', 'worker-check')
     handlers = ('cmd_status', 'cmd_stop', 'cmd_heavy_deps', 'cmd_run', 'cmd_probe',
                 'collect_status', 'try_start_service', 'build_core')
     with contextlib.ExitStack() as stack:
@@ -27,7 +27,7 @@ def main():
         with patch('mino_scout.config.development', return_value=False):
             assert cli.main(['stop']) == 0
         stop.assert_called_once_with()
-    print('PASS: 56 development/production help and invalid-argument checks; plain stop dispatch preserved; no real service touched')
+    print('PASS: 64 development/production help and invalid-argument checks; plain stop dispatch preserved; no real service touched')
 
 
 if __name__ == '__main__':

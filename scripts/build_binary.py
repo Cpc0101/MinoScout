@@ -413,6 +413,14 @@ def check(dist_dir: Path) -> int:
     if '"node_id"' not in stdout and '"node_id"' not in stderr:
         print("自检失败：probe 没有输出 manifest")
         return 1
+    worker = subprocess.run([str(exe), "worker-check"], capture_output=True, text=True,
+        encoding="utf-8", errors="replace", env=env, timeout=180, cwd=str(dist_dir), stdin=subprocess.DEVNULL)
+    print("--- frozen worker submit check ---")
+    print(worker.stdout[-4000:])
+    print(worker.stderr[-4000:])
+    if worker.returncode != 0 or 'PASS: real ScriptRecords.submit' not in worker.stdout:
+        print(f"自检失败：frozen worker submit rc={worker.returncode}")
+        return 1
     print(f"自检通过。产物大小：{dir_size_mb(dist_dir)} MB")
     return 0
 
