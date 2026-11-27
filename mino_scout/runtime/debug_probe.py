@@ -50,15 +50,17 @@ def run():
             with store._db('clocks') as db:
                 db.execute('UPDATE attempts SET started_at=?', (time.time() - 600,))
             for request in ('first', 'second'):
-                submit(identity, request, "from pathlib import Path\nPath('same-name.txt').write_text('" + request + "')")
+                submit(identity, request, "from pathlib import Path\nPath('same-name.txt').write_text('" + request + "')\n(case.output_dir / 'sdk-output.txt').write_text('" + request + "')")
                 done = _wait(lambda: read(identity, request), lambda x: x['command']['state'] == 'completed')
                 assert done['command']['result']['status'] == 'completed', done
                 assert done['session_age_ms'] >= 600000 and done['command']['elapsed_ms'] < 10000, done
                 assert done['session_state'] == 'ready' and done['active_command'] is None, done
                 assert done['execution_started'] == 'yes', done
                 assert Path(done['output_workspace'], 'same-name.txt').read_text() == request
+                assert Path(done['output_workspace'], 'sdk-output.txt').read_text() == request
             first_path = Path(done['output_workspace']).parent / 'first' / 'same-name.txt'
             assert first_path.read_text() == 'first'
+            assert (first_path.parent / 'sdk-output.txt').read_text() == 'first'
             submit(identity, 'block', 'import time\ntime.sleep(60)', timeout=1)
             current = _wait(lambda: read(identity, 'first'), lambda x: x['active_command'] is not None)
             assert current['command']['request_id'] == 'first'

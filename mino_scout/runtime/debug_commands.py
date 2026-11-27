@@ -94,7 +94,7 @@ def submit(store, task, attempt, params, *, accept_new=True):
 def current(store, task, attempt, request_id=""):
     with store._db(task) as db:
         _table(db)
-        row = db.execute("SELECT * FROM debug_commands WHERE attempt_id=?" + (" AND request_id=?" if request_id else " ORDER BY created_at DESC LIMIT 1"),
+        row = db.execute("SELECT * FROM debug_commands WHERE attempt_id=?" + (" AND request_id=?" if request_id else " ORDER BY created_at DESC, rowid DESC LIMIT 1"),
                          (attempt, identifier(request_id)) if request_id else (attempt,)).fetchone()
         return view(row) if row else None
 
