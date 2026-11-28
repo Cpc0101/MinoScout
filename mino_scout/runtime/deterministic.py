@@ -103,7 +103,22 @@ def observe(app, control, field, text):
     })
 
 
-def verify(app, kind, subject, *, control="", wanted=True, timeout_ms=0, ocr=False, region=None):
+def _fold_text(value):
+    return "".join(ch for ch in str(value).casefold() if ch.isalnum())
+
+
+def loose_text(expected, observed):
+    """Spacing, case and joined words. Not a substring and not a synonym."""
+    needle = _fold_text(expected)
+    if len(needle) < 2:
+        return ""
+    for item in observed:
+        if _fold_text(item) == needle:
+            return str(item)
+    return ""
+
+
+def verify(app, kind, subject, *, control="", wanted=True, timeout_ms=0, ocr=False, region=None, strict=False):
     from mino_scout.runtime.script_exec import ActionResult, ScriptAbort
     if type(timeout_ms) is not int or not 0 <= timeout_ms <= 60000:
         raise ScriptAbort("timeout_ms 必须是 0..60000", reason_code="assertion_invalid", status="blocked")
@@ -120,6 +135,15 @@ def verify(app, kind, subject, *, control="", wanted=True, timeout_ms=0, ocr=Fal
         value, actual, sufficient = read_condition(app, kind, subject, control, ocr, region)
         passed = sufficient and type(value) is type(wanted) and value == wanted
         if passed or time.monotonic() >= deadline:
+            close = ""
+            if not passed and not strict and kind == "text" and wanted is True and sufficient and subject:
+                close = loose_text(subject, (actual or {}).get("observed") or [])
+            if close:
+                app.case._assert("ocr_text" if ocr else kind, "accepted", expected=expected, actual={**(actual or {}), "accepted_text": close},
+                                 observation_id=app._observation_id, artifact_id=app._artifact_id, app=app.key,
+                                 reason_code="accepted_difference", message=f"文案可接受差异：期望「{subject}」，实际「{close}」")
+                app.case._accepted_differences.append({"expected": str(subject), "actual": close, "source_ref": app.case._source_ref, "artifact_id": app._artifact_id or ""})
+                return ActionResult(ok=True, status="pass", summary=f"文案可接受差异：{close}", data={**(actual or {}), "accepted_text": close})
             status = "pass" if passed else "fail" if sufficient else "unknown"
             reason = "" if passed else "assertion_failed" if sufficient else "observation_insufficient"
             app.case._assert("ocr_text" if ocr else kind, status, expected=expected, actual=actual,

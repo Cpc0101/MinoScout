@@ -438,13 +438,14 @@ def _report_outcome(case, outcome):
                     })
     from mino_scout.runtime.business_report import build_report
     assertions = case._assertions
-    counts = {"total": len(assertions), "pass": sum(r["status"] == "pass" for r in assertions),
-              "fail": sum(r["status"] == "fail" for r in assertions), "unknown": sum(r["status"] not in {"pass", "fail"} for r in assertions)}
+    counts = {"total": len(assertions), "pass": sum(r["status"] in {"pass", "accepted"} for r in assertions),
+              "fail": sum(r["status"] == "fail" for r in assertions), "unknown": sum(r["status"] not in {"pass", "fail", "accepted"} for r in assertions)}
     # The durable path builds the final report from full events at RecordStore.finish.
     # Legacy synchronous nodes still return a bounded business projection.
     meta = {"source_snapshot": case._source_snapshot, "source_hash": case._source_hash,
             "run_purpose": case._model_gate.run_purpose, "source_context": case._source_context}
-    outcome.update(assertions=counts, test_report=build_report(meta, outcome, [(0, "assertion/result", r) for r in assertions]))
+    outcome.update(assertions=counts, accepted_differences=list(case._accepted_differences),
+                   test_report=build_report(meta, outcome, [(0, "assertion/result", r) for r in assertions]))
     usage = outcome["test_report"]["model_usage"]
     gate = case._model_gate
     usage.update(calls=gate.calls, llm_calls=sum(count for key, count in gate.by_rule.items() if key[0] == "llm"),
@@ -774,6 +775,7 @@ class Case:
         self._source_ref = ""
         self._step_id = ""
         self._assertions: list[dict] = []
+        self._accepted_differences: list[dict] = []
         self._latched_error: ScriptAbort | None = None
         self._failure_role = ""
         self._failure_ref = ""
@@ -860,7 +862,7 @@ class Case:
         self._assertions.append(row)
         if self._recorder:
             self._recorder.append("assertion/result", row)
-        if status != "pass":
+        if status not in {"pass", "accepted"}:
             self._latched_error = self._latched_error or ScriptAbort(str(evidence.get("message") or "断言未通过"),
                 reason_code=str(evidence.get("reason_code") or "assertion_failed"), status="blocked" if status == "unknown" else "fail")
         return row
@@ -1174,7 +1176,22 @@ class App:
         return self._device("clear_app_cache", {"package": self._package, "bundle": self._package, "bundle_id": self._package})
 
     def version(self) -> ActionResult:
-        return self._device("get_app_version", {"package": self._package, "bundle": self._package, "bundle_id": self._package})
+        params = {"package": self._package, "bundle": self._package, "bundle_id": self._package}
+        result = self._device("get_app_version", params)
+        expected = self._case._expected_build
+        raw = result.data if isinstance(result.data, dict) else {}
+        actual = str(raw.get("version_name") or raw.get("version") or "")
+        code = raw.get("version_code")
+        if actual and code is not None and str(code).strip():
+            actual = f"{actual} ({code})"
+        package_path = ""
+        inputs = self._case.data.inputs if hasattr(self._case, "data") else {}
+        if isinstance(inputs, dict):
+            package_path = str(inputs.get("package_path") or "")
+        if expected and package_path and not _build_matches(actual, expected):
+            self.install(package_path)
+            result = self._device("get_app_version", params)
+        return result
 
     def foreground(self) -> ActionResult:
         return self._device("get_foreground_app", {})
@@ -1534,9 +1551,9 @@ class App:
         return on_page(self, page_key)
 
     def expect_text(self, text: str, *, control: str = "", present: bool = True, timeout_ms: int = 0,
-                    ocr: bool = False, region=None):
+                    ocr: bool = False, region=None, strict: bool = False):
         from mino_scout.runtime.deterministic import verify
-        return verify(self, "text", text, control=control, wanted=present, timeout_ms=timeout_ms, ocr=ocr, region=region)
+        return verify(self, "text", text, control=control, wanted=present, timeout_ms=timeout_ms, ocr=ocr, region=region, strict=strict)
 
     def expect_state(self, control: str, state: str, expected: bool = True, *, timeout_ms: int = 0):
         from mino_scout.runtime.deterministic import verify

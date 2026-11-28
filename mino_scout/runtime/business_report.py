@@ -74,10 +74,10 @@ def build_report(meta, outcome, events):
         observed = [(seq, row) for seq, row in assertions if row.get("source_ref") == ref]
         # A later passing page assertion must never hide an earlier business failure.
         failed = [(seq, row) for seq, row in observed if row.get("status") == "fail"]
-        unknown = [(seq, row) for seq, row in observed if row.get("status") not in {"pass", "fail"}]
+        unknown = [(seq, row) for seq, row in observed if row.get("status") not in {"pass", "fail", "accepted"}]
         chosen = (failed or unknown or observed)
         seq, row = chosen[0] if failed or unknown else chosen[-1] if chosen else (0, {})
-        status = row.get("status", "not_run") if not observed or row.get("status") in {"pass", "fail", "unknown"} else "unknown"
+        status = "pass" if row.get("status") == "accepted" else row.get("status", "not_run") if not observed or row.get("status") in {"pass", "fail", "unknown", "accepted"} else "unknown"
         reason = str(row.get("reason_code") or ("assertion_failed" if status == "fail" else ""))
         descriptions = [_describe(value) for _, value in failed + unknown + [pair for pair in observed if pair[1].get("status") == "pass"]]
         expected_text = "\n".join(value[0] for value in descriptions) if descriptions else _short(clause.get("text"))
@@ -109,9 +109,9 @@ def build_report(meta, outcome, events):
     failure = {"source_ref": failure_ref, "title": str(outcome.get("failure_title") or "")[:300],
                "actual": _short(outcome.get("summary")), "event_seq": failures[0][0] if failures else 0}
     auxiliary = [row for _, row in assertions if row.get("source_ref") not in {str(c.get("id") or "") for c in expectations}]
-    auxiliary_counts = {"total": len(auxiliary), "pass": sum(r.get("status") == "pass" for r in auxiliary),
+    auxiliary_counts = {"total": len(auxiliary), "pass": sum(r.get("status") in {"pass", "accepted"} for r in auxiliary),
                         "fail": sum(r.get("status") == "fail" for r in auxiliary),
-                        "unknown": sum(r.get("status") not in {"pass", "fail"} for r in auxiliary)}
+                        "unknown": sum(r.get("status") not in {"pass", "fail", "accepted"} for r in auxiliary)}
     purpose = "preparation" if (meta.get("source_context") or {}).get("purpose") == "prepare" else meta.get("run_purpose", "unclassified")
     return {"version": 1, "run_purpose": purpose, "counts": counts,
             "auxiliary_assertions": auxiliary_counts,

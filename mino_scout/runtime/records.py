@@ -211,6 +211,7 @@ class RecordStore:
                 **({"otp_wait": meta["otp_wait"]} if "otp_wait" in meta else {}),
                 "data_outputs": meta.get("data_outputs", {}), "data_missing": meta.get("data_missing", []),
                 "tested_build": meta.get("tested_build", ""),
+                "accepted_differences": meta.get("accepted_differences", []),
                 "source_hash": meta.get("source_hash", ""), "source_coverage": meta.get("source_coverage", {}),
                 **({"test_report": meta["test_report"]} if "test_report" in meta else {}),
                 "cancel_requested": bool(row["cancel_requested"]),
@@ -290,7 +291,7 @@ class RecordStore:
             metadata = json.loads(row["metadata"])
             from mino_scout.server_comm.protocol import validate_data_summary
             outcome = {**outcome, **validate_data_summary({**metadata, **outcome})}
-            metadata.update({key: outcome[key] for key in ("failure_stage", "execution_started", "source_coverage", "execution_stopped", "browser_closed", "data_outputs", "data_missing") if key in outcome})
+            metadata.update({key: outcome[key] for key in ("failure_stage", "execution_started", "source_coverage", "execution_stopped", "browser_closed", "data_outputs", "data_missing", "accepted_differences") if key in outcome})
             from mino_scout.runtime.business_report import build_report
             events = [(seq, kind, json.loads(data)) for seq, kind, data in db.execute(
                 "SELECT seq,type,data FROM events WHERE attempt_id=? ORDER BY seq", (attempt_id,))]
