@@ -1385,3 +1385,17 @@ actor、browser context 和 page/tab 在一条用例内隔离，不得跨用例�
 ```
 
 失败组分类固定为 `stable_repeated_failure`、`recurrent_failure`、`fail_then_pass`、`single_failure`。`recurrent_failure` 表示同一签名先失败、出现过通过、随后再次失败；不能归为已恢复。文本签名前必须把失败阶段纳入规范化，并把 UUID、时间、request id、端口、带业务前缀的 ID 和路径中的稳定对象 ID 等易变片段规范化；HTTP 3 位状态码必须保留，`404` 与 `500` 不得合并。签名相同且可比的历史才归入同一组。比较兼容性至少核对 app、platform、environment baseline、env profile、env surface、tested build、execution mode、case identity 和 fixture digest。任一关键字段缺失或变化时，观测进入 `incomparable` 并附 `reason_codes`，不能推断为稳定失败或已恢复。
+
+## 外部测试文件资源回调
+
+沿用 `EXECUTE/RESULT`，不增加信封/dataclass 字段。Scout 发布 runtime capability `{id:"asset.transfer",executor:"core",platform_scope:"all",contract_version:1,features:["publish","fetch","sha256","local_library","pending_register"]}`。显式文件引用仍通过 `ScriptRun.inputs` 的 `{asset_id,version}` 传入；Nexus 派单检查 `local_library` 能力，并拒绝把引用派到 `source.node_id` 以外的节点。旧节点不会收到显式资产引用任务。
+
+| capability_id | params（除已有准入字段） | RESULT.data |
+|---|---|---|
+| `asset.list` | kind/attributes/limit | 当前项目 ready 资产目录 |
+| `asset.begin` | asset（固定逻辑版本、sha256/md5/size_bytes、元数据） | ready 引用、`location=scout_library`，或 deduplicated |
+| `asset.upload` | asset_id/version | 已登记引用 |
+| `asset.complete` | asset_id/version | 已登记引用 |
+| `asset.download` | asset_id/version | ready 引用；Scout 再按 SHA-256 打开本机库 |
+
+Nexus 从仍有效的 admission 推导项目与执行身份，并把执行节点写入 `source.node_id`。客户端不能跨项目获取。响应不含传输 URL。三种位置分开：生成任务的文件在 `execution/<task_id>/attempts/<attempt>/output/`，`publish` 才复制到 `~/.mino/scout/assets/<账号>/library/<sha256>`；用例执行时 `fetch` 再复制到本次 `output/.assets/<asset_id>/v<version>/`。正文不进入事件、摘要或 Nexus。Scout 账号隔离库有配额；未完成登记的队列独立于 Git 工作区与安装目录，未确认不删除。prepare/reuse/resume 的选择属于 Agent，资源 ready 不是正式用例 PASS。复用必须回到持有该文件的同一台 Scout。

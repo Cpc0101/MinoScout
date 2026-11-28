@@ -365,6 +365,16 @@ def _run_locked(core, payload, root: Path, *, deadline: float, stop) -> dict[str
         return _failure(exc, case)
     except Exception as exc:
         return _failure(ScriptAbort(f"{type(exc).__name__}: {exc}", reason_code="script_failed", status="blocked"), case)
+    finally:
+        if case is not None and hasattr(case, "assets"):
+            try:
+                case.assets.close()
+            except Exception as exc:
+                try:
+                    if case._recorder:
+                        case._recorder.append("asset/cleanup_gap", {"exception_type": type(exc).__name__})
+                except Exception:
+                    pass  # Cleanup diagnostics cannot replace the execution outcome.
 
 
 def _failure(exc: BaseException, case: Case | None) -> dict[str, Any]:
@@ -390,9 +400,30 @@ def _failure(exc: BaseException, case: Case | None) -> dict[str, Any]:
     })
 
 
+def _build_matches(actual: str, expected: str) -> bool:
+    actual, expected = actual.strip(), expected.strip()
+    return bool(expected) and (actual == expected or actual.startswith(expected + " ") or actual.startswith(expected + "("))
+
+
+def _enforce_build(case, outcome):
+    expected = str(getattr(case, "_expected_build", "") or "")
+    if not expected or outcome.get("status") == "cancelled":
+        return outcome
+    actual = ""
+    recorder = getattr(case, "_recorder", None)
+    if recorder:
+        actual = str(recorder.store.metadata(recorder.task_id, recorder.attempt_id).get("tested_build") or "")
+    if _build_matches(actual, expected):
+        return outcome
+    return {**outcome, "status": "blocked",
+            "reason_code": "tested_build_mismatch" if actual else "tested_build_unverified",
+            "summary": f"被测构建是 {actual or '未读取'}，要求 {expected}"}
+
+
 def _report_outcome(case, outcome):
     if case is None:
         return outcome
+    outcome = _enforce_build(case, outcome)
     if case._recorder:
         from mino_scout.platform.web.playwright_hub import get_hub
         for app in case._apps.values():
@@ -679,6 +710,16 @@ class _Nexus:
         if not passed:
             raise self._case._latched_error
 
+    def fact(self, actual: Any, expected: Any, message: str = "") -> None:
+        """Check a business fact that is not on the current screen. Missing facts stay a precondition."""
+        self._case._guard()
+        if actual is None:
+            raise ScriptAbort("这条预期不在当前界面上，且没有可核对的事实", reason_code="fact_unavailable", status="blocked")
+        self._case._assert("fact", "pass" if actual == expected else "fail", expected=expected, actual=actual,
+                           message=message or "界面外事实不符")
+        if actual != expected:
+            raise self._case._latched_error
+
     def note(self, *messages: str, **fields: Any) -> None:
         from mino_scout.server_comm.callbacks import note
 
@@ -699,6 +740,7 @@ class Case:
         self.output_dir = Path.cwd()
         self._debug = debug_source is not None
         self._debug_write_error = None
+        self._case_id = str(payload.case_id)
         self.run_id = str(payload.run_id)
         self.session_id = str(payload.session_id)
         self._source_context = dict(getattr(payload, "source_context", {}) or {})
@@ -706,6 +748,7 @@ class Case:
         self._sn = str(payload.sn)
         self._platform = str(payload.platform)
         self._hint = dict(getattr(payload, "device_hint", None) or {})
+        self._expected_build = str(getattr(payload, "expected_build", "") or "").strip()
         self._all_pages = _load_pages(root)
         self.env = str(self._hint.get("env") or "")
         self.app_id = str(self._hint.get("app_id") or "")
@@ -738,6 +781,8 @@ class Case:
         self._covered: set[str] = set()
         from mino_scout.runtime.case_data import CaseData
         self.data = CaseData(self, getattr(payload, "inputs", {}))
+        from mino_scout.runtime.case_assets import CaseAssets
+        self.assets = CaseAssets(self, str(getattr(payload, "owner_user_id", "") or ""))
         self._source_snapshot, self._source_clauses, self._source_roles = {}, {}, {}
         self._source_hash = ""
         if not self._debug:
@@ -834,7 +879,7 @@ class Case:
     def __getattr__(self, name: str):
         if name.startswith("_"):
             raise AttributeError(name)
-        raise _unknown("case", name, ["config", "env", "app_id", "app_key", "init", "scout", "nexus", "data", "workspace", "output_dir"],
+        raise _unknown("case", name, ["config", "env", "app_id", "app_key", "init", "scout", "nexus", "data", "assets", "workspace", "output_dir"],
                        "。设备动作写在 app = case.init(case.config.<KEY>) 返回的 app 上")
 
     def init(
@@ -1600,6 +1645,15 @@ class App:
         status = str(getattr(result.status, "value", result.status) or "fail")
         action = ActionResult(ok=status == "pass", summary=str(result.summary or ""), status=status, data=_public(result.raw_response))
         self._report(capability, action, str(result.executor_used or _EXECUTOR[self._platform]), elapsed, extra=extra)
+        if capability == "get_app_version" and action.ok:
+            raw = action.data if isinstance(action.data, dict) else {}
+            build = str(raw.get("version_name") or raw.get("version") or "").strip()
+            code = raw.get("version_code")
+            if build and code is not None and str(code).strip():
+                build = f"{build} ({code})"
+            recorder = self._case._recorder
+            if build and recorder:
+                recorder.store.update_metadata(recorder.task_id, recorder.attempt_id, {"tested_build": build})
         if not action.ok and not allow_failed:
             raw = action.data
             execution = raw.get("execution") if isinstance(raw.get("execution"), dict) else {}

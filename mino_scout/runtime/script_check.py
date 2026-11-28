@@ -19,7 +19,7 @@ _REUSE = {
     "openai": "use case.scout.llm() / app.vlm() for model calls",
     "anthropic": "use case.scout.llm() / app.vlm() for model calls",
 }
-_CASE_ATTRS = {"config", "env", "app_id", "app_key", "init", "scout", "nexus", "data", "workspace", "output_dir"}
+_CASE_ATTRS = {"config", "env", "app_id", "app_key", "init", "scout", "nexus", "data", "assets", "workspace", "output_dir"}
 _STEP_CALLS = {"prep", "do", "check"}
 _EMPTY_PREP = {"无", "无前置", "无需前置", "不需要", "不需要前置", "无操作", "none", "n/a", "na"}
 _SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules"}
@@ -41,6 +41,12 @@ class Hint:
 def check_repo(root: Path, *, require_cases: bool = False) -> list[Hint]:
     root = Path(root).resolve()
     hints: list[Hint] = []
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root)
+        if _SKIP_DIRS.intersection(rel.parts) or not path.is_file() or path.is_symlink():
+            continue
+        if path.stat().st_size > 500 * 1024:
+            hints.append(Hint(str(rel), 0, "large_resource", "文件超过 500 KiB；测试资源用 case.assets.publish 入独立存储，脚本仓只保存资产版本引用"))
     keys = _config_keys(root, hints)
     used: dict[str, tuple[str, int]] = {}
     trees: dict[Path, ast.Module] = {}

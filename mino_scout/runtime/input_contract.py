@@ -49,6 +49,8 @@ def runtime_input_capabilities() -> list[dict[str, Any]]:
         },
     ])
 
+    rows.append({"id": "asset.transfer", "executor": "core", "platform_scope": "all", "platforms": [],
+        "contract_version": 1, "features": ["publish", "fetch", "sha256", "local_library", "pending_register"]})
     rows.append({"id": "node.update", "executor": "core", "platform_scope": "all", "platforms": [],
         "contract_version": 1, "features": ["fixed_build", "status", "rollback"]})
     rows.append({"id": "node.source_read", "executor": "core", "platform_scope": "all", "platforms": [],

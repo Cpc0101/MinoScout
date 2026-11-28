@@ -59,7 +59,7 @@ def scrub(value: Any) -> Any:
     if isinstance(value, str):
         # Git/HTTP URLs must never archive embedded credentials or token queries.
         value = re.sub(r"(https?://)[^/@\s]+:[^/@\s]+@", r"\1[REDACTED]@", value)
-        value = re.sub(r"(?i)([?&](?:token|access_token|api_key|password)=)[^&\s]+", r"\1[REDACTED]", value)
+        value = re.sub(r"(?i)([?&](?:token|access_token|api_key|password|x-amz-signature|x-amz-credential|x-amz-security-token)=)[^&\s]+", r"\1[REDACTED]", value)
         return sanitize(value)
     if value is None or isinstance(value, (bool, int, float)):
         return value
@@ -210,6 +210,7 @@ class RecordStore:
                 **{key: meta[key] for key in ("execution_stopped", "browser_closed", "scout_process_generation") if key in meta},
                 **({"otp_wait": meta["otp_wait"]} if "otp_wait" in meta else {}),
                 "data_outputs": meta.get("data_outputs", {}), "data_missing": meta.get("data_missing", []),
+                "tested_build": meta.get("tested_build", ""),
                 "source_hash": meta.get("source_hash", ""), "source_coverage": meta.get("source_coverage", {}),
                 **({"test_report": meta["test_report"]} if "test_report" in meta else {}),
                 "cancel_requested": bool(row["cancel_requested"]),

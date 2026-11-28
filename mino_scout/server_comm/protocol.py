@@ -270,6 +270,7 @@ class ScriptRun:
     source_context: dict[str, Any] = field(default_factory=dict)
     debug_origin: dict[str, Any] = field(default_factory=dict)
     web_capabilities: list[str] = field(default_factory=list)
+    expected_build: str = ""
 
 
 SCRIPT_RUN_CAPABILITY = "script.run"
@@ -306,7 +307,7 @@ RECORD_RESOURCE_STOP_CONTRACT = "script_resource_stop.v1"
 RECORD_REPORT_VERSION = 1  # Optional bounded business projection in record.sync.
 SCRIPT_RUN_FIELDS = ("run_id", "session_id", "case_id", "sn", "platform", "repo_url", "branch", "revision", "script_path",
                      "task_id", "attempt_id", "owner_user_id", "execution_timeout_sec", "inputs", "source_context", "execution_kind", "workspace", "debug_origin",
-                     "web_capabilities")
+                     "web_capabilities", "expected_build")
 _SCRIPT_RUN_FIELDS = SCRIPT_RUN_FIELDS
 
 
